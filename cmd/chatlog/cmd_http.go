@@ -79,6 +79,8 @@ var httpEndpoints = []httpEndpoint{
 	{Name: "sns_search", Method: "GET", Path: "/api/v1/sns_search", Description: "SNS search"},
 	{Name: "contacts", Method: "GET", Path: "/api/v1/contacts", Description: "Contact list"},
 	{Name: "chatrooms", Method: "GET", Path: "/api/v1/chatrooms", Description: "Chatroom list"},
+	{Name: "daily_report", Method: "GET", Path: "/api/v1/daily/report", Description: "Daily WeChat report"},
+	{Name: "daily_report_save", Method: "POST", Path: "/api/v1/daily/report/save", Description: "Save daily WeChat report"},
 	{Name: "db", Method: "GET", Path: "/api/v1/db", Description: "Databases"},
 	{Name: "db_tables", Method: "GET", Path: "/api/v1/db/tables", Description: "Database tables"},
 	{Name: "db_data", Method: "GET", Path: "/api/v1/db/data", Description: "Table data"},

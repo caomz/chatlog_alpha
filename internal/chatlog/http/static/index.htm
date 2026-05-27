@@ -1346,7 +1346,7 @@
                         <div class="form-group"><label>Embedding Model</label><input type="text" id="semantic-embedding-model" class="semantic-cfg" value="qwen3-embedding:8b"><div class="text-sm text-gray">用于消息向量化，Ollama 默认 qwen3-embedding:8b。</div></div>
                         <div class="form-group"><label>Rerank Provider</label><select id="semantic-rerank-provider" class="semantic-cfg"><option value="ollama">Ollama</option><option value="glm">GLM</option></select><div class="text-sm text-gray">默认 Ollama。</div></div>
                         <div class="form-group"><label>Rerank Model</label><input type="text" id="semantic-rerank-model" class="semantic-cfg" value="dengcao/Qwen3-Reranker-8B:Q5_K_M"><div class="text-sm text-gray">用于召回结果二次精排。</div></div>
-                        <div class="form-group"><label>Chat Provider</label><select id="semantic-chat-provider" class="semantic-cfg"><option value="glm">GLM</option><option value="deepseek">DeepSeek</option><option value="ollama">Ollama</option></select><div class="text-sm text-gray">GLM/DeepSeek 可选；未配置 Chat 时问答、图谱抽取不可用。</div></div>
+                        <div class="form-group"><label>Chat Provider</label><select id="semantic-chat-provider" class="semantic-cfg"><option value="glm">GLM</option><option value="deepseek">DeepSeek</option><option value="ollama">Ollama</option><option value="mmx">MiniMax CLI</option></select><div class="text-sm text-gray">可选 GLM、DeepSeek、Ollama 或本机 mmx CLI；未配置 Chat 时问答、图谱抽取不可用。</div></div>
                         <div class="form-group"><label>Chat Model</label><input type="text" id="semantic-chat-model" class="semantic-cfg" value="glm-5.1"><div class="text-sm text-gray">用于基于证据生成回答和图谱抽取。</div></div>
                     </div>
 
@@ -4097,7 +4097,8 @@
             chat: {
                 glm: { model: 'glm-5.1', base: 'https://open.bigmodel.cn/api/paas/v4' },
                 deepseek: { model: 'deepseek-chat', base: 'https://api.deepseek.com' },
-                ollama: { model: 'qwen3:8b', base: 'http://127.0.0.1:11434' }
+                ollama: { model: 'qwen3:8b', base: 'http://127.0.0.1:11434' },
+                mmx: { model: 'MiniMax-M2.7' }
             }
         };
 

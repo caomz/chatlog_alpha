@@ -6,6 +6,7 @@ const (
 	ProviderOllama   = "ollama"
 	ProviderGLM      = "glm"
 	ProviderDeepSeek = "deepseek"
+	ProviderMMX      = "mmx"
 
 	DefaultOllamaBaseURL      = "http://127.0.0.1:11434"
 	DefaultOllamaEmbedding    = "qwen3-embedding:8b"
@@ -20,6 +21,7 @@ const (
 	DefaultGLMEmbeddingDim    = 2048
 	DefaultDeepSeekBaseURL    = "https://api.deepseek.com"
 	DefaultDeepSeekChat       = "deepseek-chat"
+	DefaultMMXChat            = "MiniMax-M2.7"
 	DefaultSemanticRecallK    = 80
 	DefaultSemanticTopN       = 20
 	DefaultSemanticThreshold  = 0.55
@@ -90,14 +92,17 @@ func NormalizeSemanticConfig(in SemanticConfig) SemanticConfig {
 		out.RerankModel = DefaultGLMRerank
 	}
 	out.ChatModel = strings.TrimSpace(out.ChatModel)
-	if out.ChatProvider == ProviderOllama && (out.ChatModel == "" || out.ChatModel == DefaultGLMChat || out.ChatModel == DefaultDeepSeekChat) {
+	if out.ChatProvider == ProviderOllama && (out.ChatModel == "" || out.ChatModel == DefaultGLMChat || out.ChatModel == DefaultDeepSeekChat || out.ChatModel == DefaultMMXChat) {
 		out.ChatModel = DefaultOllamaChat
 	}
-	if out.ChatProvider == ProviderDeepSeek && (out.ChatModel == "" || out.ChatModel == DefaultGLMChat || out.ChatModel == DefaultOllamaChat) {
+	if out.ChatProvider == ProviderDeepSeek && (out.ChatModel == "" || out.ChatModel == DefaultGLMChat || out.ChatModel == DefaultOllamaChat || out.ChatModel == DefaultMMXChat) {
 		out.ChatModel = DefaultDeepSeekChat
 	}
-	if out.ChatProvider == ProviderGLM && (out.ChatModel == "" || out.ChatModel == DefaultDeepSeekChat || out.ChatModel == DefaultOllamaChat) {
+	if out.ChatProvider == ProviderGLM && (out.ChatModel == "" || out.ChatModel == DefaultDeepSeekChat || out.ChatModel == DefaultOllamaChat || out.ChatModel == DefaultMMXChat) {
 		out.ChatModel = DefaultGLMChat
+	}
+	if out.ChatProvider == ProviderMMX && (out.ChatModel == "" || out.ChatModel == DefaultGLMChat || out.ChatModel == DefaultDeepSeekChat || out.ChatModel == DefaultOllamaChat) {
+		out.ChatModel = DefaultMMXChat
 	}
 	if out.ChatMaxTokens <= 0 {
 		out.ChatMaxTokens = DefaultSemanticMaxTokens
@@ -166,6 +171,8 @@ func normalizeProvider(raw, fallback string) string {
 		return ProviderGLM
 	case ProviderDeepSeek:
 		return ProviderDeepSeek
+	case ProviderMMX:
+		return ProviderMMX
 	default:
 		return fallback
 	}
@@ -218,6 +225,8 @@ func SemanticChatReady(cfg SemanticConfig) bool {
 		return strings.TrimSpace(cfg.BaseURL) != "" && strings.TrimSpace(cfg.APIKey) != "" && strings.TrimSpace(cfg.ChatModel) != ""
 	case ProviderDeepSeek:
 		return strings.TrimSpace(cfg.DeepSeekBaseURL) != "" && strings.TrimSpace(cfg.DeepSeekAPIKey) != "" && strings.TrimSpace(cfg.ChatModel) != ""
+	case ProviderMMX:
+		return strings.TrimSpace(cfg.ChatModel) != ""
 	default:
 		return false
 	}

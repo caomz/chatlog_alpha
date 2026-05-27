@@ -73,6 +73,7 @@ type Config interface {
 	GetDataDir() string
 	GetSaveDecryptedMedia() bool
 	GetDataKey() string
+	GetImgKey() string
 	GetWorkDir() string
 	GetPlatform() string
 	GetVersion() int

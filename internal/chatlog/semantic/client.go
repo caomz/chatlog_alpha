@@ -4,10 +4,15 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"mime"
 	"net/http"
+	"os"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
@@ -25,9 +30,16 @@ const (
 	maxRerankDocs           = 80    // cap docs sent to reranker
 	maxOllamaRerankDocs     = 20    // local generation-based rerank is much slower than hosted rerank APIs
 	maxRerankDocChars       = 400   // per-doc char ceiling for reranker
+	defaultMiniMaxBaseURL   = "https://api.minimax.io/v1"
+	defaultMiniMaxCNBaseURL = "https://api.minimaxi.com/v1"
+	maxMiniMaxChatAttempts  = 3
+	miniMaxRetryBaseDelay   = 1500 * time.Millisecond
+	miniMaxAcquirePollDelay = 10 * time.Millisecond
 )
 
 var ollamaScheduler = &ollamaModelScheduler{}
+var miniMaxGlobalKeyPool = &miniMaxAPIKeyPool{}
+var miniMaxSecretRe = regexp.MustCompile(`sk-[A-Za-z0-9_-]+`)
 
 type ollamaModelScheduler struct {
 	mu          sync.Mutex
@@ -391,6 +403,147 @@ type ChatMessage struct {
 	Content string `json:"content"`
 }
 
+type miniMaxChatResponse struct {
+	Choices []struct {
+		Message struct {
+			Content string `json:"content"`
+		} `json:"message"`
+	} `json:"choices"`
+	Error    map[string]any `json:"error"`
+	BaseResp struct {
+		StatusCode int    `json:"status_code"`
+		StatusMsg  string `json:"status_msg"`
+	} `json:"base_resp"`
+}
+
+type miniMaxVisionResponse struct {
+	Content  string         `json:"content"`
+	Error    map[string]any `json:"error"`
+	BaseResp struct {
+		StatusCode int    `json:"status_code"`
+		StatusMsg  string `json:"status_msg"`
+	} `json:"base_resp"`
+}
+
+type miniMaxHTTPConfig struct {
+	APIKeys []string
+	BaseURL string
+}
+
+type miniMaxAPIKeyPool struct {
+	mu        sync.Mutex
+	signature string
+	slots     []*miniMaxAPIKeySlot
+	next      int
+}
+
+type miniMaxAPIKeySlot struct {
+	key   string
+	label string
+	token chan struct{}
+}
+
+type miniMaxAPIKeyLease struct {
+	apiKey  string
+	baseURL string
+	label   string
+	slot    *miniMaxAPIKeySlot
+	once    sync.Once
+}
+
+func (l *miniMaxAPIKeyLease) Release() {
+	if l == nil || l.slot == nil {
+		return
+	}
+	l.once.Do(func() {
+		select {
+		case l.slot.token <- struct{}{}:
+		default:
+		}
+	})
+}
+
+func (p *miniMaxAPIKeyPool) Acquire(ctx context.Context, exclude map[string]bool) (*miniMaxAPIKeyLease, int, error) {
+	cfg, err := loadMiniMaxHTTPConfig()
+	if err != nil {
+		return nil, 0, err
+	}
+	base := strings.TrimRight(strings.TrimSpace(cfg.BaseURL), "/")
+	if base == "" {
+		base = defaultMiniMaxBaseURL
+	}
+	for {
+		lease, total, done, err := p.tryAcquire(cfg.APIKeys, base, exclude)
+		if err != nil || lease != nil || done {
+			return lease, total, err
+		}
+		timer := time.NewTimer(miniMaxAcquirePollDelay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, total, ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
+func (p *miniMaxAPIKeyPool) tryAcquire(keys []string, baseURL string, exclude map[string]bool) (*miniMaxAPIKeyLease, int, bool, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.ensureLocked(keys)
+	total := len(p.slots)
+	if total == 0 {
+		return nil, 0, true, fmt.Errorf("minimax api key is not configured")
+	}
+	eligible := 0
+	for _, slot := range p.slots {
+		if exclude == nil || !exclude[slot.label] {
+			eligible++
+		}
+	}
+	if eligible == 0 {
+		return nil, total, true, nil
+	}
+	for i := 0; i < total; i++ {
+		idx := (p.next + i) % total
+		slot := p.slots[idx]
+		if exclude != nil && exclude[slot.label] {
+			continue
+		}
+		select {
+		case <-slot.token:
+			p.next = (idx + 1) % total
+			return &miniMaxAPIKeyLease{
+				apiKey:  slot.key,
+				baseURL: baseURL,
+				label:   slot.label,
+				slot:    slot,
+			}, total, false, nil
+		default:
+		}
+	}
+	return nil, total, false, nil
+}
+
+func (p *miniMaxAPIKeyPool) ensureLocked(keys []string) {
+	signature := strings.Join(keys, "\x00")
+	if p.signature == signature && len(p.slots) == len(keys) {
+		return
+	}
+	p.signature = signature
+	p.next = 0
+	p.slots = make([]*miniMaxAPIKeySlot, 0, len(keys))
+	for _, key := range keys {
+		slot := &miniMaxAPIKeySlot{
+			key:   key,
+			label: miniMaxKeyLabel(key),
+			token: make(chan struct{}, 1),
+		}
+		slot.token <- struct{}{}
+		p.slots = append(p.slots, slot)
+	}
+}
+
 func (c *Client) Chat(ctx context.Context, cfg conf.SemanticConfig, messages []ChatMessage) (string, error) {
 	cfg = conf.NormalizeSemanticConfig(cfg)
 	clean := make([]ChatMessage, 0, len(messages))
@@ -411,13 +564,63 @@ func (c *Client) Chat(ctx context.Context, cfg conf.SemanticConfig, messages []C
 	if cfg.ChatProvider == conf.ProviderDeepSeek {
 		return c.chatOpenAICompatible(ctx, cfg.DeepSeekAPIKey, cfg.DeepSeekBaseURL, cfg.ChatModel, clean, cfg.ChatThinking, cfg.ChatMaxTokens, cfg.ChatTemperature)
 	}
+	if cfg.ChatProvider == conf.ProviderMMX {
+		return c.chatMMX(ctx, cfg, clean)
+	}
 	if !conf.SemanticChatReady(cfg) {
 		return "", fmt.Errorf("chat model is not configured")
 	}
 	return c.chatOpenAICompatible(ctx, cfg.APIKey, cfg.BaseURL, cfg.ChatModel, clean, cfg.ChatThinking, cfg.ChatMaxTokens, cfg.ChatTemperature)
 }
 
+func (c *Client) AnalyzeImage(ctx context.Context, cfg conf.SemanticConfig, prompt string, imageData []byte, mimeType string) (string, error) {
+	cfg = conf.NormalizeSemanticConfig(cfg)
+	prompt = strings.TrimSpace(prompt)
+	if prompt == "" {
+		prompt = "请简洁描述图片中的可见文字、界面信息和与聊天上下文有关的事实；不要猜测图片外的信息。"
+	}
+	if len(imageData) == 0 {
+		return "", fmt.Errorf("image data is empty")
+	}
+	if strings.TrimSpace(mimeType) == "" {
+		mimeType = http.DetectContentType(imageData)
+	}
+	if !strings.HasPrefix(strings.ToLower(mimeType), "image/") {
+		if ext, _ := mime.ExtensionsByType(mimeType); len(ext) == 0 {
+			return "", fmt.Errorf("unsupported image mime type: %s", mimeType)
+		}
+	}
+	content := []map[string]any{
+		{"type": "text", "text": prompt},
+		{"type": "image_url", "image_url": map[string]any{
+			"url": "data:" + mimeType + ";base64," + base64.StdEncoding.EncodeToString(imageData),
+		}},
+	}
+	messages := []map[string]any{{"role": "user", "content": content}}
+	switch cfg.ChatProvider {
+	case conf.ProviderMMX:
+		return c.analyzeMiniMaxImage(ctx, prompt, imageData, mimeType)
+	case conf.ProviderDeepSeek:
+		return c.chatOpenAICompatibleRaw(ctx, cfg.DeepSeekAPIKey, cfg.DeepSeekBaseURL, cfg.ChatModel, messages, cfg.ChatThinking, cfg.ChatMaxTokens, cfg.ChatTemperature)
+	case conf.ProviderOllama:
+		return c.chatOllamaVision(ctx, cfg, prompt, imageData)
+	default:
+		if !conf.SemanticChatReady(cfg) {
+			return "", fmt.Errorf("chat model is not configured")
+		}
+		return c.chatOpenAICompatibleRaw(ctx, cfg.APIKey, cfg.BaseURL, cfg.ChatModel, messages, cfg.ChatThinking, cfg.ChatMaxTokens, cfg.ChatTemperature)
+	}
+}
+
 func (c *Client) chatOpenAICompatible(ctx context.Context, apiKey, baseURL, model string, messages []ChatMessage, thinking bool, maxTokens int, temperature float64) (string, error) {
+	raw := make([]map[string]any, 0, len(messages))
+	for _, msg := range messages {
+		raw = append(raw, map[string]any{"role": msg.Role, "content": msg.Content})
+	}
+	return c.chatOpenAICompatibleRaw(ctx, apiKey, baseURL, model, raw, thinking, maxTokens, temperature)
+}
+
+func (c *Client) chatOpenAICompatibleRaw(ctx context.Context, apiKey, baseURL, model string, messages []map[string]any, thinking bool, maxTokens int, temperature float64) (string, error) {
 	base := strings.TrimRight(strings.TrimSpace(baseURL), "/")
 	if base == "" {
 		base = conf.DefaultGLMBaseURL
@@ -455,6 +658,454 @@ func (c *Client) chatOpenAICompatible(ctx context.Context, apiKey, baseURL, mode
 		return "", fmt.Errorf("chat returned empty content")
 	}
 	return answer, nil
+}
+
+func (c *Client) chatMMX(ctx context.Context, cfg conf.SemanticConfig, messages []ChatMessage) (string, error) {
+	raw := make([]map[string]any, 0, len(messages))
+	for _, msg := range messages {
+		raw = append(raw, map[string]any{"role": msg.Role, "content": msg.Content})
+	}
+	return c.chatMMXRaw(ctx, cfg, raw)
+}
+
+func (c *Client) chatMMXRaw(ctx context.Context, cfg conf.SemanticConfig, messages []map[string]any) (string, error) {
+	payload := map[string]any{
+		"model":       cfg.ChatModel,
+		"messages":    messages,
+		"stream":      false,
+		"max_tokens":  cfg.ChatMaxTokens,
+		"temperature": cfg.ChatTemperature,
+	}
+	var lastErr error
+	attempted := 0
+	for round := 1; round <= maxMiniMaxChatAttempts; round++ {
+		excluded := map[string]bool{}
+		for {
+			lease, keyCount, err := miniMaxGlobalKeyPool.Acquire(ctx, excluded)
+			if err != nil {
+				return "", fmt.Errorf("minimax chat failed before request: %w", sanitizeMiniMaxError(err, nil))
+			}
+			if lease == nil {
+				break
+			}
+			attempted++
+			answer, err := c.doMiniMaxChatWithLease(ctx, lease, payload)
+			if err == nil {
+				return answer, nil
+			}
+			lastErr = err
+			excluded[lease.label] = true
+			if !shouldSwitchMiniMaxKey(err) {
+				return "", fmt.Errorf("minimax chat failed with key=%s: %w", lease.label, err)
+			}
+			if len(excluded) >= keyCount {
+				break
+			}
+		}
+		if round < maxMiniMaxChatAttempts {
+			if waitErr := sleepWithContext(ctx, miniMaxRetryDelay(lastErr, round)); waitErr != nil {
+				return "", fmt.Errorf("minimax chat failed: %w", waitErr)
+			}
+		}
+	}
+	if lastErr == nil {
+		return "", fmt.Errorf("minimax chat failed after %d round(s), tried %d key attempt(s)", maxMiniMaxChatAttempts, attempted)
+	}
+	return "", fmt.Errorf("minimax chat failed after %d round(s), tried %d key attempt(s), last_error=%w", maxMiniMaxChatAttempts, attempted, lastErr)
+}
+
+func (c *Client) doMiniMaxChatWithLease(ctx context.Context, lease *miniMaxAPIKeyLease, payload map[string]any) (string, error) {
+	defer lease.Release()
+	base := strings.TrimRight(strings.TrimSpace(lease.baseURL), "/")
+	if base == "" {
+		base = defaultMiniMaxBaseURL
+	}
+	var resp miniMaxChatResponse
+	if err := c.doJSONRequest(ctx, lease.apiKey, base+"/chat/completions", payload, &resp); err != nil {
+		return "", fmt.Errorf("key=%s: %w", lease.label, sanitizeMiniMaxError(err, []string{lease.apiKey}))
+	}
+	answer, err := parseMiniMaxChatResponse(resp)
+	if err != nil {
+		return "", fmt.Errorf("key=%s: %w", lease.label, sanitizeMiniMaxError(err, []string{lease.apiKey}))
+	}
+	return answer, nil
+}
+
+func (c *Client) analyzeMiniMaxImage(ctx context.Context, prompt string, imageData []byte, mimeType string) (string, error) {
+	mimeType = strings.TrimSpace(mimeType)
+	if mimeType == "" {
+		mimeType = http.DetectContentType(imageData)
+	}
+	payload := map[string]any{
+		"prompt":    prompt,
+		"image_url": "data:" + mimeType + ";base64," + base64.StdEncoding.EncodeToString(imageData),
+	}
+	var lastErr error
+	attempted := 0
+	for round := 1; round <= maxMiniMaxChatAttempts; round++ {
+		excluded := map[string]bool{}
+		for {
+			lease, keyCount, err := miniMaxGlobalKeyPool.Acquire(ctx, excluded)
+			if err != nil {
+				return "", fmt.Errorf("minimax vision failed before request: %w", sanitizeMiniMaxError(err, nil))
+			}
+			if lease == nil {
+				break
+			}
+			attempted++
+			answer, err := c.doMiniMaxVisionWithLease(ctx, lease, payload)
+			if err == nil {
+				return answer, nil
+			}
+			lastErr = err
+			excluded[lease.label] = true
+			if !shouldSwitchMiniMaxKey(err) {
+				return "", fmt.Errorf("minimax vision failed with key=%s: %w", lease.label, err)
+			}
+			if len(excluded) >= keyCount {
+				break
+			}
+		}
+		if round < maxMiniMaxChatAttempts {
+			if waitErr := sleepWithContext(ctx, miniMaxRetryDelay(lastErr, round)); waitErr != nil {
+				return "", fmt.Errorf("minimax vision failed: %w", waitErr)
+			}
+		}
+	}
+	if lastErr == nil {
+		return "", fmt.Errorf("minimax vision failed after %d round(s), tried %d key attempt(s)", maxMiniMaxChatAttempts, attempted)
+	}
+	return "", fmt.Errorf("minimax vision failed after %d round(s), tried %d key attempt(s), last_error=%w", maxMiniMaxChatAttempts, attempted, lastErr)
+}
+
+func (c *Client) doMiniMaxVisionWithLease(ctx context.Context, lease *miniMaxAPIKeyLease, payload map[string]any) (string, error) {
+	defer lease.Release()
+	var resp miniMaxVisionResponse
+	if err := c.doJSONRequest(ctx, lease.apiKey, miniMaxVisionURL(lease.baseURL), payload, &resp); err != nil {
+		return "", fmt.Errorf("key=%s: %w", lease.label, sanitizeMiniMaxError(err, []string{lease.apiKey}))
+	}
+	answer, err := parseMiniMaxVisionResponse(resp)
+	if err != nil {
+		return "", fmt.Errorf("key=%s: %w", lease.label, sanitizeMiniMaxError(err, []string{lease.apiKey}))
+	}
+	return answer, nil
+}
+
+func miniMaxVisionURL(baseURL string) string {
+	base := strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	if base == "" {
+		base = defaultMiniMaxBaseURL
+	}
+	if strings.HasSuffix(base, "/v1") {
+		return base + "/coding_plan/vlm"
+	}
+	return base + "/v1/coding_plan/vlm"
+}
+
+func shouldSwitchMiniMaxKey(err error) bool {
+	if err == nil {
+		return false
+	}
+	if isNonRetryableMiniMaxError(err) {
+		return false
+	}
+	return isMiniMaxAuthError(err) || isRetryableMiniMaxError(err)
+}
+
+func isMiniMaxAuthError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "model http 401") || strings.Contains(msg, "model http 403")
+}
+
+func isNonRetryableMiniMaxError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	for _, token := range []string{
+		"model http 400",
+		"model http 404",
+		"model http 422",
+		"max tokens exceeded",
+		"model not found",
+		"invalid request",
+		"decode model response failed",
+		"returned empty choices",
+		"returned empty content",
+	} {
+		if strings.Contains(msg, token) {
+			return true
+		}
+	}
+	return false
+}
+
+func sanitizeMiniMaxError(err error, keys []string) error {
+	if err == nil {
+		return nil
+	}
+	msg := err.Error()
+	for _, key := range keys {
+		key = strings.TrimSpace(key)
+		if key != "" {
+			msg = strings.ReplaceAll(msg, key, miniMaxKeyLabel(key))
+		}
+	}
+	msg = miniMaxSecretRe.ReplaceAllString(msg, "sk-***")
+	return errors.New(msg)
+}
+
+func miniMaxKeyLabel(key string) string {
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return "***"
+	}
+	r := []rune(key)
+	if len(r) <= 4 {
+		return "***"
+	}
+	return "***" + string(r[len(r)-4:])
+}
+
+func uniqueNonEmptyStrings(items []string) []string {
+	out := make([]string, 0, len(items))
+	seen := map[string]struct{}{}
+	for _, item := range items {
+		item = strings.TrimSpace(item)
+		if item == "" {
+			continue
+		}
+		if _, ok := seen[item]; ok {
+			continue
+		}
+		seen[item] = struct{}{}
+		out = append(out, item)
+	}
+	return out
+}
+
+func splitMiniMaxAPIKeys(raw string) []string {
+	return uniqueNonEmptyStrings(strings.Split(raw, ","))
+}
+
+func miniMaxEnvAPIKeys() []string {
+	if keys := splitMiniMaxAPIKeys(os.Getenv("MINIMAX_API_KEYS")); len(keys) > 0 {
+		return keys
+	}
+	var keys []string
+	for _, prefix := range []string{"MINIMAX", "MINMAX"} {
+		keys = append(keys, os.Getenv(prefix+"_API_KEY"))
+		for i := 2; i <= 20; i++ {
+			keys = append(keys, os.Getenv(fmt.Sprintf("%s%d_API_KEY", prefix, i)))
+		}
+	}
+	return uniqueNonEmptyStrings(keys)
+}
+
+func miniMaxEnvBaseURL() string {
+	for _, name := range []string{"MINIMAX_BASE_URL", "MINMAX_BASE_URL"} {
+		if v := strings.TrimSpace(os.Getenv(name)); v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+func loadMiniMaxHTTPConfig() (miniMaxHTTPConfig, error) {
+	if keys := miniMaxEnvAPIKeys(); len(keys) > 0 {
+		baseURL := miniMaxEnvBaseURL()
+		if baseURL == "" {
+			baseURL = defaultMiniMaxCNBaseURL
+		}
+		return miniMaxHTTPConfig{APIKeys: keys, BaseURL: baseURL}, nil
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return miniMaxHTTPConfig{}, err
+	}
+	path := filepath.Join(home, ".mmx", "config.json")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return miniMaxHTTPConfig{}, fmt.Errorf("minimax config not found: set MINIMAX_API_KEYS, run mmx auth login, or create %s", path)
+	}
+	var cfg struct {
+		APIKey  string `json:"api_key"`
+		BaseURL string `json:"base_url"`
+		Region  string `json:"region"`
+	}
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		return miniMaxHTTPConfig{}, fmt.Errorf("decode minimax config failed: %w", err)
+	}
+	apiKeys := uniqueNonEmptyStrings([]string{cfg.APIKey})
+	if len(apiKeys) == 0 {
+		return miniMaxHTTPConfig{}, fmt.Errorf("minimax api key is not configured in %s", path)
+	}
+	baseURL := miniMaxEnvBaseURL()
+	if baseURL == "" {
+		baseURL = strings.TrimSpace(cfg.BaseURL)
+	}
+	if baseURL == "" {
+		switch strings.ToLower(strings.TrimSpace(cfg.Region)) {
+		case "cn":
+			baseURL = defaultMiniMaxCNBaseURL
+		default:
+			baseURL = defaultMiniMaxBaseURL
+		}
+	}
+	return miniMaxHTTPConfig{APIKeys: apiKeys, BaseURL: baseURL}, nil
+}
+
+func MiniMaxConfiguredKeyCount() int {
+	cfg, err := loadMiniMaxHTTPConfig()
+	if err != nil {
+		return 1
+	}
+	if len(cfg.APIKeys) == 0 {
+		return 1
+	}
+	return len(cfg.APIKeys)
+}
+
+func (c *Client) chatOllamaVision(ctx context.Context, cfg conf.SemanticConfig, prompt string, imageData []byte) (string, error) {
+	base := strings.TrimRight(strings.TrimSpace(cfg.OllamaBaseURL), "/")
+	if base == "" {
+		base = conf.DefaultOllamaBaseURL
+	}
+	payload := map[string]any{
+		"model":  cfg.ChatModel,
+		"prompt": prompt,
+		"images": []string{base64.StdEncoding.EncodeToString(imageData)},
+		"stream": false,
+	}
+	var resp struct {
+		Response string `json:"response"`
+		Error    string `json:"error"`
+	}
+	if err := c.doJSONNoAuth(ctx, base+"/api/generate", payload, &resp); err != nil {
+		return "", err
+	}
+	if resp.Error != "" {
+		return "", fmt.Errorf("ollama vision error: %s", resp.Error)
+	}
+	answer := strings.TrimSpace(resp.Response)
+	if answer == "" {
+		return "", fmt.Errorf("ollama vision returned empty content")
+	}
+	return answer, nil
+}
+
+func parseMiniMaxChatResponse(resp miniMaxChatResponse) (string, error) {
+	if len(resp.Error) > 0 {
+		return "", fmt.Errorf("minimax chat error: %v", resp.Error)
+	}
+	if resp.BaseResp.StatusCode != 0 {
+		return "", fmt.Errorf("minimax chat error: %s", strings.TrimSpace(resp.BaseResp.StatusMsg))
+	}
+	if len(resp.Choices) == 0 {
+		return "", fmt.Errorf("minimax chat returned empty choices")
+	}
+	answer := strings.TrimSpace(resp.Choices[0].Message.Content)
+	if answer == "" {
+		return "", fmt.Errorf("minimax chat returned empty content")
+	}
+	return stripReasoningBlocks(answer), nil
+}
+
+func parseMiniMaxVisionResponse(resp miniMaxVisionResponse) (string, error) {
+	if len(resp.Error) > 0 {
+		return "", fmt.Errorf("minimax vision error: %v", resp.Error)
+	}
+	if resp.BaseResp.StatusCode != 0 {
+		return "", fmt.Errorf("minimax vision error: %s", strings.TrimSpace(resp.BaseResp.StatusMsg))
+	}
+	answer := strings.TrimSpace(resp.Content)
+	if answer == "" {
+		return "", fmt.Errorf("minimax vision returned empty content")
+	}
+	return stripReasoningBlocks(answer), nil
+}
+
+func stripReasoningBlocks(s string) string {
+	s = thinkBlockRe.ReplaceAllString(s, "")
+	s = thoughtBlockRe.ReplaceAllString(s, "")
+	return strings.TrimSpace(s)
+}
+
+func isRetryableMiniMaxError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	for _, token := range []string{
+		"context deadline exceeded",
+		"client.timeout",
+		"timeout",
+		"temporary",
+		"connection reset",
+		"connection refused",
+		"eof",
+		"model http 408",
+		"model http 409",
+		"model http 425",
+		"model http 429",
+		"model http 529",
+		"model http 500",
+		"model http 502",
+		"model http 503",
+		"model http 504",
+		"network request failed",
+		"overloaded_error",
+		"server is overloaded",
+	} {
+		if strings.Contains(msg, token) {
+			return true
+		}
+	}
+	return false
+}
+
+func miniMaxRetryDelay(err error, attempt int) time.Duration {
+	msg := ""
+	if err != nil {
+		msg = strings.ToLower(err.Error())
+	}
+	if wait := parseResetAt(msg); wait > 0 {
+		return wait
+	}
+	if attempt < 1 {
+		attempt = 1
+	}
+	return time.Duration(attempt) * miniMaxRetryBaseDelay
+}
+
+func parseResetAt(msg string) time.Duration {
+	m := miniMaxResetAtRe.FindStringSubmatch(msg)
+	if len(m) != 2 {
+		return 0
+	}
+	ts, err := time.Parse(time.RFC3339, m[1])
+	if err != nil {
+		return 0
+	}
+	wait := time.Until(ts.Add(10 * time.Minute))
+	if wait <= 0 {
+		return 0
+	}
+	return wait
+}
+
+func sleepWithContext(ctx context.Context, d time.Duration) error {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 func (c *Client) chatOllama(ctx context.Context, cfg conf.SemanticConfig, messages []ChatMessage) (string, error) {
@@ -513,6 +1164,16 @@ func (c *Client) ChatStream(ctx context.Context, cfg conf.SemanticConfig, messag
 	}
 	if cfg.ChatProvider == conf.ProviderOllama {
 		answer, err := c.chatOllama(ctx, cfg, clean)
+		if err != nil {
+			return err
+		}
+		if onDelta != nil {
+			return onDelta(answer)
+		}
+		return nil
+	}
+	if cfg.ChatProvider == conf.ProviderMMX {
+		answer, err := c.chatMMX(ctx, cfg, clean)
 		if err != nil {
 			return err
 		}
@@ -723,7 +1384,12 @@ func truncateApproxTokens(s string, maxTokens int) string {
 	return string(runes[:maxTokens])
 }
 
-var brokenNumRe = regexp.MustCompile(`([0-9])\.\s+([0-9])`)
+var (
+	brokenNumRe      = regexp.MustCompile(`([0-9])\.\s+([0-9])`)
+	thinkBlockRe     = regexp.MustCompile(`(?is)<think\b[^>]*>.*?</think>`)
+	thoughtBlockRe   = regexp.MustCompile(`(?is)<thought\b[^>]*>.*?</thought>`)
+	miniMaxResetAtRe = regexp.MustCompile(`(?i)resets at\s+([0-9T:+-]{5,})`)
+)
 
 func fixBrokenJSONNumbers(in []byte) []byte {
 	// Best-effort repair only; keeps behavior unchanged for valid JSON.

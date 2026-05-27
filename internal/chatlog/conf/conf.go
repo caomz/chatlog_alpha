@@ -134,11 +134,13 @@ func scrubConfigSecrets(v any) {
 
 func isSensitiveConfigKey(key string) bool {
 	key = strings.ToLower(strings.TrimSpace(key))
+	key = strings.ReplaceAll(key, "_", "")
+	key = strings.ReplaceAll(key, "-", "")
 	switch key {
-	case "data_key", "img_key", "api_key", "client_secret", "access_token", "refresh_token", "password":
+	case "datakey", "imgkey", "apikey", "clientsecret", "accesstoken", "refreshtoken", "password":
 		return true
 	}
-	return strings.Contains(key, "token") || strings.Contains(key, "secret") || strings.Contains(key, "api_key")
+	return strings.Contains(key, "token") || strings.Contains(key, "secret") || strings.Contains(key, "apikey")
 }
 
 var DataDirConfigs = map[string]bool{

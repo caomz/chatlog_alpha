@@ -124,6 +124,8 @@ func (s *Service) initAPIRouter() {
 		api.GET("/sns/media/proxy", s.handleSNSMediaProxy)
 		api.GET("/contacts", s.handleContactsCompat)
 		api.GET("/chatrooms", s.handleChatRoomsCompat)
+		api.GET("/daily/report", s.handleDailyReport)
+		api.POST("/daily/report/save", s.handleDailyReportSave)
 		api.GET("/db", s.handleGetDBs)
 		api.GET("/db/search", s.handleSearchAllDBs)
 		api.GET("/db/tables", s.handleGetDBTables)

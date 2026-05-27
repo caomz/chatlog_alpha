@@ -13,13 +13,15 @@ import (
 )
 
 var (
-	jsonBlockRe     = regexp.MustCompile("(?s)```(?:json)?\\s*(.*?)\\s*```")
-	fullDateCNRe    = regexp.MustCompile(`(\d{4})年(\d{1,2})月(\d{1,2})日?`)
-	monthDayCNRe    = regexp.MustCompile(`(\d{1,2})月(\d{1,2})日?`)
-	isoDateRe       = regexp.MustCompile(`(\d{4})-(\d{1,2})-(\d{1,2})`)
-	phoneLikeRe     = regexp.MustCompile(`1[3-9]\d{9}`)
-	wxIDLikeRe      = regexp.MustCompile(`(?i)^wxid_[a-z0-9]+$`)
-	spaceCollapseRe = regexp.MustCompile(`\s+`)
+	jsonBlockRe       = regexp.MustCompile("(?s)```(?:json)?\\s*(.*?)\\s*```")
+	llmThinkBlockRe   = regexp.MustCompile(`(?is)<think\b[^>]*>.*?</think>`)
+	llmThoughtBlockRe = regexp.MustCompile(`(?is)<thought\b[^>]*>.*?</thought>`)
+	fullDateCNRe      = regexp.MustCompile(`(\d{4})年(\d{1,2})月(\d{1,2})日?`)
+	monthDayCNRe      = regexp.MustCompile(`(\d{1,2})月(\d{1,2})日?`)
+	isoDateRe         = regexp.MustCompile(`(\d{4})-(\d{1,2})-(\d{1,2})`)
+	phoneLikeRe       = regexp.MustCompile(`1[3-9]\d{9}`)
+	wxIDLikeRe        = regexp.MustCompile(`(?i)^wxid_[a-z0-9]+$`)
+	spaceCollapseRe   = regexp.MustCompile(`\s+`)
 )
 
 func parseTimeFlexible(raw string) time.Time {
@@ -302,10 +304,12 @@ func extractJSONObject(raw string) string {
 }
 
 func decodeExtraction(raw string) (Extraction, error) {
+	raw = stripLLMReasoning(raw)
 	candidates := jsonObjectCandidates(raw)
 	if len(candidates) == 0 {
 		candidates = []string{extractJSONObject(raw)}
 	}
+	candidates = preferExtractionSchemaCandidates(candidates)
 	var lastErr error
 	for _, candidate := range candidates {
 		candidate = strings.TrimSpace(candidate)
@@ -327,7 +331,50 @@ func decodeExtraction(raw string) (Extraction, error) {
 	return Extraction{}, lastErr
 }
 
+func stripLLMReasoning(raw string) string {
+	raw = llmThinkBlockRe.ReplaceAllString(raw, "")
+	raw = llmThoughtBlockRe.ReplaceAllString(raw, "")
+	return strings.TrimSpace(raw)
+}
+
+func preferExtractionSchemaCandidates(candidates []string) []string {
+	if len(candidates) < 2 {
+		return candidates
+	}
+	matches := make([]string, 0, len(candidates))
+	rest := make([]string, 0, len(candidates))
+	for _, candidate := range candidates {
+		if _, ok, err := extractionShape(candidate); err == nil && ok {
+			matches = append(matches, candidate)
+			continue
+		}
+		rest = append(rest, candidate)
+	}
+	if len(matches) == 0 {
+		return candidates
+	}
+	return append(matches, rest...)
+}
+
 func unmarshalExtraction(raw string) (Extraction, bool, error) {
+	if kind, ok, err := extractionShape(raw); err != nil {
+		return Extraction{}, false, err
+	} else if ok {
+		if kind == "wrapped" {
+			var wrapped struct {
+				Extraction Extraction `json:"extraction"`
+			}
+			if err := json.Unmarshal([]byte(raw), &wrapped); err != nil {
+				return Extraction{}, false, err
+			}
+			return wrapped.Extraction, true, nil
+		}
+		var ext Extraction
+		if err := json.Unmarshal([]byte(raw), &ext); err != nil {
+			return Extraction{}, false, err
+		}
+		return ext, true, nil
+	}
 	var wrapped struct {
 		Extraction Extraction `json:"extraction"`
 	}
@@ -342,6 +389,24 @@ func unmarshalExtraction(raw string) (Extraction, bool, error) {
 		return ext, true, nil
 	}
 	return Extraction{}, false, nil
+}
+
+func extractionShape(raw string) (string, bool, error) {
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(raw), &obj); err != nil {
+		return "", false, err
+	}
+	if _, ok := obj["extraction"]; ok {
+		return "wrapped", true, nil
+	}
+	_, hasEntities := obj["entities"]
+	_, hasRelations := obj["relations"]
+	_, hasEvents := obj["events"]
+	_, hasFacts := obj["facts"]
+	if hasEntities && hasRelations && hasEvents && hasFacts {
+		return "direct", true, nil
+	}
+	return "", false, nil
 }
 
 func extractionHasContent(ext Extraction) bool {

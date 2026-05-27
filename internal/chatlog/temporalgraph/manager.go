@@ -346,13 +346,23 @@ func (m *Manager) processOne(ctx context.Context, rec SourceRecord) error {
 	verified, err := m.verifyExtraction(ctx, rec, ext)
 	if err != nil {
 		log.Debug().Err(err).Msg("temporal graph llm verify failed")
-		return err
+		if !isGraphVerificationDecodeError(err) {
+			return err
+		}
+		verified = ext
 	}
 	verified = normalizeExtraction(verified, rec)
 	if len(verified.Entities) == 0 && len(verified.Events) == 0 && len(verified.Facts) == 0 && len(verified.Relations) == 0 {
 		return errNoGraphResults
 	}
 	return m.store.ApplyExtraction(rec, verified)
+}
+
+func isGraphVerificationDecodeError(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(err.Error(), "decode graph verification failed")
 }
 
 func (m *Manager) extract(ctx context.Context, rec SourceRecord) (Extraction, error) {

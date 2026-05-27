@@ -90,6 +90,50 @@ func TestDecodeExtractionIgnoresBracesInsideStrings(t *testing.T) {
 	}
 }
 
+func TestDecodeExtractionAcceptsEmptyExtraction(t *testing.T) {
+	raw := `{"entities":[],"relations":[],"events":[],"facts":[]}`
+	ext, err := decodeExtraction(raw)
+	if err != nil {
+		t.Fatalf("decodeExtraction returned error: %v", err)
+	}
+	if len(ext.Entities) != 0 || len(ext.Relations) != 0 || len(ext.Events) != 0 || len(ext.Facts) != 0 {
+		t.Fatalf("expected empty extraction, got %#v", ext)
+	}
+}
+
+func TestDecodeExtractionAcceptsFencedEmptyExtraction(t *testing.T) {
+	raw := "```json\n{\"entities\":[],\"relations\":[],\"events\":[],\"facts\":[]}\n```"
+	ext, err := decodeExtraction(raw)
+	if err != nil {
+		t.Fatalf("decodeExtraction returned error: %v", err)
+	}
+	if len(ext.Entities) != 0 || len(ext.Relations) != 0 || len(ext.Events) != 0 || len(ext.Facts) != 0 {
+		t.Fatalf("expected empty extraction, got %#v", ext)
+	}
+}
+
+func TestDecodeExtractionStripsThinkBlock(t *testing.T) {
+	raw := "<think>{\"entities\":[{\"name\":\"错误\",\"type\":\"person\"}]}</think>\n```json\n{\"entities\":[{\"name\":\"段宏洋\",\"type\":\"person\",\"confidence\":0.9}],\"relations\":[],\"events\":[],\"facts\":[]}\n```"
+	ext, err := decodeExtraction(raw)
+	if err != nil {
+		t.Fatalf("decodeExtraction returned error: %v", err)
+	}
+	if len(ext.Entities) != 1 || ext.Entities[0].Name != "段宏洋" {
+		t.Fatalf("unexpected extraction: %#v", ext)
+	}
+}
+
+func TestDecodeExtractionPrefersExtractionSchemaCandidate(t *testing.T) {
+	raw := `分析 {"foo":"bar"} 后输出 {"entities":[{"name":"客户A","type":"customer","confidence":0.8}],"relations":[],"events":[],"facts":[]}`
+	ext, err := decodeExtraction(raw)
+	if err != nil {
+		t.Fatalf("decodeExtraction returned error: %v", err)
+	}
+	if len(ext.Entities) != 1 || ext.Entities[0].Name != "客户A" {
+		t.Fatalf("unexpected extraction: %#v", ext)
+	}
+}
+
 func TestIsDatabaseNotReady(t *testing.T) {
 	if !isDatabaseNotReady(errors.New("database not ready")) {
 		t.Fatal("expected database not ready to match")

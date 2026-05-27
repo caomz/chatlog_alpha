@@ -216,6 +216,10 @@ func (c *Context) GetDataKey() string {
 	return c.DataKey
 }
 
+func (c *Context) GetImgKey() string {
+	return c.ImgKey
+}
+
 func (c *Context) GetWalEnabled() bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
