@@ -345,6 +345,44 @@ func (s *Store) MarkSource(id int64, status, errText string) error {
 	return err
 }
 
+func (s *Store) RequeueFailedSourcesByError(errText string) (int64, error) {
+	errText = strings.TrimSpace(errText)
+	if errText == "" {
+		return 0, nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	res, err := s.db.Exec(`UPDATE graph_source_records SET status='pending', error='', updated_at=? WHERE status='failed' AND error=?`, time.Now().Unix(), errText)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
+func (s *Store) RequeueFailedSourcesByErrorContaining(tokens []string) (int64, error) {
+	clauses := make([]string, 0, len(tokens))
+	args := []any{time.Now().Unix()}
+	for _, token := range tokens {
+		token = strings.ToLower(strings.TrimSpace(token))
+		if token == "" {
+			continue
+		}
+		clauses = append(clauses, `LOWER(error) LIKE ?`)
+		args = append(args, "%"+token+"%")
+	}
+	if len(clauses) == 0 {
+		return 0, nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	query := fmt.Sprintf(`UPDATE graph_source_records SET status='pending', error='', updated_at=? WHERE status='failed' AND (%s)`, strings.Join(clauses, " OR "))
+	res, err := s.db.Exec(query, args...)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
 func (s *Store) ApplyExtraction(src SourceRecord, ext Extraction) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()

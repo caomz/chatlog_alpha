@@ -32,6 +32,24 @@ curl -s http://127.0.0.1:5030/health
 curl -s http://127.0.0.1:5030/api/v1/ping
 ```
 
+## Daily report HTML and Markdown
+
+Generate the browser-readable daily report from the latest JSON, and copy the matching Markdown report, without rerunning model analysis:
+
+```bash
+go run ./skills/chatlog-http-cli/scripts/render-enhanced-daily-html.go \
+  --config .cache/daily-report-config/chatlog-server.json
+```
+
+By default, the final files are written to:
+
+```text
+/Volumes/WorkSSD/Dev/openclaw_mz/knowledge/raw/微信每日聊天记录/daily-YYYY-MM-DD-enhanced.html
+/Volumes/WorkSSD/Dev/openclaw_mz/knowledge/raw/微信每日聊天记录/daily-YYYY-MM-DD.md
+```
+
+Use `--json` for a specific report JSON, `--markdown` for a specific Markdown source, `--out` for an exact HTML path, `--markdown-out` for an exact Markdown output path, or `--out-dir` for a different directory.
+
 ## Automatic Codex hook
 
 This project installs a global Codex `Stop` hook that is project-scoped by script logic:

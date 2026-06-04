@@ -1,0 +1,463 @@
+{
+  "active_feature_id": "temporal-graph-reprocess-failed-2026-06-04",
+  "features": [
+    {
+      "id": "temporal-graph-reprocess-failed-2026-06-04",
+      "name": "Temporal Graph Reprocess Failed Sources 2026-06-04",
+      "title": "Reprocess failed temporal graph sources",
+      "description": "Requeue temporal graph sources that previously failed, restore a ready Chat provider, and leave the graph worker processing without exposing private chat contents.",
+      "status": "running",
+      "scope": [
+        "Check runtime temporal graph status through local HTTP endpoints.",
+        "Classify failed source error buckets without printing chat content.",
+        "Switch semantic Chat provider to MMX MiniMax-M3 without sending or showing secret values.",
+        "Requeue recoverable config failures with graph resume.",
+        "Use graph rebuild reset=false to re-enqueue remaining failed sources without clearing the graph."
+      ],
+      "done_criteria": [
+        "Graph service is reachable on 127.0.0.1:5030.",
+        "Failed source buckets are counted without exposing message content.",
+        "Recoverable chat model configuration failures are moved back to pending.",
+        "Remaining failed sources are re-enqueued via rebuild reset=false.",
+        "Progress and next monitoring command are recorded."
+      ],
+      "evidence": [
+        {
+          "command": "curl -sS --max-time 8 'http://127.0.0.1:5030/health'",
+          "result": "PASS: returned status ok."
+        },
+        {
+          "command": "curl -sS --max-time 8 'http://127.0.0.1:5030/api/v1/graph/status?format=json'",
+          "result": "PASS before requeue: running=false, pending=0, processed=4849, failed=1814."
+        },
+        {
+          "command": "sqlite3 readonly failed error bucket query",
+          "result": "PASS: counted 1772 chat model is not configured failures, about 30 json/decode related failures, and 4 model http 422 failures without printing private content."
+        },
+        {
+          "command": "POST /api/v1/semantic/config?format=json",
+          "result": "PASS: set chat_provider=mmx, chat_model=MiniMax-M3, chat_max_tokens=8192, chat_temperature=0.2; API keys were not sent in the request body or returned by the API."
+        },
+        {
+          "command": "POST /api/v1/graph/resume?format=json",
+          "result": "PASS: pending became 1772 and failed dropped from 1814 to 42."
+        },
+        {
+          "command": "POST /api/v1/graph/rebuild?format=json with reset=false",
+          "result": "PASS: accepted; follow-up status showed enqueue_running=true, source_count=6964, pending about 2075, processing=8, failed=41."
+        }
+      ],
+      "next_step": "Monitor curl -sS 'http://127.0.0.1:5030/api/v1/graph/status?format=json'. If MiniMax-M3 keeps producing truncated JSON, switch graph extraction back to MiniMax-M2.7 or increase structured-output hardening.",
+      "dependencies": [
+        "semantic-minimax-m3-config"
+      ]
+    },
+    {
+      "id": "semantic-minimax-m3-config",
+      "name": "Semantic MiniMax M3 Config",
+      "title": "Add MiniMax-M3 chat model configuration",
+      "description": "Add MiniMax-M3 as the default MiniMax CLI chat model while preserving MiniMax-M2.7 as a recognized legacy model.",
+      "status": "completed",
+      "scope": [
+        "Update semantic Chat config defaults for MiniMax CLI.",
+        "Keep MiniMax-M2.7 recognized so provider switching can reset stale MiniMax values safely.",
+        "Expose MiniMax-M3 in the semantic configuration UI without calling model providers.",
+        "Verify config normalization and semantic package tests."
+      ],
+      "done_criteria": [
+        "MMX Chat provider defaults to MiniMax-M3 when no Chat model is set.",
+        "MiniMax-M2.7 remains a known legacy MMX model.",
+        "Switching Chat provider away from MMX resets both MiniMax-M3 and MiniMax-M2.7 to the target provider default.",
+        "The web config page suggests MiniMax-M3 and uses it when MMX provider defaults are synced.",
+        "Focused tests pass without running quota-sensitive model calls."
+      ],
+      "evidence": [
+        {
+          "command": "go test ./internal/chatlog/conf",
+          "result": "PASS: semantic config normalization tests passed."
+        },
+        {
+          "command": "go test ./internal/chatlog/conf ./internal/chatlog/semantic",
+          "result": "PASS: conf and semantic package tests passed."
+        },
+        {
+          "command": "./init.sh",
+          "result": "PASS after state update: root harness check 41/41, harness skill check 29/29, daily report help, and HTTP endpoint list passed."
+        },
+        {
+          "command": "make build",
+          "result": "PASS: rebuilt bin/chatlog with MiniMax-M3 semantic config default."
+        },
+        {
+          "command": "curl -sS --max-time 5 'http://127.0.0.1:5030/api/v1/graph/status?format=json'",
+          "result": "PASS: runtime graph worker is running, so service restart was intentionally skipped."
+        }
+      ],
+      "next_step": "Restart chatlog-alpha after the graph worker is idle if the live UI should pick up the new MiniMax-M3 static config immediately.",
+      "dependencies": []
+    },
+    {
+      "id": "daily-report-2026-05-31-key-recovery",
+      "name": "Daily Report 2026-05-31 Key Recovery",
+      "title": "WeChat daily report key recovery and cache hardening",
+      "description": "Recover WeChat key scanning and harden WCDB cache behavior so the 2026-05-31 daily report can be generated from the live local service.",
+      "status": "done",
+      "priority": "P0",
+      "scope": [
+        "Daily report generation for 2026-05-31.",
+        "WeChat key scanning on Darwin.",
+        "WCDB cache validation and fallback."
+      ],
+      "done_criteria": [
+        "TUI runtime shows Keys Status 可读 and HTTP server on 127.0.0.1:5030.",
+        "Daily report generation succeeds for 2026-05-31.",
+        "Enhanced HTML and Markdown are rendered into the knowledge raw folder.",
+        "Build succeeds after key scanning and cache hardening changes."
+      ],
+      "evidence": [
+        "TUI runtime shows Keys Status 可读 and HTTP server on 127.0.0.1:5030",
+        "go run . report daily --http http://127.0.0.1:5030 --date today ... succeeded for 2026-05-31",
+        "render-enhanced-daily-html.go generated daily-2026-05-31-enhanced.html under knowledge/raw/微信每日聊天记录",
+        "make build succeeded after adding mac-key-helper and WCDB cache validation/fallback"
+      ],
+      "changed_files": [
+        "cmd/chatlog/cmd_mac_key_helper_darwin.go",
+        "internal/wechat/key/darwin/init_scan.go",
+        "internal/wechatdb/wcdbapi/client.go",
+        "progress.md",
+        "session-handoff.md"
+      ],
+      "next_step": "If strict regression coverage is needed, run focused tests for internal/chatlog/dailyreport and internal/wechatdb/wcdbapi.",
+      "dependencies": [],
+      "updated_at": "2026-05-31T08:20:00+08:00"
+    },
+    {
+      "id": "root-harness-bridge",
+      "name": "Root Harness Bridge",
+      "title": "Root Harness Bridge",
+      "description": "Add root-level agent instructions, state, verification, scope, and lifecycle artifacts that bridge into the existing chatlog-http-cli harness skill.",
+      "status": "completed",
+      "scope": [
+        "Add AGENTS.md and CLAUDE.md as root instruction entrypoints.",
+        "Add feature_list.json, progress.md, and session-handoff.md for restartable state.",
+        "Add init.sh and scripts/check-root-harness.mjs as verification entrypoints.",
+        "Wire root harness check into the existing project-scoped Codex Stop hook."
+      ],
+      "done_criteria": [
+        "Root instruction files route agents to skills/chatlog-http-cli/SKILL.md.",
+        "State artifacts identify one active feature, current status, evidence, and next step.",
+        "Verification commands are runnable without touching private chat contents by default.",
+        "Existing repo-local harness skill check and new root harness check both pass.",
+        "harness-creator validation score is at least 85/100 with no subsystem FAIL items."
+      ],
+      "evidence": [
+        {
+          "command": "node scripts/check-root-harness.mjs",
+          "result": "PASS: Root harness check 41/41 passed."
+        },
+        {
+          "command": "node skills/chatlog-http-cli/scripts/check-harness-skill.mjs",
+          "result": "PASS: Harness skill check 25/25 passed."
+        },
+        {
+          "command": "python3 .codex/hooks/chatlog_harness_skill_check.py <<'JSON'\n{\"cwd\":\"/Volumes/WorkSSD/Dev/chatlog_alpha\"}\nJSON",
+          "result": "PASS: repo-local harness skill check and root harness bridge check both passed."
+        },
+        {
+          "command": "./init.sh",
+          "result": "PASS: quick gate completed without running privacy or quota-sensitive checks."
+        },
+        {
+          "command": "./init.sh --full",
+          "result": "PASS: quick gate, go test ./..., and make build completed."
+        },
+        {
+          "command": "node /Users/mingtian/.agents/skills/harness-creator-workspace/skill-snapshot-before-iteration-1/scripts/validate-harness.mjs --target /Volumes/WorkSSD/Dev/chatlog_alpha",
+          "result": "PASS: Overall 100/100; instructions/state/verification/scope/lifecycle all 5/5."
+        }
+      ],
+      "next_step": "Optional follow-up: generate the deferred harness assessment report with before/after evidence.",
+      "dependencies": []
+    },
+    {
+      "id": "daily-report-2026-05-28",
+      "name": "Daily Report 2026-05-28",
+      "title": "Daily WeChat Report 2026-05-28",
+      "description": "Generate the 2026-05-28 WeChat daily report with text summary and vision options enabled, then verify output files and structured counts without exposing private chat content.",
+      "status": "completed",
+      "scope": [
+        "Generate today's report under reports/ using the repo-local CLI.",
+        "Use the temporary daily report config bridge instead of changing global ~/.chatlog service config.",
+        "Verify output files, JSON counts, and AI analysis error fields without printing private report contents."
+      ],
+      "done_criteria": [
+        "reports/daily-2026-05-28.md exists and has a current timestamp.",
+        "reports/daily-2026-05-28.json exists and has a current timestamp.",
+        "reports/daily-2026-05-28-dialogue-analysis.md exists and has a current timestamp.",
+        "JSON overview and analysis error fields are checked without exposing chat content.",
+        "Any skipped or stale derived artifacts are explicitly recorded."
+      ],
+      "evidence": [
+        {
+          "command": "CHATLOG_DIR=.cache/daily-report-config go run . report daily --date today --mention caomz --alias 曹明哲 --before 5 --after 10 --reply-window 60 --include-private --format both --out ./reports --vision --summary --max-images 50 --analysis-concurrency 0",
+          "result": "PASS on second run: markdown/json/dialogue_analysis saved; summary mentions=13 replied=0 pending=13 private=34 todos=32."
+        },
+        {
+          "command": "jq structured verification on reports/daily-2026-05-28.json",
+          "result": "PASS: scanned_message_count=1810, mentions_with_analysis=13/13, private_with_summary=34/34, groups_with_summary=10/10, analysis_errors all zero."
+        },
+        {
+          "command": "./init.sh",
+          "result": "PASS: quick gate completed; root harness check 41/41, harness skill check 25/25, daily report help, and HTTP endpoint list all passed."
+        }
+      ],
+      "next_step": "If a browser-readable artifact is needed, regenerate daily-2026-05-28-enhanced.html from the fresh JSON/Markdown; the existing enhanced HTML is older than the latest CLI report.",
+      "dependencies": []
+    },
+    {
+      "id": "daily-report-html-output-dir",
+      "name": "Daily Report HTML Output Directory",
+      "title": "Daily Report HTML Output Directory",
+      "description": "Move the enhanced daily report HTML renderer into the repo-local skill and make the default final HTML destination the Obsidian raw folder under openclaw_mz.",
+      "status": "completed",
+      "scope": [
+        "Promote the temporary enhanced HTML renderer into skills/chatlog-http-cli/scripts.",
+        "Default generated HTML output to /Volumes/WorkSSD/Dev/openclaw_mz/knowledge/raw/微信每日聊天记录.",
+        "Document the skill command and output behavior.",
+        "Verify the script using the latest existing report JSON without rerunning model analysis."
+      ],
+      "done_criteria": [
+        "The skill has a reusable enhanced HTML renderer script.",
+        "The renderer defaults to the requested openclaw_mz knowledge raw directory.",
+        "The skill docs explain how to generate HTML without rerunning summary or vision model calls.",
+        "The script generated an HTML file in the requested directory.",
+        "Harness and script-level verification passed."
+      ],
+      "evidence": [
+        {
+          "command": "go run ./skills/chatlog-http-cli/scripts/render-enhanced-daily-html.go --config .cache/daily-report-config/chatlog-server.json",
+          "result": "PASS: used reports/daily-2026-05-28.json and wrote /Volumes/WorkSSD/Dev/openclaw_mz/knowledge/raw/微信每日聊天记录/daily-2026-05-28-enhanced.html; image_nodes=17 unique_assets=15 resolved=15 failed=0."
+        },
+        {
+          "command": "go test ./skills/chatlog-http-cli/scripts",
+          "result": "PASS: package compiled; no test files."
+        },
+        {
+          "command": "node skills/chatlog-http-cli/scripts/check-harness-skill.mjs",
+          "result": "PASS: Harness skill check 28/28 passed."
+        },
+        {
+          "command": "node scripts/check-root-harness.mjs",
+          "result": "PASS: Root harness check 41/41 passed."
+        },
+        {
+          "command": "./init.sh",
+          "result": "PASS: quick gate completed; root harness check 41/41, harness skill check 28/28, daily report help, and HTTP endpoint list all passed."
+        }
+      ],
+      "next_step": "Use the skill renderer after each daily JSON generation; the default HTML final artifact will land in the openclaw_mz knowledge raw folder.",
+      "dependencies": [
+        "daily-report-2026-05-28"
+      ]
+    },
+    {
+      "id": "daily-report-markdown-html-output-dir",
+      "name": "Daily Report Markdown and HTML Output Directory",
+      "title": "Daily Report Markdown and HTML Output Directory",
+      "description": "Update the daily report artifact renderer so the matching Markdown file is written to the same openclaw_mz knowledge raw folder as the enhanced HTML file.",
+      "status": "completed",
+      "scope": [
+        "Copy the matching reports/daily-YYYY-MM-DD.md into the final openclaw_mz knowledge raw folder.",
+        "Keep enhanced HTML generation in the same command and same destination folder.",
+        "Document the Markdown and HTML final artifact behavior in the skill and daily report docs.",
+        "Verify with an existing report JSON/Markdown without rerunning model analysis."
+      ],
+      "done_criteria": [
+        "The renderer defaults to reports/daily-YYYY-MM-DD.md for the same date as the selected JSON.",
+        "The renderer writes daily-YYYY-MM-DD.md to /Volumes/WorkSSD/Dev/openclaw_mz/knowledge/raw/微信每日聊天记录 by default.",
+        "The renderer still writes daily-YYYY-MM-DD-enhanced.html to the same folder.",
+        "Skill docs and checks mention the Markdown output behavior.",
+        "Generated Markdown and HTML files exist in the requested directory."
+      ],
+      "evidence": [
+        {
+          "command": "go run ./skills/chatlog-http-cli/scripts/render-enhanced-daily-html.go --config .cache/daily-report-config/chatlog-server.json",
+          "result": "PASS: wrote /Volumes/WorkSSD/Dev/openclaw_mz/knowledge/raw/微信每日聊天记录/daily-2026-05-28.md and daily-2026-05-28-enhanced.html; image_nodes=17 unique_assets=15 resolved=15 failed=0."
+        },
+        {
+          "command": "ls -lh /Volumes/WorkSSD/Dev/openclaw_mz/knowledge/raw/微信每日聊天记录/daily-2026-05-28.md /Volumes/WorkSSD/Dev/openclaw_mz/knowledge/raw/微信每日聊天记录/daily-2026-05-28-enhanced.html",
+          "result": "PASS: Markdown about 54K and HTML about 219K both updated at 2026-05-29 03:17 CST."
+        },
+        {
+          "command": "go test ./skills/chatlog-http-cli/scripts",
+          "result": "PASS: package compiled; no test files."
+        },
+        {
+          "command": "node skills/chatlog-http-cli/scripts/check-harness-skill.mjs",
+          "result": "PASS: Harness skill check 29/29 passed."
+        },
+        {
+          "command": "node scripts/check-root-harness.mjs",
+          "result": "PASS: Root harness check 41/41 passed."
+        },
+        {
+          "command": "./init.sh",
+          "result": "PASS: quick gate completed; root harness check 41/41, harness skill check 29/29, daily report help, and HTTP endpoint list all passed."
+        }
+      ],
+      "next_step": "After generating the next daily report JSON/Markdown, run the skill renderer once; both Markdown and enhanced HTML will land in the openclaw_mz knowledge raw folder by default.",
+      "dependencies": [
+        "daily-report-html-output-dir"
+      ]
+    },
+    {
+      "id": "temporal-graph-recover-chat-config-failures",
+      "name": "Temporal Graph Recover Chat Config Failures",
+      "title": "Temporal Graph Recover Chat Config Failures",
+      "description": "Fix temporal graph sources that failed with chat model is not configured after the Chat provider is later configured, without automatically retrying thousands of model-backed jobs.",
+      "status": "completed",
+      "scope": [
+        "Diagnose graph status and semantic config through local HTTP endpoints without printing private chat contents.",
+        "Add store-level recovery for failed sources whose error is exactly chat model is not configured.",
+        "Retry those recoverable failures only on explicit resume or rebuild, not on every background ticker.",
+        "Clear stale recoverable graph last_error once Chat config is ready and there is no pending work.",
+        "Verify with focused temporal graph tests and the project quick gate."
+      ],
+      "done_criteria": [
+        "Failed graph sources with error chat model is not configured can be requeued after Chat config is ready.",
+        "Other model failures such as MiniMax HTTP/rate-limit errors are not automatically requeued by this recovery path.",
+        "Background ProcessPending does not unexpectedly requeue recoverable failures and consume model quota.",
+        "Runtime graph status/config is checked without exposing private chat data.",
+        "Verification commands and skipped runtime/model checks are recorded."
+      ],
+      "evidence": [
+        {
+          "command": "curl -sS --max-time 5 http://127.0.0.1:5030/health",
+          "result": "PASS: local service returned status ok."
+        },
+        {
+          "command": "curl -sS --max-time 5 'http://127.0.0.1:5030/api/v1/graph/status?format=json'",
+          "result": "PASS: reproduced graph status with source_count=4867 processed=3169 failed=1698 pending=0 and last_error=chat model is not configured."
+        },
+        {
+          "command": "curl -sS --max-time 5 'http://127.0.0.1:5030/api/v1/semantic/config?format=json'",
+          "result": "PASS: semantic config showed enabled=true, chat_provider=mmx, chat_model=MiniMax-M2.7, and has_api_key=true; no API key value was returned."
+        },
+        {
+          "command": "go test ./internal/chatlog/temporalgraph",
+          "result": "PASS: temporal graph package tests passed with recovery coverage."
+        },
+        {
+          "command": "go test ./internal/chatlog/dailyreport ./internal/chatlog/semantic ./internal/chatlog/temporalgraph",
+          "result": "PASS: focused project gate passed."
+        },
+        {
+          "command": "./init.sh",
+          "result": "PASS: quick gate completed; root harness check 41/41, harness skill check 29/29, daily report help, and HTTP endpoint list all passed."
+        },
+        {
+          "command": "make build",
+          "result": "PASS: rebuilt bin/chatlog with the temporal graph recovery fix."
+        },
+        {
+          "command": "restart tmux service chatlog-alpha using ./bin/chatlog",
+          "result": "PASS: local service restarted; /health returned status ok; graph status no longer included last_error=chat model is not configured."
+        },
+        {
+          "command": "POST /api/v1/graph/resume?format=json",
+          "result": "PASS: requeued 1671 recoverable chat-config failures; failed count dropped from 1698 to 27; worker started with running=true."
+        },
+        {
+          "command": "go test ./internal/chatlog/semantic ./internal/chatlog/temporalgraph",
+          "result": "PASS: MiniMax timeout attempt and graph timeout requeue tests passed."
+        },
+        {
+          "command": "go test ./internal/chatlog/dailyreport ./internal/chatlog/semantic ./internal/chatlog/temporalgraph",
+          "result": "PASS: focused project gate passed after timeout retry change."
+        },
+        {
+          "command": "make build and restart tmux service chatlog-alpha",
+          "result": "PASS: rebuilt bin/chatlog and restarted 127.0.0.1:5030 with the timeout retry change."
+        },
+        {
+          "command": "POST /api/v1/graph/resume?format=json after timeout retry change",
+          "result": "PASS: timeout failures were requeued; failed timeout count became 0; remaining failed count was 25."
+        },
+        {
+          "command": "./init.sh",
+          "result": "PASS: quick gate completed after timeout retry change."
+        }
+      ],
+      "next_step": "Monitor /api/v1/graph/status; remaining failed items are non-timeout model/decode errors and should be triaged separately if they matter.",
+      "dependencies": []
+    },
+    {
+      "id": "harness-assessment-report",
+      "name": "Harness Assessment Report",
+      "title": "Harness Assessment Report",
+      "description": "Generate a shareable HTML or benchmark assessment after the root harness bridge has real before/after evidence.",
+      "status": "deferred",
+      "scope": [
+        "Use harness-creator assessment tooling to compare before and after structure.",
+        "Keep the report as a content and retrospective artifact, not a shipping gate."
+      ],
+      "done_criteria": [
+        "Report includes pre-change 20/100 baseline and post-change validation evidence.",
+        "Report clearly states that structural benchmark is not a real agent-session eval."
+      ],
+      "evidence": [],
+      "next_step": "Run the assessment only after the root harness bridge is verified.",
+      "dependencies": [
+        "root-harness-bridge"
+      ]
+    },
+    {
+      "id": "middleware-incident-chain-report-2026-06-04",
+      "name": "Middleware / CRM Incident Chain Report 2026-06-04",
+      "title": "Use temporal graph to reconstruct middleware / CRM incident chain",
+      "description": "Aggregate graph timeline + query events/facts/relations within 90d window to build a 4-day middleware/CRM incident chain retrospective as a local HTML report, without exposing private chat content and without blocking the running re-process worker.",
+      "status": "completed",
+      "scope": [
+        "Probe graph read endpoints (status / timeline / query / visualize / qa).",
+        "Locate CRM middleware incident chain via keyword = CRM, 跨域, 连接池, 延迟, 故障复盘.",
+        "Anchor report to graph events/facts/relations with source_record_id / source_label provenance.",
+        "Render self-contained HTML report under reports/ (private, not committed).",
+        "Update progress.md and session-handoff.md with this side-task."
+      ],
+      "done_criteria": [
+        "Graph read endpoints return data with running=true and processed=4872.",
+        "At least 4 fault symptoms, 3 diagnostic steps, 4 fix steps, and 2 follow-up actions are linked in the timeline.",
+        "All cited events carry source_label so the reader can jump back to the original message.",
+        "Report file is generated at reports/middleware-incident-chain-2026-05-31_06-03.html.",
+        "No message search triggered (worker under load); only readonly graph endpoints used."
+      ],
+      "evidence": [
+        {
+          "command": "curl -sS 'http://127.0.0.1:5030/api/v1/graph/status?format=json'",
+          "result": "PASS: running=true, entity_count=8238, event_count=4167, processed=4872, failed=33, pending=12147."
+        },
+        {
+          "command": "curl -sS 'http://127.0.0.1:5030/api/v1/graph/timeline?keyword=CRM&window=90d&limit=60&format=json'",
+          "result": "PASS: 60 events, includes 营业厅网关告警 / 月账单连接失败 / 短号查询告警 / CIP00068 失败 / 域名跳转跨域 / 磐基-CRM虚机延迟 / 145前台故障."
+        },
+        {
+          "command": "curl -sS 'http://127.0.0.1:5030/api/v1/graph/timeline?keyword=跨域&window=90d&format=json'",
+          "result": "PASS: 5 items, includes 跨域跳转问题反馈 + 域名跳转跨域问题排查 + 跨域不可访问 relation."
+        },
+        {
+          "command": "curl -sS 'http://127.0.0.1:5030/api/v1/graph/timeline?keyword=中间件&window=90d&format=json'",
+          "result": "PASS: 36 items, includes 12台中间件服务器基础监控部署完成 (96 条规则) and 中间件巡检报告分享."
+        },
+        {
+          "command": "write reports/middleware-incident-chain-2026-05-31_06-03.html",
+          "result": "PASS: ~28KB self-contained HTML, sections: summary / timeline / root / actions / maintain / data."
+        }
+      ],
+      "next_step": "When graph worker drain completes, rerun /api/v1/graph/timeline?keyword=中间件&window=90d to refresh, then re-anchor unverified items (编译报错待解决 / 王勇夜间补测脚本).",
+      "dependencies": [
+        "temporal-graph-reprocess-failed-2026-06-04"
+      ],
+      "side_task": true
+    }
+  ]
+}

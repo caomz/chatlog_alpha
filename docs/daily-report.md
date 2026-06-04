@@ -53,6 +53,32 @@ reports/daily-YYYY-MM-DD-dialogue-analysis.md
 reports/.image-analysis-cache.json
 ```
 
+## HTML / Markdown 阅读版
+
+增强 HTML 阅读版从已有 `reports/daily-YYYY-MM-DD.json` 生成，同时会把同日期 `reports/daily-YYYY-MM-DD.md` 复制到最终目录，不会重新调用 `--summary` / `--vision` 或外部模型。
+
+默认命令：
+
+```bash
+go run ./skills/chatlog-http-cli/scripts/render-enhanced-daily-html.go \
+  --config .cache/daily-report-config/chatlog-server.json
+```
+
+默认输出：
+
+```text
+/Volumes/WorkSSD/Dev/openclaw_mz/knowledge/raw/微信每日聊天记录/daily-YYYY-MM-DD-enhanced.html
+/Volumes/WorkSSD/Dev/openclaw_mz/knowledge/raw/微信每日聊天记录/daily-YYYY-MM-DD.md
+```
+
+如需指定日期：
+
+```bash
+go run ./skills/chatlog-http-cli/scripts/render-enhanced-daily-html.go \
+  --json reports/daily-2026-05-28.json \
+  --config .cache/daily-report-config/chatlog-server.json
+```
+
 启用图片理解 + 文本解析，并让 MiniMax 多 Key 并发：
 
 ```bash

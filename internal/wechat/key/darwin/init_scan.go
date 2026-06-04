@@ -25,6 +25,53 @@ type dbSaltEntry struct {
 	DBRel   string
 }
 
+// BuildAllKeysByPIDAndSalts matches externally collected db salts with keys
+// scanned from WeChat process memory. This is used by privileged helpers on
+// macOS when the elevated process can read process memory but cannot access
+// the user's TCC-protected WeChat container files.
+func BuildAllKeysByPIDAndSalts(pid uint32, salts map[string]string) (map[string]string, string, error) {
+	if pid == 0 {
+		return nil, "", fmt.Errorf("invalid pid")
+	}
+	if len(salts) == 0 {
+		return nil, "", fmt.Errorf("empty salt map")
+	}
+
+	pairs, err := scanKeySaltPairsByPID(pid)
+	if err != nil {
+		return nil, "", err
+	}
+	if len(pairs) == 0 {
+		return nil, "", fmt.Errorf("内存扫描未发现候选 key/salt")
+	}
+
+	out := map[string]string{}
+	for rel, salt := range salts {
+		rel = normalizePath(rel)
+		salt = strings.ToLower(strings.TrimSpace(salt))
+		if rel == "" || len(salt) != 32 {
+			continue
+		}
+		for _, pair := range pairs {
+			if pair.SaltHex == salt {
+				out[rel] = strings.ToLower(pair.KeyHex)
+				break
+			}
+		}
+	}
+	if len(out) == 0 {
+		return nil, "", fmt.Errorf("扫描到候选 key，但未匹配到任意数据库 salt")
+	}
+
+	if key, ok := pickPreferredMessageKeyFromMap(out); ok {
+		return out, key, nil
+	}
+	for _, key := range out {
+		return out, key, nil
+	}
+	return nil, "", fmt.Errorf("all_keys.json 中没有有效 enc_key")
+}
+
 // InitAllKeysByPID implements wx-cli style flow:
 // 1) collect db salts under db_storage
 // 2) scan process memory for x'<64hex_key><32hex_salt>'
@@ -177,6 +224,26 @@ func pickPreferredMessageKey(dataDir string, keys map[string]string, status func
 		status(fmt.Sprintf("message库未命中，按频次回退选择候选 key（top=%d）", counts[0].Count))
 	}
 	return counts[0].Key, true
+}
+
+func pickPreferredMessageKeyFromMap(keys map[string]string) (string, bool) {
+	preferred := []string{
+		"message/message_0.db",
+		"db_storage/message/message_0.db",
+		"session/session.db",
+		"db_storage/session/session.db",
+	}
+	for _, rel := range preferred {
+		if key, ok := keys[normalizePath(rel)]; ok && len(key) == 64 {
+			return strings.ToLower(key), true
+		}
+	}
+	for rel, key := range keys {
+		if strings.Contains(normalizePath(rel), "message") && len(key) == 64 {
+			return strings.ToLower(key), true
+		}
+	}
+	return "", false
 }
 
 func validateKeyOnDBPath(dataDir, dbRelPath, keyHex string) bool {

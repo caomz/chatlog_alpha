@@ -24,17 +24,18 @@ import (
 )
 
 const (
-	maxEmbeddingBatch       = 64
-	maxEmbeddingInputTokens = 3072
-	maxRerankTotalChars     = 30000 // GLM rerank limits query+documents to 32k chars
-	maxRerankDocs           = 80    // cap docs sent to reranker
-	maxOllamaRerankDocs     = 20    // local generation-based rerank is much slower than hosted rerank APIs
-	maxRerankDocChars       = 400   // per-doc char ceiling for reranker
-	defaultMiniMaxBaseURL   = "https://api.minimax.io/v1"
-	defaultMiniMaxCNBaseURL = "https://api.minimaxi.com/v1"
-	maxMiniMaxChatAttempts  = 3
-	miniMaxRetryBaseDelay   = 1500 * time.Millisecond
-	miniMaxAcquirePollDelay = 10 * time.Millisecond
+	maxEmbeddingBatch         = 64
+	maxEmbeddingInputTokens   = 3072
+	maxRerankTotalChars       = 30000 // GLM rerank limits query+documents to 32k chars
+	maxRerankDocs             = 80    // cap docs sent to reranker
+	maxOllamaRerankDocs       = 20    // local generation-based rerank is much slower than hosted rerank APIs
+	maxRerankDocChars         = 400   // per-doc char ceiling for reranker
+	defaultMiniMaxBaseURL     = "https://api.minimax.io/v1"
+	defaultMiniMaxCNBaseURL   = "https://api.minimaxi.com/v1"
+	maxMiniMaxChatAttempts    = 3
+	maxMiniMaxTimeoutAttempts = 5
+	miniMaxRetryBaseDelay     = 1500 * time.Millisecond
+	miniMaxAcquirePollDelay   = 10 * time.Millisecond
 )
 
 var ollamaScheduler = &ollamaModelScheduler{}
@@ -678,7 +679,7 @@ func (c *Client) chatMMXRaw(ctx context.Context, cfg conf.SemanticConfig, messag
 	}
 	var lastErr error
 	attempted := 0
-	for round := 1; round <= maxMiniMaxChatAttempts; round++ {
+	for round := 1; round <= miniMaxMaxAttemptsForError(lastErr); round++ {
 		excluded := map[string]bool{}
 		for {
 			lease, keyCount, err := miniMaxGlobalKeyPool.Acquire(ctx, excluded)
@@ -702,16 +703,17 @@ func (c *Client) chatMMXRaw(ctx context.Context, cfg conf.SemanticConfig, messag
 				break
 			}
 		}
-		if round < maxMiniMaxChatAttempts {
+		if round < miniMaxMaxAttemptsForError(lastErr) {
 			if waitErr := sleepWithContext(ctx, miniMaxRetryDelay(lastErr, round)); waitErr != nil {
 				return "", fmt.Errorf("minimax chat failed: %w", waitErr)
 			}
 		}
 	}
+	maxAttempts := miniMaxMaxAttemptsForError(lastErr)
 	if lastErr == nil {
-		return "", fmt.Errorf("minimax chat failed after %d round(s), tried %d key attempt(s)", maxMiniMaxChatAttempts, attempted)
+		return "", fmt.Errorf("minimax chat failed after %d round(s), tried %d key attempt(s)", maxAttempts, attempted)
 	}
-	return "", fmt.Errorf("minimax chat failed after %d round(s), tried %d key attempt(s), last_error=%w", maxMiniMaxChatAttempts, attempted, lastErr)
+	return "", fmt.Errorf("minimax chat failed after %d round(s), tried %d key attempt(s), last_error=%w", maxAttempts, attempted, lastErr)
 }
 
 func (c *Client) doMiniMaxChatWithLease(ctx context.Context, lease *miniMaxAPIKeyLease, payload map[string]any) (string, error) {
@@ -742,7 +744,7 @@ func (c *Client) analyzeMiniMaxImage(ctx context.Context, prompt string, imageDa
 	}
 	var lastErr error
 	attempted := 0
-	for round := 1; round <= maxMiniMaxChatAttempts; round++ {
+	for round := 1; round <= miniMaxMaxAttemptsForError(lastErr); round++ {
 		excluded := map[string]bool{}
 		for {
 			lease, keyCount, err := miniMaxGlobalKeyPool.Acquire(ctx, excluded)
@@ -766,16 +768,17 @@ func (c *Client) analyzeMiniMaxImage(ctx context.Context, prompt string, imageDa
 				break
 			}
 		}
-		if round < maxMiniMaxChatAttempts {
+		if round < miniMaxMaxAttemptsForError(lastErr) {
 			if waitErr := sleepWithContext(ctx, miniMaxRetryDelay(lastErr, round)); waitErr != nil {
 				return "", fmt.Errorf("minimax vision failed: %w", waitErr)
 			}
 		}
 	}
+	maxAttempts := miniMaxMaxAttemptsForError(lastErr)
 	if lastErr == nil {
-		return "", fmt.Errorf("minimax vision failed after %d round(s), tried %d key attempt(s)", maxMiniMaxChatAttempts, attempted)
+		return "", fmt.Errorf("minimax vision failed after %d round(s), tried %d key attempt(s)", maxAttempts, attempted)
 	}
-	return "", fmt.Errorf("minimax vision failed after %d round(s), tried %d key attempt(s), last_error=%w", maxMiniMaxChatAttempts, attempted, lastErr)
+	return "", fmt.Errorf("minimax vision failed after %d round(s), tried %d key attempt(s), last_error=%w", maxAttempts, attempted, lastErr)
 }
 
 func (c *Client) doMiniMaxVisionWithLease(ctx context.Context, lease *miniMaxAPIKeyLease, payload map[string]any) (string, error) {
@@ -1059,6 +1062,31 @@ func isRetryableMiniMaxError(err error) bool {
 		"network request failed",
 		"overloaded_error",
 		"server is overloaded",
+	} {
+		if strings.Contains(msg, token) {
+			return true
+		}
+	}
+	return false
+}
+
+func miniMaxMaxAttemptsForError(err error) int {
+	if isMiniMaxTimeoutError(err) {
+		return maxMiniMaxTimeoutAttempts
+	}
+	return maxMiniMaxChatAttempts
+}
+
+func isMiniMaxTimeoutError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	for _, token := range []string{
+		"context deadline exceeded",
+		"client.timeout",
+		"timeout",
+		"deadline exceeded",
 	} {
 		if strings.Contains(msg, token) {
 			return true

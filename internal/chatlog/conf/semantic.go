@@ -21,7 +21,8 @@ const (
 	DefaultGLMEmbeddingDim    = 2048
 	DefaultDeepSeekBaseURL    = "https://api.deepseek.com"
 	DefaultDeepSeekChat       = "deepseek-chat"
-	DefaultMMXChat            = "MiniMax-M2.7"
+	DefaultMMXChat            = "MiniMax-M3"
+	LegacyMMXChatM27          = "MiniMax-M2.7"
 	DefaultSemanticRecallK    = 80
 	DefaultSemanticTopN       = 20
 	DefaultSemanticThreshold  = 0.55
@@ -92,13 +93,13 @@ func NormalizeSemanticConfig(in SemanticConfig) SemanticConfig {
 		out.RerankModel = DefaultGLMRerank
 	}
 	out.ChatModel = strings.TrimSpace(out.ChatModel)
-	if out.ChatProvider == ProviderOllama && (out.ChatModel == "" || out.ChatModel == DefaultGLMChat || out.ChatModel == DefaultDeepSeekChat || out.ChatModel == DefaultMMXChat) {
+	if out.ChatProvider == ProviderOllama && (out.ChatModel == "" || out.ChatModel == DefaultGLMChat || out.ChatModel == DefaultDeepSeekChat || isKnownMMXChat(out.ChatModel)) {
 		out.ChatModel = DefaultOllamaChat
 	}
-	if out.ChatProvider == ProviderDeepSeek && (out.ChatModel == "" || out.ChatModel == DefaultGLMChat || out.ChatModel == DefaultOllamaChat || out.ChatModel == DefaultMMXChat) {
+	if out.ChatProvider == ProviderDeepSeek && (out.ChatModel == "" || out.ChatModel == DefaultGLMChat || out.ChatModel == DefaultOllamaChat || isKnownMMXChat(out.ChatModel)) {
 		out.ChatModel = DefaultDeepSeekChat
 	}
-	if out.ChatProvider == ProviderGLM && (out.ChatModel == "" || out.ChatModel == DefaultDeepSeekChat || out.ChatModel == DefaultOllamaChat || out.ChatModel == DefaultMMXChat) {
+	if out.ChatProvider == ProviderGLM && (out.ChatModel == "" || out.ChatModel == DefaultDeepSeekChat || out.ChatModel == DefaultOllamaChat || isKnownMMXChat(out.ChatModel)) {
 		out.ChatModel = DefaultGLMChat
 	}
 	if out.ChatProvider == ProviderMMX && (out.ChatModel == "" || out.ChatModel == DefaultGLMChat || out.ChatModel == DefaultDeepSeekChat || out.ChatModel == DefaultOllamaChat) {
@@ -175,6 +176,15 @@ func normalizeProvider(raw, fallback string) string {
 		return ProviderMMX
 	default:
 		return fallback
+	}
+}
+
+func isKnownMMXChat(model string) bool {
+	switch strings.TrimSpace(model) {
+	case DefaultMMXChat, LegacyMMXChatM27:
+		return true
+	default:
+		return false
 	}
 }
 

@@ -8,6 +8,7 @@ const skillRoot = path.resolve(scriptDir, '..');
 
 const files = [
   'SKILL.md',
+  'scripts/render-enhanced-daily-html.go',
   'references/harness-map.md',
   'references/verification-gates.md',
   'references/session-state.md',
@@ -52,6 +53,9 @@ checkContains('make build gate', ['make build']);
 checkContains('daily help gate', ['go run . report daily --help']);
 checkContains('http health gate', ['/health', '/api/v1/ping']);
 checkContains('quota warning', ['--vision', '--summary', 'quota']);
+checkContains('daily html renderer', ['render-enhanced-daily-html.go']);
+checkContains('daily html output dir', ['/volumes/workssd/dev/openclaw_mz/knowledge/raw/微信每日聊天记录']);
+checkContains('daily markdown output', ['markdown-out', 'daily-yyyy-mm-dd.md']);
 
 const failed = checks.filter((check) => !check.pass);
 

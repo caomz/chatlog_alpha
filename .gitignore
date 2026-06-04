@@ -93,3 +93,6 @@ tmpclaude-*/
 # Test files
 sns.md
 .claude/settings.local.json
+
+# frontend-slides transient build output
+outputs/

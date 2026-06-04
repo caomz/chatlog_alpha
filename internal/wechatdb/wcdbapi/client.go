@@ -500,7 +500,10 @@ func (c *Client) ensureDecrypted(src string) (string, error) {
 	srcMTime := st.ModTime().UnixNano()
 	if ok && entry.srcMTime == srcMTime && entry.walMTime == walMTime && entry.keyHex == useKey {
 		if _, err := os.Stat(entry.outPath); err == nil {
-			return entry.outPath, nil
+			if readable, err := isReadableSQLite(entry.outPath); err == nil && readable {
+				return entry.outPath, nil
+			}
+			_ = os.Remove(entry.outPath)
 		}
 	}
 
@@ -529,14 +532,30 @@ func (c *Client) ensureDecrypted(src string) (string, error) {
 		return "", err
 	}
 	if walMTime > 0 {
+		baseCopy := tmpPath + ".base"
+		if err := copyFile(tmpPath, baseCopy); err != nil {
+			_ = os.Remove(tmpPath)
+			return "", err
+		}
 		keyBytes, err := decodeHexKey(useKey)
 		if err != nil {
 			_ = os.Remove(tmpPath)
+			_ = os.Remove(baseCopy)
 			return "", err
 		}
 		if err := applyWAL(walPath, tmpPath, keyBytes); err != nil {
 			_ = os.Remove(tmpPath)
+			_ = os.Remove(baseCopy)
 			return "", err
+		}
+		if ok, err := isReadableSQLite(tmpPath); err != nil || !ok {
+			_ = os.Remove(tmpPath)
+			if err := os.Rename(baseCopy, tmpPath); err != nil {
+				_ = os.Remove(baseCopy)
+				return "", err
+			}
+		} else {
+			_ = os.Remove(baseCopy)
 		}
 	}
 	if err := os.Rename(tmpPath, outPath); err != nil {
@@ -743,6 +762,28 @@ func fileMTimeNS(path string) int64 {
 		return 0
 	}
 	return st.ModTime().UnixNano()
+}
+
+func copyFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		out.Close()
+		_ = os.Remove(dst)
+		return err
+	}
+	if err := out.Close(); err != nil {
+		_ = os.Remove(dst)
+		return err
+	}
+	return nil
 }
 
 func decodeHexKey(hexKey string) ([]byte, error) {

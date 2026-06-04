@@ -190,6 +190,27 @@ chatlog http call --endpoint cache_clear --method POST
 
 Most `/api/v1/*` endpoints default to YAML output unless `format=json` is provided. `--path` overrides endpoint path when both are provided.
 
+## Daily Report HTML / Markdown Artifacts
+
+The enhanced standalone HTML reader is generated from an existing `reports/daily-YYYY-MM-DD.json` artifact, and the matching Markdown report is copied from `reports/daily-YYYY-MM-DD.md`. Prefer this path when the user asks for an HTML file or browser-readable daily report, because it does not rerun `--summary`, `--vision`, or any model provider call.
+
+Default command:
+
+```bash
+go run ./skills/chatlog-http-cli/scripts/render-enhanced-daily-html.go \
+  --config .cache/daily-report-config/chatlog-server.json
+```
+
+Default behavior:
+
+- `--json` empty: use the latest `reports/daily-YYYY-MM-DD.json`.
+- `--markdown` empty: use `reports/daily-YYYY-MM-DD.md` for the same report date.
+- `--out` empty: write `daily-YYYY-MM-DD-enhanced.html` to `/Volumes/WorkSSD/Dev/openclaw_mz/knowledge/raw/微信每日聊天记录`.
+- `--markdown-out` empty: write `daily-YYYY-MM-DD.md` to `/Volumes/WorkSSD/Dev/openclaw_mz/knowledge/raw/微信每日聊天记录`.
+- `--out-dir`: override only the destination directory.
+
+The generated HTML and copied Markdown are private chat-derived content. Do not commit them or paste their contents into chat. Verify them by checking path, timestamp, size, and high-level counts only.
+
 ## Automatic Hook Use
 
 The repo also documents hook usage in `skills/chatlog-http-cli/USAGE.md`.

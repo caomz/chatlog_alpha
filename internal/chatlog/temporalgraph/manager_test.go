@@ -1,10 +1,27 @@
 package temporalgraph
 
 import (
+	"context"
 	"errors"
 	"testing"
 	"time"
+
+	"github.com/sjzar/chatlog/internal/chatlog/conf"
 )
+
+type testGraphConfig struct {
+	workDir  string
+	semantic conf.SemanticConfig
+}
+
+func (c testGraphConfig) GetWorkDir() string {
+	return c.workDir
+}
+
+func (c testGraphConfig) GetSemanticConfig() *conf.SemanticConfig {
+	cfg := c.semantic
+	return &cfg
+}
 
 func TestShouldSkipGraphMessageContent(t *testing.T) {
 	cases := []struct {
@@ -140,5 +157,87 @@ func TestIsDatabaseNotReady(t *testing.T) {
 	}
 	if isDatabaseNotReady(errors.New("database query failed")) {
 		t.Fatal("unexpected database not ready match")
+	}
+}
+
+func TestResumeRequeuesRecoverableChatConfigFailures(t *testing.T) {
+	store, err := OpenStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("OpenStore() error = %v", err)
+	}
+	defer store.Close()
+
+	id, _, err := store.UpsertSource(SourceRecord{
+		SourceID:   "biz:recoverable",
+		SourceType: "business",
+		EventType:  "ticket",
+		Content:    "配置恢复后应重新抽取",
+		EventTime:  time.Now(),
+	})
+	if err != nil {
+		t.Fatalf("UpsertSource() error = %v", err)
+	}
+	if err := store.MarkSource(id, "failed", errChatModelNotConfigured); err != nil {
+		t.Fatalf("MarkSource() error = %v", err)
+	}
+	m := &Manager{
+		conf: testGraphConfig{semantic: conf.NormalizeSemanticConfig(conf.SemanticConfig{
+			Enabled:      true,
+			ChatProvider: conf.ProviderMMX,
+			ChatModel:    conf.DefaultMMXChat,
+		})},
+		store:   store,
+		lastErr: errChatModelNotConfigured,
+	}
+
+	if err := m.Resume(); err != nil {
+		t.Fatalf("Resume() error = %v", err)
+	}
+	st := store.Status(false, false, "")
+	if st.Pending != 1 || st.Failed != 0 {
+		t.Fatalf("unexpected status after resume: pending=%d failed=%d", st.Pending, st.Failed)
+	}
+	if m.lastErr != "" {
+		t.Fatalf("recoverable lastErr was not cleared: %q", m.lastErr)
+	}
+}
+
+func TestProcessPendingDoesNotAutoRequeueRecoverableFailures(t *testing.T) {
+	store, err := OpenStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("OpenStore() error = %v", err)
+	}
+	defer store.Close()
+
+	id, _, err := store.UpsertSource(SourceRecord{
+		SourceID:   "biz:no-auto-retry",
+		SourceType: "business",
+		EventType:  "ticket",
+		Content:    "只有显式恢复才重试",
+		EventTime:  time.Now(),
+	})
+	if err != nil {
+		t.Fatalf("UpsertSource() error = %v", err)
+	}
+	if err := store.MarkSource(id, "failed", errChatModelNotConfigured); err != nil {
+		t.Fatalf("MarkSource() error = %v", err)
+	}
+	m := &Manager{
+		conf: testGraphConfig{semantic: conf.NormalizeSemanticConfig(conf.SemanticConfig{
+			Enabled:      true,
+			ChatProvider: conf.ProviderMMX,
+			ChatModel:    conf.DefaultMMXChat,
+		})},
+		store:   store,
+		lastErr: errChatModelNotConfigured,
+	}
+
+	m.ProcessPending(context.Background(), 10)
+	st := store.Status(false, false, "")
+	if st.Pending != 0 || st.Failed != 1 {
+		t.Fatalf("unexpected status after process: pending=%d failed=%d", st.Pending, st.Failed)
+	}
+	if m.lastErr != "" {
+		t.Fatalf("stale recoverable lastErr was not cleared: %q", m.lastErr)
 	}
 }

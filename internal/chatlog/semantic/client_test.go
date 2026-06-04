@@ -80,6 +80,15 @@ func TestMiniMaxRetryDelay(t *testing.T) {
 	}
 }
 
+func TestMiniMaxMaxAttemptsForTimeout(t *testing.T) {
+	if got := miniMaxMaxAttemptsForError(errors.New("Post https://api.minimaxi.com/v1/chat/completions: context deadline exceeded (Client.Timeout exceeded while awaiting headers)")); got != maxMiniMaxTimeoutAttempts {
+		t.Fatalf("timeout attempts = %d, want %d", got, maxMiniMaxTimeoutAttempts)
+	}
+	if got := miniMaxMaxAttemptsForError(errors.New("model http 529: overloaded_error")); got != maxMiniMaxChatAttempts {
+		t.Fatalf("non-timeout attempts = %d, want %d", got, maxMiniMaxChatAttempts)
+	}
+}
+
 func TestLoadMiniMaxHTTPConfigFromEnvKeys(t *testing.T) {
 	clearMiniMaxEnv(t)
 	t.Setenv("MINIMAX_API_KEYS", " sk-cp-one1111, ,sk-cp-two2222,sk-cp-one1111 ")
@@ -133,7 +142,7 @@ func TestLoadMiniMaxHTTPConfigEnvBaseURLOverridesConfig(t *testing.T) {
 		t.Fatalf("MkdirAll: %v", err)
 	}
 	cfgPath := filepath.Join(mmxDir, "config.json")
-	if err := os.WriteFile(cfgPath, []byte(`{"api_key":"sk-cp-file1111","base_url":"https://file-base.test/v1"}`), 0o600); err != nil {
+	if err := os.WriteFile(cfgPath, []byte(`{"api_key":"test-api-key","base_url":"https://file-base.test/v1"}`), 0o600); err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}
 
@@ -141,7 +150,7 @@ func TestLoadMiniMaxHTTPConfigEnvBaseURLOverridesConfig(t *testing.T) {
 	if err != nil {
 		t.Fatalf("loadMiniMaxHTTPConfig returned error: %v", err)
 	}
-	if got, want := strings.Join(cfg.APIKeys, ","), "sk-cp-file1111"; got != want {
+	if got, want := strings.Join(cfg.APIKeys, ","), "test-api-key"; got != want {
 		t.Fatalf("APIKeys = %q, want %q", got, want)
 	}
 	if cfg.BaseURL != "https://env-base.test/v1" {

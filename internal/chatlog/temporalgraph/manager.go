@@ -31,6 +31,7 @@ const (
 	chunkMaxGap                = 30 * time.Minute
 	defaultGraphWorkers        = 1
 	defaultGraphEnqueueWorkers = 1
+	maxGraphDecodeAttempts     = 3
 	maxGraphWorkers            = 12
 )
 
@@ -38,6 +39,14 @@ var (
 	errNoGraphResults = errors.New("temporal graph extraction produced no reliable graph results")
 	mentionTextRe     = regexp.MustCompile(`@\S+`)
 )
+
+const errChatModelNotConfigured = "chat model is not configured"
+
+var recoverableGraphTimeoutErrorTokens = []string{
+	"context deadline exceeded",
+	"client.timeout",
+	"network timeout",
+}
 
 type Config interface {
 	GetWorkDir() string
@@ -186,6 +195,12 @@ func (m *Manager) Pause() error {
 }
 
 func (m *Manager) Resume() error {
+	if m.chatReady() {
+		if _, err := m.requeueRecoverableFailedSources(); err != nil {
+			return err
+		}
+		m.clearRecoverableConfigError()
+	}
 	m.mu.Lock()
 	m.paused = false
 	m.mu.Unlock()
@@ -225,7 +240,7 @@ func (m *Manager) ProcessPending(ctx context.Context, limit int) {
 		return
 	}
 	if !m.chatReady() {
-		m.setError(fmt.Errorf("chat model is not configured"))
+		m.setError(errors.New(errChatModelNotConfigured))
 		return
 	}
 	m.mu.Lock()
@@ -266,6 +281,7 @@ func (m *Manager) ProcessPending(ctx context.Context, limit int) {
 			return
 		}
 		if len(items) == 0 {
+			m.clearRecoverableConfigError()
 			return
 		}
 		m.processBatch(ctx, items, workers)
@@ -333,6 +349,14 @@ func (m *Manager) setError(err error) {
 	m.lastErr = err.Error()
 }
 
+func (m *Manager) clearRecoverableConfigError() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.lastErr == errChatModelNotConfigured {
+		m.lastErr = ""
+	}
+}
+
 func (m *Manager) processOne(ctx context.Context, rec SourceRecord) error {
 	ext, err := m.extract(ctx, rec)
 	if err != nil {
@@ -372,7 +396,7 @@ func (m *Manager) extract(ctx context.Context, rec SourceRecord) (Extraction, er
 	}
 	cfg := conf.NormalizeSemanticConfig(*cfgPtr)
 	if !cfg.Enabled || !conf.SemanticChatReady(cfg) {
-		return Extraction{}, fmt.Errorf("chat model is not configured")
+		return Extraction{}, errors.New(errChatModelNotConfigured)
 	}
 	system := `你是时间知识图谱抽取器。请只输出 JSON，不要解释。
 Schema:
@@ -383,18 +407,11 @@ Schema:
   "facts":[{"statement":"可追溯事实陈述","time_text":"原文中的时间表达","change_type":"observed|created|updated|ended|conflict","status":"active|ended|conflict","confidence":0.0,"evidence":"原文证据"}]
 }
 要求：实体名优先使用 participants/entity_hints 中的可识别名称；context 是理解前后文的证据，target 或 content 是当前抽取重点；关系和事实必须能从 content/context 中直接得到；如果出现“今天/明天/下周/月底”等时间表达，原样写入 time_text；如果出现“取消/结束/不再/改为/变更/冲突”等表达，设置 change_type/status；不确定时降低 confidence。`
-	raw, err := m.client.Chat(ctx, cfg, []semantic.ChatMessage{
+	messages := []semantic.ChatMessage{
 		{Role: "system", Content: system},
 		{Role: "user", Content: toJSONString(sourcePromptPayload(rec))},
-	})
-	if err != nil {
-		return Extraction{}, err
 	}
-	ext, err := decodeExtraction(raw)
-	if err != nil {
-		return Extraction{}, fmt.Errorf("decode graph extraction failed: %w; raw=%s", err, truncateRunes(raw, 260))
-	}
-	return ext, nil
+	return m.chatDecodeExtraction(ctx, cfg, messages, "extraction")
 }
 
 func (m *Manager) verifyExtraction(ctx context.Context, rec SourceRecord, ext Extraction) (Extraction, error) {
@@ -404,7 +421,7 @@ func (m *Manager) verifyExtraction(ctx context.Context, rec SourceRecord, ext Ex
 	}
 	cfg := conf.NormalizeSemanticConfig(*cfgPtr)
 	if !cfg.Enabled || !conf.SemanticChatReady(cfg) {
-		return Extraction{}, fmt.Errorf("chat model is not configured")
+		return Extraction{}, errors.New(errChatModelNotConfigured)
 	}
 	system := `你是时间知识图谱质量校验器。请只输出 JSON，不要解释。
 输入包含 source 和 extraction。你需要：
@@ -418,18 +435,38 @@ func (m *Manager) verifyExtraction(ctx context.Context, rec SourceRecord, ext Ex
 		"source":     sourcePromptPayload(rec),
 		"extraction": ext,
 	}
-	raw, err := m.client.Chat(ctx, cfg, []semantic.ChatMessage{
+	messages := []semantic.ChatMessage{
 		{Role: "system", Content: system},
 		{Role: "user", Content: toJSONString(payload)},
-	})
-	if err != nil {
-		return Extraction{}, err
 	}
-	out, err := decodeExtraction(raw)
-	if err != nil {
-		return Extraction{}, fmt.Errorf("decode graph verification failed: %w; raw=%s", err, truncateRunes(raw, 260))
+	return m.chatDecodeExtraction(ctx, cfg, messages, "verification")
+}
+
+func (m *Manager) chatDecodeExtraction(ctx context.Context, cfg conf.SemanticConfig, messages []semantic.ChatMessage, stage string) (Extraction, error) {
+	var lastErr error
+	stage = cleanType(stage, "extraction")
+	for attempt := 1; attempt <= maxGraphDecodeAttempts; attempt++ {
+		raw, err := m.client.Chat(ctx, cfg, messages)
+		if err != nil {
+			return Extraction{}, err
+		}
+		out, err := decodeExtraction(raw)
+		if err == nil {
+			return out, nil
+		}
+		lastErr = err
+		if ctx.Err() != nil {
+			return Extraction{}, ctx.Err()
+		}
+		messages = append(messages,
+			semantic.ChatMessage{Role: "assistant", Content: truncateRunes(raw, 1200)},
+			semantic.ChatMessage{Role: "user", Content: "上一次输出不是合法 JSON，无法解析。请不要解释，不要输出 Markdown 代码块，只重新输出一个完整、严格合法的 JSON 对象，字段必须是 entities、relations、events、facts。"},
+		)
 	}
-	return out, nil
+	if lastErr == nil {
+		lastErr = fmt.Errorf("unknown decode error")
+	}
+	return Extraction{}, fmt.Errorf("decode graph %s failed after %d attempt(s): %w", stage, maxGraphDecodeAttempts, lastErr)
 }
 
 func normalizeExtraction(ext Extraction, rec SourceRecord) Extraction {
@@ -665,8 +702,12 @@ func (m *Manager) IngestEvent(ctx context.Context, item IngestEvent) (int64, err
 
 func (m *Manager) Rebuild(ctx context.Context, reset bool) error {
 	if !m.chatReady() {
-		return fmt.Errorf("chat model is not configured")
+		return errors.New(errChatModelNotConfigured)
 	}
+	if _, err := m.requeueRecoverableFailedSources(); err != nil {
+		return err
+	}
+	m.clearRecoverableConfigError()
 	if reset {
 		if err := m.store.ClearGraph(); err != nil {
 			return err
@@ -685,6 +726,18 @@ func (m *Manager) chatReady() bool {
 	}
 	cfg := m.conf.GetSemanticConfig()
 	return cfg != nil && cfg.Enabled && conf.SemanticChatReady(*cfg)
+}
+
+func (m *Manager) requeueRecoverableFailedSources() (int64, error) {
+	if m == nil || m.store == nil {
+		return 0, nil
+	}
+	total, err := m.store.RequeueFailedSourcesByError(errChatModelNotConfigured)
+	if err != nil {
+		return total, err
+	}
+	n, err := m.store.RequeueFailedSourcesByErrorContaining(recoverableGraphTimeoutErrorTokens)
+	return total + n, err
 }
 
 func (m *Manager) EnsureHistoryQueued(ctx context.Context) {

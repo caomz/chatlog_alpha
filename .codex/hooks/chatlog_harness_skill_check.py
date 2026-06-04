@@ -11,7 +11,18 @@ from pathlib import Path
 from typing import Any
 
 PROJECT_ROOT = Path("/Volumes/WorkSSD/Dev/chatlog_alpha").resolve()
-CHECK_CMD = ["node", "skills/chatlog-http-cli/scripts/check-harness-skill.mjs"]
+CHECK_CMDS = [
+    {
+        "label": "repo-local harness skill",
+        "command": ["node", "skills/chatlog-http-cli/scripts/check-harness-skill.mjs"],
+        "failure": "fix skills/chatlog-http-cli before declaring completion.",
+    },
+    {
+        "label": "root harness bridge",
+        "command": ["node", "scripts/check-root-harness.mjs"],
+        "failure": "fix root harness artifacts before declaring completion.",
+    },
+]
 
 
 def _load_payload() -> dict[str, Any]:
@@ -49,15 +60,11 @@ def _is_inside_project(path: Path) -> bool:
     return path == PROJECT_ROOT or PROJECT_ROOT in path.parents
 
 
-def main() -> int:
-    payload = _load_payload()
-    if not any(_is_inside_project(path) for path in _candidate_paths(payload)):
-        return 0
-
-    print("[chatlog harness] running repo-local harness skill check...")
+def _run_check(label: str, command: list[str], failure: str) -> int:
+    print(f"[chatlog harness] running {label} check...")
     try:
         result = subprocess.run(
-            CHECK_CMD,
+            command,
             cwd=PROJECT_ROOT,
             text=True,
             capture_output=True,
@@ -65,10 +72,10 @@ def main() -> int:
             check=False,
         )
     except FileNotFoundError as exc:
-        print(f"[chatlog harness] failed to start check command: {exc}", file=sys.stderr)
+        print(f"[chatlog harness] failed to start {label} check: {exc}", file=sys.stderr)
         return 1
     except subprocess.TimeoutExpired:
-        print("[chatlog harness] check timed out after 30s", file=sys.stderr)
+        print(f"[chatlog harness] {label} check timed out after 30s", file=sys.stderr)
         return 1
 
     if result.stdout:
@@ -78,12 +85,26 @@ def main() -> int:
 
     if result.returncode != 0:
         print(
-            "[chatlog harness] FAILED: fix skills/chatlog-http-cli before declaring completion.",
+            f"[chatlog harness] FAILED: {failure}",
             file=sys.stderr,
         )
         return result.returncode
 
-    print("[chatlog harness] OK: harness skill check passed.")
+    print(f"[chatlog harness] OK: {label} check passed.")
+    return 0
+
+
+def main() -> int:
+    payload = _load_payload()
+    if not any(_is_inside_project(path) for path in _candidate_paths(payload)):
+        return 0
+
+    for check in CHECK_CMDS:
+        code = _run_check(check["label"], check["command"], check["failure"])
+        if code != 0:
+            return code
+
+    print("[chatlog harness] OK: all harness checks passed.")
     return 0
 
 
