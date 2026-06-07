@@ -196,31 +196,39 @@ type ExtractedFact struct {
 }
 
 type Status struct {
-	Enabled              bool    `json:"enabled"`
-	Paused               bool    `json:"paused"`
-	Running              bool    `json:"running"`
-	HistoryQueued        bool    `json:"history_queued"`
-	EnqueueRunning       bool    `json:"enqueue_running"`
-	Workers              int     `json:"workers"`
-	EnqueueWorkers       int     `json:"enqueue_workers"`
-	EffectiveWorkers     int     `json:"effective_workers,omitempty"`
-	AdaptiveLevel        string  `json:"adaptive_level,omitempty"`
-	StorePath            string  `json:"store_path"`
-	EntityCount          int     `json:"entity_count"`
-	RelationCount        int     `json:"relation_count"`
-	EventCount           int     `json:"event_count"`
-	FactCount            int     `json:"fact_count"`
-	SourceCount          int     `json:"source_count"`
-	Pending              int     `json:"pending"`
-	Processing           int     `json:"processing"`
-	Processed            int     `json:"processed"`
-	Failed               int     `json:"failed"`
-	ProgressPct          float64 `json:"progress_pct"`
-	StartedAt            string  `json:"started_at,omitempty"`
-	ProcessingRatePerMin float64 `json:"processing_rate_per_minute,omitempty"`
-	EstimatedSecondsLeft int64   `json:"estimated_seconds_left,omitempty"`
-	LastUpdatedAt        string  `json:"last_updated_at,omitempty"`
-	LastError            string  `json:"last_error,omitempty"`
+	Enabled              bool              `json:"enabled"`
+	Paused               bool              `json:"paused"`
+	Running              bool              `json:"running"`
+	HistoryQueued        bool              `json:"history_queued"`
+	EnqueueRunning       bool              `json:"enqueue_running"`
+	Workers              int               `json:"workers"`
+	EnqueueWorkers       int               `json:"enqueue_workers"`
+	EffectiveWorkers     int               `json:"effective_workers,omitempty"`
+	AdaptiveLevel        string            `json:"adaptive_level,omitempty"`
+	StorePath            string            `json:"store_path"`
+	EntityCount          int               `json:"entity_count"`
+	RelationCount        int               `json:"relation_count"`
+	EventCount           int               `json:"event_count"`
+	FactCount            int               `json:"fact_count"`
+	SourceCount          int               `json:"source_count"`
+	Pending              int               `json:"pending"`
+	Processing           int               `json:"processing"`
+	Processed            int               `json:"processed"`
+	Failed               int               `json:"failed"`
+	ProgressPct          float64           `json:"progress_pct"`
+	StartedAt            string            `json:"started_at,omitempty"`
+	ProcessingRatePerMin float64           `json:"processing_rate_per_minute,omitempty"`
+	EstimatedSecondsLeft int64             `json:"estimated_seconds_left,omitempty"`
+	LastUpdatedAt        string            `json:"last_updated_at,omitempty"`
+	LastError            string            `json:"last_error,omitempty"`
+	// FailedBuckets reports the count of currently-failed sources per
+	// HA-004 normalized bucket. The map is always populated with every
+	// known bucket (zero when no row matched) so operator dashboards and
+	// HA guard can render a stable summary. The keys are bucket names
+	// (e.g. "config_error", "sensitive_input_1026"); values are counts.
+	// No private chat content, source payload, or prompt text is
+	// included — operators only see counts.
+	FailedBuckets map[string]int `json:"failed_buckets,omitempty"`
 }
 
 type QueryResult struct {

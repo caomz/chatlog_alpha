@@ -383,6 +383,145 @@ func (s *Store) RequeueFailedSourcesByErrorContaining(tokens []string) (int64, e
 	return res.RowsAffected()
 }
 
+// failedBucketTokens maps each HA-004 normalized bucket to a list of
+// case-insensitive substrings that bucket the error message into that
+// bucket. Order matters: the first matching bucket wins, so list
+// recoverable tokens before non-recoverable ones to avoid double
+// classification (e.g. "model http 429" lives in rate_limited, not
+// non_retryable_request).
+//
+// Adding a new bucket requires three changes:
+//   1. Append the bucket name and matching tokens here.
+//   2. Mention it in FailedBucketCounts so /api/v1/graph/status always
+//      reports it (even with 0).
+//   3. If the bucket is recoverable, add it to recoverableGraphBuckets
+//      in manager.go so /api/v1/graph/resume will requeue it.
+var failedBucketTokens = map[string][]string{
+	"config_error":              {errChatModelNotConfigured, "semantic config missing"},
+	"network_timeout":           {"client.timeout", "context deadline exceeded", "network timeout", "eof"},
+	"before_request_timeout":    {"before request"},
+	"rate_limited":              {"model http 429", "rate limit", "minimax_rate_limited"},
+	"auth_error":                {"http 401", "http 403", "minimax_auth_error"},
+	"json_decode_error":         {"decode graph extraction failed", "decode graph verification failed", "decode model response failed"},
+	"empty_graph":               {"temporal graph extraction produced no reliable graph results"},
+	"sensitive_input_1026":      {"new_sensitive (1026)", "minimax_sensitive_1026", "input new_sensitive"},
+	"sensitive_output_1027":     {"new_sensitive (1027)", "minimax_sensitive_1027", "output new_sensitive"},
+	"non_retryable_request":     {"http 400", "http 404", "http 422"},
+}
+
+// ClassifyFailedError returns the normalized HA-004 bucket name for the
+// given error string, or "" if no bucket matches. The classifier is
+// intentionally conservative: an empty result means "unclassified /
+// unknown" and such rows stay in the failed bucket without being
+// requeued by automatic recovery paths.
+func ClassifyFailedError(errText string) string {
+	errText = strings.ToLower(strings.TrimSpace(errText))
+	if errText == "" {
+		return ""
+	}
+	// Iterate in stable order so the first matching bucket wins.
+	for _, bucket := range orderedFailedBuckets() {
+		tokens, ok := failedBucketTokens[bucket]
+		if !ok {
+			continue
+		}
+		for _, token := range tokens {
+			if strings.Contains(errText, strings.ToLower(token)) {
+				return bucket
+			}
+		}
+	}
+	return ""
+}
+
+// orderedFailedBuckets returns the buckets in a deterministic iteration
+// order. Recoverable buckets come first so substring overlap (e.g. an
+// error message that contains both "context deadline exceeded" and
+// "minimax_sensitive_1026" — currently impossible in practice but
+// defensively bounded) is classified as the recoverable class only when
+// the recoverable token appears earlier in the message.
+func orderedFailedBuckets() []string {
+	return []string{
+		"config_error",
+		"network_timeout",
+		"before_request_timeout",
+		"rate_limited",
+		"auth_error",
+		"json_decode_error",
+		"empty_graph",
+		"sensitive_input_1026",
+		"sensitive_output_1027",
+		"non_retryable_request",
+	}
+}
+
+// AllFailedBucketNames returns the stable list of known bucket names.
+// The list is the public contract for /api/v1/graph/status#failed_buckets:
+// callers can rely on every name being present even when the count is 0.
+func AllFailedBucketNames() []string {
+	return append([]string{}, orderedFailedBuckets()...)
+}
+
+// RequeueFailedSourcesByBucket requeues every failed source whose error
+// string classifies into the given bucket. The bucket must be a known
+// HA-004 bucket name (case-sensitive); unknown names return 0 affected
+// rows so callers can safely pass user input.
+func (s *Store) RequeueFailedSourcesByBucket(bucket string) (int64, error) {
+	bucket = strings.TrimSpace(bucket)
+	tokens, ok := failedBucketTokens[bucket]
+	if !ok || len(tokens) == 0 {
+		return 0, nil
+	}
+	clauses := make([]string, 0, len(tokens))
+	args := []any{time.Now().Unix()}
+	for _, token := range tokens {
+		clauses = append(clauses, `LOWER(error) LIKE ?`)
+		args = append(args, "%"+strings.ToLower(token)+"%")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	query := fmt.Sprintf(`UPDATE graph_source_records SET status='pending', error='', updated_at=? WHERE status='failed' AND (%s)`, strings.Join(clauses, " OR "))
+	res, err := s.db.Exec(query, args...)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
+// FailedBucketCounts returns the number of currently-failed sources
+// classified into each known HA-004 bucket. The result always contains
+// every known bucket (with 0 when none match) so callers can render a
+// stable summary without special-casing missing keys.
+func (s *Store) FailedBucketCounts() (map[string]int, error) {
+	counts := make(map[string]int, len(orderedFailedBuckets()))
+	for _, name := range orderedFailedBuckets() {
+		counts[name] = 0
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rows, err := s.db.Query(`SELECT error FROM graph_source_records WHERE status='failed'`)
+	if err != nil {
+		return counts, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var raw string
+		if err := rows.Scan(&raw); err != nil {
+			return counts, err
+		}
+		bucket := ClassifyFailedError(raw)
+		if bucket == "" {
+			// Unclassified failures are still surfaced so operators
+			// see them; we just do not attribute them to a known
+			// bucket. We expose the catch-all under a stable token.
+			counts["unclassified"]++
+			continue
+		}
+		counts[bucket]++
+	}
+	return counts, rows.Err()
+}
+
 func (s *Store) ApplyExtraction(src SourceRecord, ext Extraction) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
