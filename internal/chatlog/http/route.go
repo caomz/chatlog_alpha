@@ -79,6 +79,7 @@ func (s *Service) initBaseRouter() {
 	s.router.GET("/api/v1/semantic/config", s.handleSemanticConfigGet)
 	s.router.POST("/api/v1/semantic/config", s.handleSemanticConfigSet)
 	s.router.POST("/api/v1/semantic/test", s.handleSemanticTest)
+	s.router.GET("/api/v1/semantic/mmx/status", s.handleSemanticMMXStatus)
 	s.router.GET("/api/v1/semantic/index/status", s.handleSemanticIndexStatus)
 	s.router.GET("/api/v1/semantic/index/preview", s.handleSemanticIndexPreview)
 	s.router.POST("/api/v1/semantic/qa/stream", s.handleSemanticQAStream)
@@ -274,10 +275,26 @@ func (s *Service) handleSemanticConfigGet(c *gin.Context) {
 		cfg = &conf.SemanticConfig{}
 	}
 	norm := conf.NormalizeSemanticConfig(*cfg)
+	// configured_key_count reports the MiniMax key pool size when the
+	// active Chat provider is mmx; otherwise it is 0. This keeps the
+	// runtime view consistent with the privacy-safe /semantic/mmx/status
+	// endpoint and prevents leaking env-side counts when the live config
+	// is not actually pointed at MiniMax.
+	configuredKeyCount := 0
+	if strings.EqualFold(strings.TrimSpace(norm.ChatProvider), conf.ProviderMMX) {
+		configuredKeyCount = semantic.MiniMaxConfiguredKeyCount()
+	}
+	// has_api_key is provider-aware: mmx derives keys from the env, so
+	// having at least one configured key counts as "has_api_key".
+	hasAPIKey := strings.TrimSpace(norm.APIKey) != ""
+	if strings.EqualFold(strings.TrimSpace(norm.ChatProvider), conf.ProviderMMX) {
+		hasAPIKey = configuredKeyCount > 0
+	}
 	writeByFormat(c, gin.H{
 		"enabled":              norm.Enabled,
 		"api_key":              "",
-		"has_api_key":          strings.TrimSpace(norm.APIKey) != "",
+		"has_api_key":          hasAPIKey,
+		"configured_key_count": configuredKeyCount,
 		"base_url":             norm.BaseURL,
 		"ollama_base_url":      norm.OllamaBaseURL,
 		"deepseek_api_key":     "",
@@ -356,6 +373,52 @@ func (s *Service) handleSemanticConfigSet(c *gin.Context) {
 	}
 	s.conf.SetSemanticConfig(cfg)
 	s.handleSemanticConfigGet(c)
+}
+
+// handleSemanticMMXStatus returns a privacy-safe view of the MiniMax key pool
+// so that operators and HA guard scripts can verify that 5 keys are actually
+// configured without printing real API keys. The response never contains any
+// key starting with "sk-" or any other reversible fragment.
+func (s *Service) handleSemanticMMXStatus(c *gin.Context) {
+	snap := semantic.MiniMaxKeyPoolStatus()
+	envConfigured := semantic.MiniMaxConfiguredKeyCount()
+	// If the live pool has not been exercised yet (e.g. right after a
+	// fresh restart), fall back to the env-derived count so HA guard can
+	// still detect the configured key size. The pool snapshot overrides
+	// when present so the operator can see busy/idle state in real time.
+	if snap.ConfiguredKeyCount == 0 && envConfigured > 0 {
+		snap.ConfiguredKeyCount = envConfigured
+		snap.IdleKeyCount = envConfigured
+	}
+	// has_api_key is provider-aware: when the live config is mmx and the
+	// pool has at least one configured key, the service can satisfy chat
+	// calls even if no api_key is persisted on the config struct.
+	hasAPIKey := snap.ConfiguredKeyCount > 0
+	if cur := s.conf.GetSemanticConfig(); cur != nil {
+		norm := conf.NormalizeSemanticConfig(*cur)
+		if !strings.EqualFold(strings.TrimSpace(norm.ChatProvider), conf.ProviderMMX) {
+			hasAPIKey = strings.TrimSpace(norm.APIKey) != ""
+		}
+	}
+	resp := gin.H{
+		"configured_key_count":  snap.ConfiguredKeyCount,
+		"busy_key_count":        snap.BusyKeyCount,
+		"idle_key_count":        snap.IdleKeyCount,
+		"leased_request_count":  snap.LeasedRequestCount,
+		"retry_count":           snap.RetryCount,
+		"last_error_bucket":     snap.LastErrorBucket,
+		"last_error_at":         snap.LastErrorAt,
+		"key_labels":            snap.Labels,
+		"signature":             snap.Signature,
+		"source":                "minimax_global_key_pool",
+		"has_api_key":           hasAPIKey,
+	}
+	if cur := s.conf.GetSemanticConfig(); cur != nil {
+		norm := conf.NormalizeSemanticConfig(*cur)
+		resp["chat_provider"] = norm.ChatProvider
+		resp["chat_model"] = norm.ChatModel
+	}
+	writeByFormat(c, resp, c.Query("format"))
 }
 
 func (s *Service) handleSemanticTest(c *gin.Context) {
