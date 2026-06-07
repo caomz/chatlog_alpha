@@ -401,17 +401,23 @@ func (s *Service) handleSemanticMMXStatus(c *gin.Context) {
 		}
 	}
 	resp := gin.H{
-		"configured_key_count":  snap.ConfiguredKeyCount,
-		"busy_key_count":        snap.BusyKeyCount,
-		"idle_key_count":        snap.IdleKeyCount,
-		"leased_request_count":  snap.LeasedRequestCount,
-		"retry_count":           snap.RetryCount,
-		"last_error_bucket":     snap.LastErrorBucket,
-		"last_error_at":         snap.LastErrorAt,
-		"key_labels":            snap.Labels,
-		"signature":             snap.Signature,
-		"source":                "minimax_global_key_pool",
-		"has_api_key":           hasAPIKey,
+		"configured_key_count":   snap.ConfiguredKeyCount,
+		"busy_key_count":         snap.BusyKeyCount,
+		"idle_key_count":         snap.IdleKeyCount,
+		"leased_request_count":   snap.LeasedRequestCount,
+		"retry_count":            snap.RetryCount,
+		"last_error_bucket":      snap.LastErrorBucket,
+		"last_error_at":          snap.LastErrorAt,
+		"key_labels":             snap.Labels,
+		"signature":              snap.Signature,
+		"source":                 "minimax_global_key_pool",
+		"has_api_key":            hasAPIKey,
+		"quarantined_key_count":  snap.QuarantinedKeyCount,
+		"healthy_key_count":      snap.HealthyKeyCount,
+		"quarantined_labels":     snap.QuarantinedLabels,
+		"last_quarantined_label": snap.LastQuarantinedLabel,
+		"last_quarantined_for":   snap.LastQuarantinedFor,
+		"last_quarantined_at":    snap.LastQuarantinedAt,
 	}
 	if cur := s.conf.GetSemanticConfig(); cur != nil {
 		norm := conf.NormalizeSemanticConfig(*cur)

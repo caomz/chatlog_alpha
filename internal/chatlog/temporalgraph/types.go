@@ -203,6 +203,8 @@ type Status struct {
 	EnqueueRunning       bool    `json:"enqueue_running"`
 	Workers              int     `json:"workers"`
 	EnqueueWorkers       int     `json:"enqueue_workers"`
+	EffectiveWorkers     int     `json:"effective_workers,omitempty"`
+	AdaptiveLevel        string  `json:"adaptive_level,omitempty"`
 	StorePath            string  `json:"store_path"`
 	EntityCount          int     `json:"entity_count"`
 	RelationCount        int     `json:"relation_count"`
