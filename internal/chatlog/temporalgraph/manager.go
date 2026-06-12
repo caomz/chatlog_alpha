@@ -25,6 +25,7 @@ const (
 	realtimeMessageScanLimit   = 100
 	historySessionScanLimit    = 500
 	historyMessageBatchSize    = 300
+	graphSourceTimeout         = 10 * time.Minute
 	contextBeforeCount         = 5
 	contextAfterCount          = 2
 	chunkMessageCount          = 40
@@ -42,7 +43,38 @@ var (
 
 const errChatModelNotConfigured = "chat model is not configured"
 
+// adaptiveKeyErrorBuckets mirrors the spike buckets keyHealthTracker reacts
+// to. It is intentionally a small allow-list so that sensitive, decode, and
+// config errors do not accidentally throttle the pool — those require prompt
+// or parser fixes, not fewer workers.
+var adaptiveKeyErrorBuckets = []string{
+	"minimax_rate_limited",
+	"minimax_timeout",
+	"minimax_before_request_timeout",
+}
+
+// bucketFromError picks one of the adaptive spike buckets out of an upstream
+// error string. We deliberately do NOT import semantic.classifyMiniMaxErrorBucket
+// (unexported) so the manager package stays loosely coupled; the strings come
+// from chatMMXRaw/chatMMX paths and are stable enough to substring-match here.
+func bucketFromError(err error) string {
+	if err == nil {
+		return ""
+	}
+	msg := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(msg, "model http 429"):
+		return "minimax_rate_limited"
+	case strings.Contains(msg, "before request"):
+		return "minimax_before_request_timeout"
+	case strings.Contains(msg, "context deadline exceeded"):
+		return "minimax_timeout"
+	}
+	return ""
+}
+
 var recoverableGraphTimeoutErrorTokens = []string{
+	"before request",
 	"context deadline exceeded",
 	"client.timeout",
 	"network timeout",
@@ -68,9 +100,15 @@ type Manager struct {
 	runStartedDone int
 	workers        int
 	enqueueWorkers int
-	wake           chan struct{}
-	stop           chan struct{}
-	stopOnce       sync.Once
+	// lastEffectiveWorkers caches the most recent adaptive cap. It is updated
+	// by ProcessPending on each tick so /api/v1/graph/status can report the
+	// current effective concurrency without recomputing the cap on read.
+	lastEffectiveWorkers int
+	adaptiveLevel        adaptiveLevel
+	tracker              *keyHealthTracker
+	wake             chan struct{}
+	stop             chan struct{}
+	stopOnce         sync.Once
 }
 
 func NewManager(cfg Config, db *database.Service) (*Manager, error) {
@@ -87,6 +125,7 @@ func NewManager(cfg Config, db *database.Service) (*Manager, error) {
 		stop:           make(chan struct{}),
 		workers:        defaultGraphWorkers,
 		enqueueWorkers: defaultGraphEnqueueWorkers,
+		tracker:        newKeyHealthTracker(),
 	}
 	m.loadWorkerConfig()
 	_ = store.ResetProcessingSources()
@@ -152,11 +191,23 @@ func (m *Manager) Status() Status {
 	m.mu.Lock()
 	paused, running, enqueuing, lastErr := m.paused, m.running, m.enqueuing, m.lastErr
 	runStartedAt, runStartedDone := m.runStartedAt, m.runStartedDone
+	lastEffective, level := m.lastEffectiveWorkers, m.adaptiveLevel
 	m.mu.Unlock()
 	st := m.store.Status(paused, running, lastErr)
 	st.EnqueueRunning = enqueuing
 	st.Workers = m.workers
 	st.EnqueueWorkers = m.enqueueWorkers
+	if lastEffective > 0 {
+		st.EffectiveWorkers = lastEffective
+	} else {
+		st.EffectiveWorkers = clampInt(m.workers, 1, maxGraphWorkers)
+	}
+	st.AdaptiveLevel = adaptiveLevelName(level)
+	if counts, err := m.store.FailedBucketCounts(); err == nil {
+		st.FailedBuckets = counts
+	} else {
+		log.Debug().Err(err).Msg("temporal graph failed bucket counts unavailable")
+	}
 	if st.SourceCount > 0 {
 		st.ProgressPct = float64(st.Processed+st.Failed) * 100 / float64(st.SourceCount)
 		if st.ProgressPct < 0 {
@@ -270,7 +321,7 @@ func (m *Manager) ProcessPending(ctx context.Context, limit int) {
 		if paused {
 			return
 		}
-		workers := clampInt(m.workers, 1, maxGraphWorkers)
+		workers := m.effectiveWorkers()
 		batchLimit := limit
 		if batchLimit < workers*2 {
 			batchLimit = workers * 2
@@ -285,6 +336,65 @@ func (m *Manager) ProcessPending(ctx context.Context, limit int) {
 			return
 		}
 		m.processBatch(ctx, items, workers)
+	}
+}
+
+// effectiveWorkers returns the adaptive worker cap for the current tick.
+// It clamps the adaptive cap against the user-persisted worker ceiling and
+// the configured MiniMax key count (provider-aware: non-mmx providers do
+// not get a key count, so we fall back to 1 to avoid overspinning workers
+// when the key pool is not the real bottleneck).
+func (m *Manager) effectiveWorkers() int {
+	if m == nil {
+		return 1
+	}
+	m.mu.Lock()
+	userSet := m.workers
+	level := m.adaptiveLevel
+	m.mu.Unlock()
+	configuredKeys := m.configuredChatKeyCount()
+	cap, newLevel := adaptiveMaxWorkers(m.tracker, configuredKeys, userSet, level, time.Now())
+	m.mu.Lock()
+	m.lastEffectiveWorkers = cap
+	if newLevel != level {
+		m.adaptiveLevel = newLevel
+	}
+	m.mu.Unlock()
+	return cap
+}
+
+// configuredChatKeyCount returns the upstream key count the adaptive logic
+// should treat as the ceiling. It currently reports 0 for non-mmx providers
+// (we have no key-pool signal there) so the adaptive layer falls back to
+// the user-set worker count. mmx providers return MiniMaxConfiguredKeyCount
+// so the cap respects the actual key-pool capacity.
+func (m *Manager) configuredChatKeyCount() int {
+	if m == nil || m.conf == nil {
+		return 0
+	}
+	cfg := m.conf.GetSemanticConfig()
+	if cfg == nil {
+		return 0
+	}
+	normalized := conf.NormalizeSemanticConfig(*cfg)
+	if !conf.SemanticChatReady(normalized) {
+		return 0
+	}
+	return semantic.MiniMaxConfiguredKeyCount()
+}
+
+// adaptiveLevelName converts an adaptive level to a stable, lowercase, public
+// token for the JSON status payload. We keep this in the manager package so
+// the status shape stays owned by the runtime layer; tests can compare on the
+// raw enum value if they need to assert internal transitions.
+func adaptiveLevelName(level adaptiveLevel) string {
+	switch level {
+	case adaptiveCritical:
+		return "critical"
+	case adaptiveDegraded:
+		return "degraded"
+	default:
+		return "stable"
 	}
 }
 
@@ -321,6 +431,9 @@ func (m *Manager) processBatch(ctx context.Context, items []SourceRecord, worker
 						continue
 					}
 					m.setError(err)
+					if bucket := bucketFromError(err); bucket != "" {
+						m.tracker.Observe(bucket, time.Now())
+					}
 					_ = m.store.MarkSource(rec.ID, "failed", err.Error())
 					continue
 				}
@@ -358,6 +471,11 @@ func (m *Manager) clearRecoverableConfigError() {
 }
 
 func (m *Manager) processOne(ctx context.Context, rec SourceRecord) error {
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, graphSourceTimeout)
+		defer cancel()
+	}
 	ext, err := m.extract(ctx, rec)
 	if err != nil {
 		log.Debug().Err(err).Msg("temporal graph llm extract failed")
@@ -728,16 +846,35 @@ func (m *Manager) chatReady() bool {
 	return cfg != nil && cfg.Enabled && conf.SemanticChatReady(*cfg)
 }
 
+// recoverableGraphBuckets is the closed list of bucket names that
+// Manager.requeueRecoverableFailedSources will move from failed back to
+// pending. Anything else — auth_error, json_decode_error, empty_graph,
+// sensitive_1026/1027, non_retryable_request, unclassified — stays in
+// failed so that prompt, parser, or content-safety fixes (not blind
+// retries) are the only path forward for those rows.
+//
+// Order does not matter for correctness; we sort the resulting map by
+// affected rows in /api/v1/graph/status for operator convenience.
+var recoverableGraphBuckets = []string{
+	"config_error",
+	"network_timeout",
+	"before_request_timeout",
+	"rate_limited",
+}
+
 func (m *Manager) requeueRecoverableFailedSources() (int64, error) {
 	if m == nil || m.store == nil {
 		return 0, nil
 	}
-	total, err := m.store.RequeueFailedSourcesByError(errChatModelNotConfigured)
-	if err != nil {
-		return total, err
+	var total int64
+	for _, bucket := range recoverableGraphBuckets {
+		n, err := m.store.RequeueFailedSourcesByBucket(bucket)
+		if err != nil {
+			return total, err
+		}
+		total += n
 	}
-	n, err := m.store.RequeueFailedSourcesByErrorContaining(recoverableGraphTimeoutErrorTokens)
-	return total + n, err
+	return total, nil
 }
 
 func (m *Manager) EnsureHistoryQueued(ctx context.Context) {

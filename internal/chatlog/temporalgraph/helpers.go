@@ -21,7 +21,17 @@ var (
 	isoDateRe         = regexp.MustCompile(`(\d{4})-(\d{1,2})-(\d{1,2})`)
 	phoneLikeRe       = regexp.MustCompile(`1[3-9]\d{9}`)
 	wxIDLikeRe        = regexp.MustCompile(`(?i)^wxid_[a-z0-9]+$`)
+	rawIDLikeRe       = regexp.MustCompile(`(?i)^(wxid_[a-z0-9]+|gh_[a-z0-9_]+|[a-z0-9._-]+@chatroom)$`)
 	spaceCollapseRe   = regexp.MustCompile(`\s+`)
+)
+
+const (
+	promptContentMaxRunes        = 2400
+	promptContextContentMaxRunes = 360
+	promptContextBeforeLimit     = 2
+	promptContextAfterLimit      = 1
+	promptParticipantsLimit      = 24
+	promptEntityHintsLimit       = 24
 )
 
 func parseTimeFlexible(raw string) time.Time {
@@ -545,15 +555,146 @@ func sourcePromptPayload(rec SourceRecord) map[string]any {
 		"source_type":  rec.SourceType,
 		"event_type":   rec.EventType,
 		"time":         rec.EventTime.Format(time.RFC3339),
-		"talker":       rec.TalkerName,
-		"talker_id":    rec.Talker,
-		"sender":       rec.SenderName,
-		"sender_id":    rec.Sender,
-		"title":        rec.Title,
-		"content":      truncateRunes(rec.Content, 4000),
-		"context":      rec.Context,
-		"participants": rec.Participants,
-		"entity_hints": rec.EntityHints,
-		"metadata":     rec.Metadata,
+		"talker":       safePromptName(rec.TalkerName, "conversation"),
+		"sender":       safePromptName(rec.SenderName, "sender"),
+		"title":        truncateRunes(rec.Title, 160),
+		"content":      truncateRunes(rec.Content, promptContentMaxRunes),
+		"context":      promptContext(rec.Context),
+		"participants": promptParticipants(rec.Participants),
+		"entity_hints": promptEntityHints(rec.EntityHints),
+		"metadata":     promptMetadata(rec.Metadata),
 	}
+}
+
+func safePromptName(raw, fallback string) string {
+	name := cleanName(raw)
+	if name == "" || isRawPromptIdentifier(name) {
+		return fallback
+	}
+	return truncateRunes(name, 80)
+}
+
+func isRawPromptIdentifier(raw string) bool {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return false
+	}
+	return rawIDLikeRe.MatchString(raw) || phoneLikeRe.MatchString(raw)
+}
+
+func promptContext(in []ContextMessage) []map[string]string {
+	if len(in) == 0 {
+		return nil
+	}
+	targetIdx := -1
+	for i, msg := range in {
+		if msg.Role == "target" {
+			targetIdx = i
+			break
+		}
+	}
+	if targetIdx < 0 {
+		targetIdx = len(in) / 2
+	}
+	start := targetIdx - promptContextBeforeLimit
+	if start < 0 {
+		start = 0
+	}
+	end := targetIdx + promptContextAfterLimit + 1
+	if end > len(in) {
+		end = len(in)
+	}
+	out := make([]map[string]string, 0, end-start)
+	for i := start; i < end; i++ {
+		msg := in[i]
+		content := strings.TrimSpace(msg.Content)
+		if content == "" {
+			continue
+		}
+		out = append(out, map[string]string{
+			"time":    msg.Time,
+			"sender":  safePromptName(msg.Sender, "speaker"),
+			"content": truncateRunes(content, promptContextContentMaxRunes),
+			"role":    msg.Role,
+		})
+	}
+	return out
+}
+
+func promptParticipants(in []GraphParticipant) []map[string]string {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]map[string]string, 0, minInt(len(in), promptParticipantsLimit))
+	seen := map[string]struct{}{}
+	for _, p := range in {
+		if len(out) >= promptParticipantsLimit {
+			break
+		}
+		display := safePromptName(p.DisplayName, "")
+		if display == "" {
+			continue
+		}
+		kind := cleanType(p.Kind, "participant")
+		key := kind + ":" + strings.ToLower(display)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, map[string]string{
+			"name": display,
+			"kind": kind,
+		})
+	}
+	return out
+}
+
+func promptEntityHints(in []string) []string {
+	out := make([]string, 0, minInt(len(in), promptEntityHintsLimit))
+	seen := map[string]struct{}{}
+	for _, raw := range in {
+		if len(out) >= promptEntityHintsLimit {
+			break
+		}
+		name := safePromptName(raw, "")
+		if name == "" {
+			continue
+		}
+		key := strings.ToLower(name)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, name)
+	}
+	return out
+}
+
+func promptMetadata(in map[string]string) map[string]string {
+	if len(in) == 0 {
+		return nil
+	}
+	out := map[string]string{}
+	for _, key := range []string{"msg_type", "msg_sub_type"} {
+		if value := strings.TrimSpace(in[key]); value != "" {
+			out[key] = truncateRunes(value, 40)
+		}
+	}
+	for _, key := range []string{"entities", "actors", "targets"} {
+		items := promptEntityHints(splitHintList(in[key]))
+		if len(items) > 0 {
+			out[key] = strings.Join(items, ",")
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }

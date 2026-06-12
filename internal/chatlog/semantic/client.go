@@ -4,7 +4,9 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -36,6 +38,8 @@ const (
 	maxMiniMaxTimeoutAttempts = 5
 	miniMaxRetryBaseDelay     = 1500 * time.Millisecond
 	miniMaxAcquirePollDelay   = 10 * time.Millisecond
+	miniMaxAcquireTimeout     = 45 * time.Second
+	miniMaxAcquireTimeoutMin  = 2 * time.Second
 )
 
 var ollamaScheduler = &ollamaModelScheduler{}
@@ -432,16 +436,42 @@ type miniMaxHTTPConfig struct {
 }
 
 type miniMaxAPIKeyPool struct {
-	mu        sync.Mutex
-	signature string
-	slots     []*miniMaxAPIKeySlot
-	next      int
+	mu             sync.Mutex
+	signature      string
+	slots          []*miniMaxAPIKeySlot
+	next           int
+	leasedRequests int64
+	retryCount     int64
+	lastError      string
+	lastErrorAt    time.Time
+	quarantined    int
 }
 
 type miniMaxAPIKeySlot struct {
-	key   string
-	label string
-	token chan struct{}
+	key             string
+	label           string
+	token           chan struct{}
+	quarantined     bool
+	quarantinedAt   time.Time
+	quarantinedFor  string
+	quarantinedHits int
+}
+
+// isQuarantiningBucket reports whether a given error bucket should cause the
+// offending key to be moved into a persistent pool-level quarantine. Only
+// auth-style errors trip this; sensitive / content-policy / decode errors are
+// always non-retryable and must not change key selection.
+func isQuarantiningBucket(bucket string) bool {
+	switch bucket {
+	case "minimax_auth_error", "minimax_sensitive_1026", "minimax_sensitive_1027":
+		// 1026/1027 are NOT retryable; we still surface the key that
+		// produced them so operators can see which key hit the content
+		// policy. They are not, however, promoted into auth-style
+		// quarantine because shouldSwitchMiniMaxKey already returns false
+		// for them and rotating the key would only mask a content issue.
+		return bucket == "minimax_auth_error"
+	}
+	return false
 }
 
 type miniMaxAPIKeyLease struct {
@@ -498,6 +528,9 @@ func (p *miniMaxAPIKeyPool) tryAcquire(keys []string, baseURL string, exclude ma
 	}
 	eligible := 0
 	for _, slot := range p.slots {
+		if slot.quarantined {
+			continue
+		}
 		if exclude == nil || !exclude[slot.label] {
 			eligible++
 		}
@@ -508,6 +541,9 @@ func (p *miniMaxAPIKeyPool) tryAcquire(keys []string, baseURL string, exclude ma
 	for i := 0; i < total; i++ {
 		idx := (p.next + i) % total
 		slot := p.slots[idx]
+		if slot.quarantined {
+			continue
+		}
 		if exclude != nil && exclude[slot.label] {
 			continue
 		}
@@ -533,16 +569,154 @@ func (p *miniMaxAPIKeyPool) ensureLocked(keys []string) {
 	}
 	p.signature = signature
 	p.next = 0
+	p.leasedRequests = 0
+	p.retryCount = 0
+	p.lastError = ""
+	p.lastErrorAt = time.Time{}
+	p.quarantined = 0
 	p.slots = make([]*miniMaxAPIKeySlot, 0, len(keys))
-	for _, key := range keys {
+	for i, key := range keys {
 		slot := &miniMaxAPIKeySlot{
 			key:   key,
-			label: miniMaxKeyLabel(key),
+			label: miniMaxKeyLabel(key, i+1),
 			token: make(chan struct{}, 1),
 		}
 		slot.token <- struct{}{}
 		p.slots = append(p.slots, slot)
 	}
+}
+
+// redactedSignature returns a short hash of the current pool signature so
+// operators can detect that the configured key set has changed without ever
+// exposing real key bytes, prefixes, or reversible fragments.
+func (p *miniMaxAPIKeyPool) redactedSignature() string {
+	if p.signature == "" {
+		return ""
+	}
+	h := sha256.Sum256([]byte(p.signature))
+	return hex.EncodeToString(h[:8])
+}
+
+// miniMaxKeyPoolSnapshot is a privacy-safe view of the key pool suitable for
+// runtime status endpoints. It never carries full API keys, key prefixes, or
+// any reversible fragment of a key.
+type miniMaxKeyPoolSnapshot struct {
+	ConfiguredKeyCount   int       `json:"configured_key_count"`
+	BusyKeyCount         int       `json:"busy_key_count"`
+	IdleKeyCount         int       `json:"idle_key_count"`
+	QuarantinedKeyCount  int       `json:"quarantined_key_count"`
+	HealthyKeyCount      int       `json:"healthy_key_count"`
+	LeasedRequestCount   int64     `json:"leased_request_count"`
+	RetryCount           int64     `json:"retry_count"`
+	LastErrorBucket      string    `json:"last_error_bucket"`
+	LastErrorAt          time.Time `json:"last_error_at"`
+	Labels               []string  `json:"key_labels"`
+	QuarantinedLabels    []string  `json:"quarantined_labels"`
+	LastQuarantinedLabel string    `json:"last_quarantined_label,omitempty"`
+	LastQuarantinedFor   string    `json:"last_quarantined_for,omitempty"`
+	LastQuarantinedAt    time.Time `json:"last_quarantined_at,omitempty"`
+	Signature            string    `json:"signature"`
+}
+// recordLease increments the leased request counter when a key is acquired.
+func (p *miniMaxAPIKeyPool) recordLease() {
+	p.mu.Lock()
+	p.leasedRequests++
+	p.mu.Unlock()
+}
+
+// recordError records a privacy-safe error bucket and increments the retry
+// counter. The bucket is a normalized short tag such as
+// "minimax_sensitive_1026" or "minimax_auth_401" and must not include any
+// real key or any payload that contains one. When label is non-empty and the
+// bucket is a quarantining bucket (currently auth errors), the slot with
+// that label is moved to a persistent pool-level quarantine so subsequent
+// Acquire calls stop preferring it. Sensitive / decode / client-error
+// buckets are never used to quarantine, so the "no key switch for 1026/1027"
+// invariant is preserved.
+func (p *miniMaxAPIKeyPool) recordError(bucket string, label string) {
+	bucket = strings.TrimSpace(bucket)
+	if bucket == "" {
+		bucket = "unknown"
+	}
+	label = strings.TrimSpace(label)
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.retryCount++
+	p.lastError = bucket
+	p.lastErrorAt = time.Now()
+	if label == "" || !isQuarantiningBucket(bucket) {
+		return
+	}
+	for _, slot := range p.slots {
+		if slot.label != label {
+			continue
+		}
+		if slot.quarantined {
+			slot.quarantinedHits++
+			return
+		}
+		slot.quarantined = true
+		slot.quarantinedAt = time.Now()
+		slot.quarantinedFor = bucket
+		slot.quarantinedHits = 1
+		p.quarantined++
+		return
+	}
+}
+
+// Snapshot returns a privacy-safe summary of the key pool. Callers must treat
+// the returned struct as a public observation and must not echo it into logs
+// that are not already redacted.
+func (p *miniMaxAPIKeyPool) Snapshot() miniMaxKeyPoolSnapshot {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	snap := miniMaxKeyPoolSnapshot{
+		ConfiguredKeyCount: len(p.slots),
+		LeasedRequestCount: p.leasedRequests,
+		RetryCount:         p.retryCount,
+		LastErrorBucket:    p.lastError,
+		LastErrorAt:        p.lastErrorAt,
+		Signature:          p.redactedSignature(),
+		Labels:             make([]string, 0, len(p.slots)),
+		QuarantinedLabels:  make([]string, 0),
+	}
+	busy := 0
+	quarantined := 0
+	for _, slot := range p.slots {
+		snap.Labels = append(snap.Labels, slot.label)
+		if slot.quarantined {
+			quarantined++
+			snap.QuarantinedLabels = append(snap.QuarantinedLabels, slot.label)
+			if snap.LastQuarantinedLabel == "" || slot.quarantinedAt.After(snap.LastQuarantinedAt) {
+				snap.LastQuarantinedLabel = slot.label
+				snap.LastQuarantinedFor = slot.quarantinedFor
+				snap.LastQuarantinedAt = slot.quarantinedAt
+			}
+			continue
+		}
+		select {
+		case <-slot.token:
+			// token was available, put it back so the snapshot does not
+			// permanently alter pool capacity.
+			slot.token <- struct{}{}
+		default:
+			busy++
+		}
+	}
+	snap.BusyKeyCount = busy
+	snap.IdleKeyCount = len(p.slots) - busy - quarantined
+	snap.QuarantinedKeyCount = quarantined
+	snap.HealthyKeyCount = len(p.slots) - quarantined
+	return snap
+}
+
+// MiniMaxKeyPoolStatus returns a privacy-safe snapshot of the global MiniMax
+// key pool. It is safe to expose in HTTP status responses and never includes
+// any real API key, key prefix, or reversible fragment. The signature is a
+// stable join of the configured keys (after redacting to labels) so operators
+// can detect that the env-configured key set has changed.
+func MiniMaxKeyPoolStatus() miniMaxKeyPoolSnapshot {
+	return miniMaxGlobalKeyPool.Snapshot()
 }
 
 func (c *Client) Chat(ctx context.Context, cfg conf.SemanticConfig, messages []ChatMessage) (string, error) {
@@ -682,13 +856,16 @@ func (c *Client) chatMMXRaw(ctx context.Context, cfg conf.SemanticConfig, messag
 	for round := 1; round <= miniMaxMaxAttemptsForError(lastErr); round++ {
 		excluded := map[string]bool{}
 		for {
-			lease, keyCount, err := miniMaxGlobalKeyPool.Acquire(ctx, excluded)
+			acquireCtx, cancel := acquireMiniMaxLeaseContext(ctx, miniMaxAcquireTimeout)
+			lease, keyCount, err := miniMaxGlobalKeyPool.Acquire(acquireCtx, excluded)
+			cancel()
 			if err != nil {
 				return "", fmt.Errorf("minimax chat failed before request: %w", sanitizeMiniMaxError(err, nil))
 			}
 			if lease == nil {
 				break
 			}
+			miniMaxGlobalKeyPool.recordLease()
 			attempted++
 			answer, err := c.doMiniMaxChatWithLease(ctx, lease, payload)
 			if err == nil {
@@ -696,6 +873,7 @@ func (c *Client) chatMMXRaw(ctx context.Context, cfg conf.SemanticConfig, messag
 			}
 			lastErr = err
 			excluded[lease.label] = true
+			miniMaxGlobalKeyPool.recordError(classifyMiniMaxErrorBucket(err), lease.label)
 			if !shouldSwitchMiniMaxKey(err) {
 				return "", fmt.Errorf("minimax chat failed with key=%s: %w", lease.label, err)
 			}
@@ -714,6 +892,27 @@ func (c *Client) chatMMXRaw(ctx context.Context, cfg conf.SemanticConfig, messag
 		return "", fmt.Errorf("minimax chat failed after %d round(s), tried %d key attempt(s)", maxAttempts, attempted)
 	}
 	return "", fmt.Errorf("minimax chat failed after %d round(s), tried %d key attempt(s), last_error=%w", maxAttempts, attempted, lastErr)
+}
+
+func acquireMiniMaxLeaseContext(ctx context.Context, fallback time.Duration) (context.Context, context.CancelFunc) {
+	if fallback <= 0 {
+		fallback = miniMaxAcquireTimeoutMin
+	}
+	if ctx == nil {
+		return context.WithTimeout(context.Background(), fallback)
+	}
+	if d, ok := ctx.Deadline(); ok {
+		remaining := time.Until(d)
+		if remaining <= 0 {
+			return context.WithCancel(ctx)
+		}
+		timeout := fallback
+		if remaining < timeout {
+			timeout = remaining
+		}
+		return context.WithTimeout(ctx, timeout)
+	}
+	return context.WithTimeout(ctx, fallback)
 }
 
 func (c *Client) doMiniMaxChatWithLease(ctx context.Context, lease *miniMaxAPIKeyLease, payload map[string]any) (string, error) {
@@ -747,13 +946,16 @@ func (c *Client) analyzeMiniMaxImage(ctx context.Context, prompt string, imageDa
 	for round := 1; round <= miniMaxMaxAttemptsForError(lastErr); round++ {
 		excluded := map[string]bool{}
 		for {
-			lease, keyCount, err := miniMaxGlobalKeyPool.Acquire(ctx, excluded)
+			acquireCtx, cancel := acquireMiniMaxLeaseContext(ctx, miniMaxAcquireTimeout)
+			lease, keyCount, err := miniMaxGlobalKeyPool.Acquire(acquireCtx, excluded)
+			cancel()
 			if err != nil {
 				return "", fmt.Errorf("minimax vision failed before request: %w", sanitizeMiniMaxError(err, nil))
 			}
 			if lease == nil {
 				break
 			}
+			miniMaxGlobalKeyPool.recordLease()
 			attempted++
 			answer, err := c.doMiniMaxVisionWithLease(ctx, lease, payload)
 			if err == nil {
@@ -761,6 +963,7 @@ func (c *Client) analyzeMiniMaxImage(ctx context.Context, prompt string, imageDa
 			}
 			lastErr = err
 			excluded[lease.label] = true
+			miniMaxGlobalKeyPool.recordError(classifyMiniMaxErrorBucket(err), lease.label)
 			if !shouldSwitchMiniMaxKey(err) {
 				return "", fmt.Errorf("minimax vision failed with key=%s: %w", lease.label, err)
 			}
@@ -832,6 +1035,8 @@ func isNonRetryableMiniMaxError(err error) bool {
 		"model http 400",
 		"model http 404",
 		"model http 422",
+		"input new_sensitive (1026)",
+		"output new_sensitive (1027)",
 		"max tokens exceeded",
 		"model not found",
 		"invalid request",
@@ -846,6 +1051,43 @@ func isNonRetryableMiniMaxError(err error) bool {
 	return false
 }
 
+// classifyMiniMaxErrorBucket returns a privacy-safe short bucket label for a
+// MiniMax call error. The bucket is intended for status endpoints and must not
+// include any real API key, key prefix, or reversible key fragment.
+func classifyMiniMaxErrorBucket(err error) string {
+	if err == nil {
+		return ""
+	}
+	msg := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(msg, "input new_sensitive (1026)"):
+		return "minimax_sensitive_1026"
+	case strings.Contains(msg, "output new_sensitive (1027)"):
+		return "minimax_sensitive_1027"
+	case strings.Contains(msg, "before request"):
+		return "minimax_before_request_timeout"
+	case strings.Contains(msg, "context deadline exceeded"):
+		return "minimax_timeout"
+	case strings.Contains(msg, "model http 401"), strings.Contains(msg, "model http 403"):
+		return "minimax_auth_error"
+	case strings.Contains(msg, "model http 429"):
+		return "minimax_rate_limited"
+	case strings.Contains(msg, "model http 5"):
+		return "minimax_server_error"
+	case strings.Contains(msg, "model http 4"):
+		return "minimax_client_error"
+	case strings.Contains(msg, "decode model response failed"):
+		return "minimax_decode_error"
+	case strings.Contains(msg, "returned empty choices"), strings.Contains(msg, "returned empty content"):
+		return "minimax_empty_response"
+	case strings.Contains(msg, "minimax api key is not configured"):
+		return "minimax_config_error"
+	case strings.Contains(msg, "minimax chat error:"), strings.Contains(msg, "minimax vision error:"):
+		return "minimax_upstream_error"
+	}
+	return "minimax_other"
+}
+
 func sanitizeMiniMaxError(err error, keys []string) error {
 	if err == nil {
 		return nil
@@ -854,23 +1096,23 @@ func sanitizeMiniMaxError(err error, keys []string) error {
 	for _, key := range keys {
 		key = strings.TrimSpace(key)
 		if key != "" {
-			msg = strings.ReplaceAll(msg, key, miniMaxKeyLabel(key))
+			msg = strings.ReplaceAll(msg, key, sanitizedMiniMaxKeyToken())
 		}
 	}
 	msg = miniMaxSecretRe.ReplaceAllString(msg, "sk-***")
 	return errors.New(msg)
 }
 
-func miniMaxKeyLabel(key string) string {
+func sanitizedMiniMaxKeyToken() string {
+	return "key_redacted"
+}
+
+func miniMaxKeyLabel(key string, ordinal int) string {
 	key = strings.TrimSpace(key)
 	if key == "" {
-		return "***"
+		return fmt.Sprintf("key_%d", ordinal)
 	}
-	r := []rune(key)
-	if len(r) <= 4 {
-		return "***"
-	}
-	return "***" + string(r[len(r)-4:])
+	return fmt.Sprintf("key_%d", ordinal)
 }
 
 func uniqueNonEmptyStrings(items []string) []string {

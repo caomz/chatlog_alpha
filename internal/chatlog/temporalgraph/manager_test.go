@@ -3,6 +3,8 @@ package temporalgraph
 import (
 	"context"
 	"errors"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -82,6 +84,89 @@ func TestNormalizeExtractionCanonicalizesAliasPredicateAndTime(t *testing.T) {
 	wantTime := time.Date(2026, 4, 26, 0, 0, 0, 0, time.Local).Unix()
 	if rel.ValidFrom != wantTime || ext.Facts[0].ValidFrom != wantTime {
 		t.Fatalf("relative time not resolved: rel=%d fact=%d want=%d", rel.ValidFrom, ext.Facts[0].ValidFrom, wantTime)
+	}
+}
+
+func TestSourcePromptPayloadRedactsRawIDsAndTrimsContext(t *testing.T) {
+	base := time.Date(2026, 6, 5, 7, 0, 0, 0, time.Local)
+	rec := SourceRecord{
+		SourceType: "message",
+		EventType:  "message_1",
+		Talker:     "123456@chatroom",
+		TalkerName: "项目群",
+		Sender:     "wxid_secret123",
+		SenderName: "张三",
+		Content:    strings.Repeat("客户A合同延期。", 400),
+		EventTime:  base,
+		Metadata: map[string]string{
+			"msg_type": "1",
+			"entities": "客户A,wxid_hidden456,13800138000",
+			"raw":      "should not pass through",
+		},
+		Context: []ContextMessage{
+			{Seq: 1, Time: "2026-06-05 06:55:00", Sender: "wxid_before1", Content: "before 1", Role: "before"},
+			{Seq: 2, Time: "2026-06-05 06:56:00", Sender: "李四", Content: "before 2", Role: "before"},
+			{Seq: 3, Time: "2026-06-05 06:57:00", Sender: "王五", Content: "before 3", Role: "before"},
+			{Seq: 4, Time: "2026-06-05 06:58:00", Sender: "wxid_secret123", Content: "target", Role: "target"},
+			{Seq: 5, Time: "2026-06-05 06:59:00", Sender: "赵六", Content: "after 1", Role: "after"},
+			{Seq: 6, Time: "2026-06-05 07:00:00", Sender: "钱七", Content: "after 2", Role: "after"},
+		},
+		Participants: []GraphParticipant{
+			{UserName: "wxid_secret123", DisplayName: "张三", Kind: "person"},
+			{UserName: "wxid_hidden456", DisplayName: "wxid_hidden456", Kind: "person"},
+		},
+		EntityHints: []string{"客户A", "wxid_hidden456", "13800138000"},
+	}
+	for i := 0; i < 40; i++ {
+		rec.Participants = append(rec.Participants, GraphParticipant{
+			UserName:    fmt.Sprintf("wxid_extra%d", i),
+			DisplayName: fmt.Sprintf("成员%d", i),
+			Kind:        "person",
+		})
+	}
+
+	payload := sourcePromptPayload(rec)
+	if _, ok := payload["talker_id"]; ok {
+		t.Fatal("talker_id should not be sent to graph prompt")
+	}
+	if _, ok := payload["sender_id"]; ok {
+		t.Fatal("sender_id should not be sent to graph prompt")
+	}
+	if got := payload["sender"]; got != "张三" {
+		t.Fatalf("sender = %v, want display name", got)
+	}
+	if content := payload["content"].(string); len([]rune(content)) > promptContentMaxRunes {
+		t.Fatalf("content was not trimmed: %d", len([]rune(content)))
+	}
+	ctxItems := payload["context"].([]map[string]string)
+	if len(ctxItems) != 4 {
+		t.Fatalf("context size = %d, want 4", len(ctxItems))
+	}
+	if ctxItems[0]["content"] != "before 2" || ctxItems[2]["role"] != "target" || ctxItems[2]["sender"] != "speaker" {
+		t.Fatalf("unexpected sanitized context: %#v", ctxItems)
+	}
+	participants := payload["participants"].([]map[string]string)
+	if len(participants) != promptParticipantsLimit {
+		t.Fatalf("participants size = %d, want %d", len(participants), promptParticipantsLimit)
+	}
+	for _, p := range participants {
+		if _, ok := p["user_name"]; ok {
+			t.Fatalf("raw user_name leaked in participant: %#v", p)
+		}
+		if strings.HasPrefix(p["name"], "wxid_") {
+			t.Fatalf("raw participant id leaked: %#v", p)
+		}
+	}
+	hints := payload["entity_hints"].([]string)
+	if len(hints) != 1 || hints[0] != "客户A" {
+		t.Fatalf("entity_hints = %#v, want only customer hint", hints)
+	}
+	metadata := payload["metadata"].(map[string]string)
+	if _, ok := metadata["raw"]; ok {
+		t.Fatalf("raw metadata leaked: %#v", metadata)
+	}
+	if metadata["entities"] != "客户A" {
+		t.Fatalf("metadata entities = %q", metadata["entities"])
 	}
 }
 

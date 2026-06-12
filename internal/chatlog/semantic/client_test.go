@@ -2,6 +2,7 @@ package semantic
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -15,6 +16,31 @@ import (
 
 	"github.com/sjzar/chatlog/internal/chatlog/conf"
 )
+
+func jsonMarshal(v any) (string, error) {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return "", err
+	}
+	return string(b), nil
+}
+
+func TestAcquireMiniMaxLeaseContextHonorsParentDeadline(t *testing.T) {
+	baseCtx, baseCancel := context.WithTimeout(context.Background(), 120*time.Millisecond)
+	defer baseCancel()
+
+	acquireCtx, acquireCancel := acquireMiniMaxLeaseContext(baseCtx, miniMaxAcquireTimeout)
+	defer acquireCancel()
+
+	baseDeadline, _ := baseCtx.Deadline()
+	acquireDeadline, ok := acquireCtx.Deadline()
+	if !ok {
+		t.Fatal("acquire context missing deadline")
+	}
+	if acquireDeadline.After(baseDeadline) {
+		t.Fatalf("acquire context deadline (%s) should not exceed parent deadline (%s)", acquireDeadline, baseDeadline)
+	}
+}
 
 func TestParseMiniMaxChatResponse(t *testing.T) {
 	var resp miniMaxChatResponse
@@ -264,6 +290,35 @@ func TestChatMMXRawSkipsAuthFailedKey(t *testing.T) {
 	}
 }
 
+func TestChatMMXRawDoesNotSwitchKeyForSensitiveError(t *testing.T) {
+	clearMiniMaxEnv(t)
+	resetMiniMaxGlobalKeyPool(t)
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		if r.Header.Get("Authorization") != "Bearer sk-cp-first1111" {
+			t.Errorf("unexpected auth header: %s", r.Header.Get("Authorization"))
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnprocessableEntity)
+		_, _ = w.Write([]byte(`{"type":"error","error":{"type":"unprocessable_entity_error","message":"output new_sensitive (1027)","http_code":"422"}}`))
+	}))
+	defer server.Close()
+	t.Setenv("MINIMAX_API_KEYS", "sk-cp-first1111,sk-cp-second2222")
+	t.Setenv("MINIMAX_BASE_URL", server.URL)
+
+	_, err := NewClient().chatMMXRaw(context.Background(), miniMaxTestConfig(), []map[string]any{{"role": "user", "content": "hi"}})
+	if err == nil {
+		t.Fatal("expected sensitive error")
+	}
+	if !strings.Contains(err.Error(), "output new_sensitive (1027)") {
+		t.Fatalf("error = %v, want sensitive code", err)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("calls = %d, want fail-fast without key switch", calls.Load())
+	}
+}
+
 func TestAnalyzeMiniMaxImageUsesVisionEndpoint(t *testing.T) {
 	clearMiniMaxEnv(t)
 	resetMiniMaxGlobalKeyPool(t)
@@ -360,8 +415,8 @@ func TestMiniMaxErrorSanitizesFullAPIKey(t *testing.T) {
 	if strings.Contains(err.Error(), key) {
 		t.Fatalf("sanitized error leaked key: %s", err)
 	}
-	if !strings.Contains(err.Error(), "***BCDE") && !strings.Contains(err.Error(), "sk-***") {
-		t.Fatalf("sanitized error did not include a redacted marker: %s", err)
+	if !strings.Contains(err.Error(), "key_redacted") {
+		t.Fatalf("sanitized error did not include key_redacted marker: %s", err)
 	}
 }
 
@@ -394,4 +449,361 @@ func miniMaxTestConfig() conf.SemanticConfig {
 		ChatMaxTokens:   conf.DefaultSemanticMaxTokens,
 		ChatTemperature: conf.DefaultSemanticTemp,
 	})
+}
+
+func TestMiniMaxKeyPoolStatusReportsConfiguredCountWithoutSecrets(t *testing.T) {
+	resetMiniMaxGlobalKeyPool(t)
+	clearMiniMaxEnv(t)
+	keys := []string{
+		"sk-cp-poolstat1111",
+		"sk-cp-poolstat2222",
+		"sk-cp-poolstat3333",
+		"sk-cp-poolstat4444",
+		"sk-cp-poolstat5555",
+	}
+	t.Setenv("MINIMAX_API_KEYS", strings.Join(keys, ","))
+
+	cfg, err := loadMiniMaxHTTPConfig()
+	if err != nil {
+		t.Fatalf("loadMiniMaxHTTPConfig returned error: %v", err)
+	}
+	if got, want := len(cfg.APIKeys), 5; got != want {
+		t.Fatalf("len(APIKeys) = %d, want %d", got, want)
+	}
+
+	// Touch the global pool with a real Acquire so the snapshot reflects 5 slots.
+	acquireCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	lease, total, err := miniMaxGlobalKeyPool.Acquire(acquireCtx, nil)
+	if err != nil {
+		t.Fatalf("Acquire returned error: %v", err)
+	}
+	if total != 5 {
+		t.Fatalf("total = %d, want 5", total)
+	}
+	if lease == nil {
+		t.Fatalf("Acquire returned nil lease")
+	}
+	miniMaxGlobalKeyPool.recordLease()
+	lease.Release()
+
+	// Record an error so retry_count and last_error_bucket surface.
+	miniMaxGlobalKeyPool.recordError("minimax_sensitive_1027", "")
+	miniMaxGlobalKeyPool.recordError("minimax_rate_limited", "")
+
+	snap := MiniMaxKeyPoolStatus()
+	if snap.ConfiguredKeyCount != 5 {
+		t.Fatalf("ConfiguredKeyCount = %d, want 5", snap.ConfiguredKeyCount)
+	}
+	if snap.LeasedRequestCount < 1 {
+		t.Fatalf("LeasedRequestCount = %d, want >= 1", snap.LeasedRequestCount)
+	}
+	if snap.RetryCount < 2 {
+		t.Fatalf("RetryCount = %d, want >= 2", snap.RetryCount)
+	}
+	if snap.LastErrorBucket == "" {
+		t.Fatalf("LastErrorBucket is empty")
+	}
+	if snap.BusyKeyCount < 0 || snap.BusyKeyCount > snap.ConfiguredKeyCount {
+		t.Fatalf("BusyKeyCount out of range: %d", snap.BusyKeyCount)
+	}
+	if snap.IdleKeyCount < 0 {
+		t.Fatalf("IdleKeyCount is negative: %d", snap.IdleKeyCount)
+	}
+	if snap.IdleKeyCount+snap.BusyKeyCount != snap.ConfiguredKeyCount {
+		t.Fatalf("idle(%d) + busy(%d) != configured(%d)", snap.IdleKeyCount, snap.BusyKeyCount, snap.ConfiguredKeyCount)
+	}
+
+	// Verify the snapshot never carries a real key, key prefix, or any
+	// reversible fragment.
+	jsonBlob, err := jsonMarshal(snap)
+	if err != nil {
+		t.Fatalf("jsonMarshal failed: %v", err)
+	}
+	if strings.Contains(jsonBlob, "sk-") {
+		t.Fatalf("snapshot leaked sk- prefix: %s", jsonBlob)
+	}
+	for _, k := range keys {
+		if strings.Contains(jsonBlob, k) {
+			t.Fatalf("snapshot leaked key fragment: key=%s blob=%s", k, jsonBlob)
+		}
+	}
+	// Labels should be present and redaction-style (stable ordinal key_N).
+	if len(snap.Labels) != 5 {
+		t.Fatalf("len(Labels) = %d, want 5", len(snap.Labels))
+	}
+	for i, label := range snap.Labels {
+		want := fmt.Sprintf("key_%d", i+1)
+		if label != want {
+			t.Fatalf("label[%d] = %q, want %q", i, label, want)
+		}
+	}
+}
+
+func TestMiniMaxKeyPoolStatusIdleAndBusyAfterLease(t *testing.T) {
+	resetMiniMaxGlobalKeyPool(t)
+	clearMiniMaxEnv(t)
+	t.Setenv("MINIMAX_API_KEYS", "sk-cp-leased-1111,sk-cp-leased-2222")
+
+	acquireCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	lease, total, err := miniMaxGlobalKeyPool.Acquire(acquireCtx, nil)
+	if err != nil {
+		t.Fatalf("Acquire returned error: %v", err)
+	}
+	if total != 2 {
+		t.Fatalf("total = %d, want 2", total)
+	}
+	if lease == nil {
+		t.Fatalf("Acquire returned nil lease")
+	}
+	// Do not release the lease so that the slot stays busy.
+	snap := MiniMaxKeyPoolStatus()
+	if snap.ConfiguredKeyCount != 2 {
+		t.Fatalf("ConfiguredKeyCount = %d, want 2", snap.ConfiguredKeyCount)
+	}
+	if snap.BusyKeyCount != 1 {
+		t.Fatalf("BusyKeyCount = %d, want 1", snap.BusyKeyCount)
+	}
+	if snap.IdleKeyCount != 1 {
+		t.Fatalf("IdleKeyCount = %d, want 1", snap.IdleKeyCount)
+	}
+	lease.Release()
+
+	snap = MiniMaxKeyPoolStatus()
+	if snap.BusyKeyCount != 0 {
+		t.Fatalf("BusyKeyCount after release = %d, want 0", snap.BusyKeyCount)
+	}
+	if snap.IdleKeyCount != 2 {
+		t.Fatalf("IdleKeyCount after release = %d, want 2", snap.IdleKeyCount)
+	}
+}
+
+func TestClassifyMiniMaxErrorBucketCoversKnownBuckets(t *testing.T) {
+	cases := []struct {
+		err  error
+		want string
+	}{
+		{errors.New("minimax chat error: input new_sensitive (1026)"), "minimax_sensitive_1026"},
+		{errors.New("minimax chat error: output new_sensitive (1027)"), "minimax_sensitive_1027"},
+		{errors.New("minimax chat failed: context deadline exceeded"), "minimax_timeout"},
+		{errors.New("minimax chat failed before request: context deadline exceeded"), "minimax_before_request_timeout"},
+		{errors.New("minimax chat error: model http 401"), "minimax_auth_error"},
+		{errors.New("minimax chat error: model http 429"), "minimax_rate_limited"},
+		{errors.New("minimax chat error: model http 500"), "minimax_server_error"},
+		{errors.New("minimax chat error: model http 400"), "minimax_client_error"},
+		{errors.New("decode model response failed: <nil>"), "minimax_decode_error"},
+		{errors.New("minimax chat returned empty choices"), "minimax_empty_response"},
+		{errors.New("minimax api key is not configured"), "minimax_config_error"},
+		{errors.New("minimax chat error: upstream service unavailable"), "minimax_upstream_error"},
+		{errors.New("something else entirely"), "minimax_other"},
+	}
+	for _, c := range cases {
+		if got := classifyMiniMaxErrorBucket(c.err); got != c.want {
+			t.Errorf("classifyMiniMaxErrorBucket(%q) = %q, want %q", c.err, got, c.want)
+		}
+	}
+}
+
+func TestClassifyMiniMaxErrorBucketEmptyForNil(t *testing.T) {
+	if got := classifyMiniMaxErrorBucket(nil); got != "" {
+		t.Fatalf("classifyMiniMaxErrorBucket(nil) = %q, want empty", got)
+	}
+}
+
+func TestMiniMaxKeyPoolLabelsUseStableOrdinals(t *testing.T) {
+	resetMiniMaxGlobalKeyPool(t)
+	clearMiniMaxEnv(t)
+	t.Setenv("MINIMAX_API_KEYS", "sk-cp-ord1111,sk-cp-ord2222,sk-cp-ord3333")
+
+	acquireCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	lease, total, err := miniMaxGlobalKeyPool.Acquire(acquireCtx, nil)
+	if err != nil {
+		t.Fatalf("Acquire returned error: %v", err)
+	}
+	if total != 3 {
+		t.Fatalf("total = %d, want 3", total)
+	}
+	lease.Release()
+
+	snap := MiniMaxKeyPoolStatus()
+	wantLabels := []string{"key_1", "key_2", "key_3"}
+	if len(snap.Labels) != len(wantLabels) {
+		t.Fatalf("len(Labels) = %d, want %d", len(snap.Labels), len(wantLabels))
+	}
+	for i, want := range wantLabels {
+		if snap.Labels[i] != want {
+			t.Fatalf("snap.Labels[%d] = %q, want %q", i, snap.Labels[i], want)
+		}
+	}
+
+	// Sanitized token must be used in error messages, not the raw key bytes.
+	errBoom := sanitizeMiniMaxError(fmt.Errorf("upstream echoed sk-cp-ord2222 boom"),
+		[]string{"sk-cp-ord2222"})
+	if strings.Contains(errBoom.Error(), "sk-cp-ord2222") {
+		t.Fatalf("sanitized error leaked raw key: %s", errBoom)
+	}
+	if !strings.Contains(errBoom.Error(), "key_redacted") {
+		t.Fatalf("sanitized error missing key_redacted token: %s", errBoom)
+	}
+}
+
+func TestRecordErrorQuarantinesKeyOnAuthError(t *testing.T) {
+	resetMiniMaxGlobalKeyPool(t)
+	clearMiniMaxEnv(t)
+	keys := []string{
+		"sk-cp-qauth1111",
+		"sk-cp-qauth2222",
+		"sk-cp-qauth3333",
+	}
+	t.Setenv("MINIMAX_API_KEYS", strings.Join(keys, ","))
+
+	// Touch Acquire once so ensureLocked materializes the 3 slots. chatMMXRaw
+	// always calls recordError after a successful lease, so production code
+	// hits the same "slots are populated" precondition.
+	acquireCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	lease, total, err := miniMaxGlobalKeyPool.Acquire(acquireCtx, nil)
+	if err != nil {
+		t.Fatalf("Acquire returned error: %v", err)
+	}
+	if total != 3 {
+		t.Fatalf("total = %d, want 3", total)
+	}
+	lease.Release()
+
+	// Trigger an auth error for key_2.
+	miniMaxGlobalKeyPool.recordError("minimax_auth_error", "key_2")
+
+	snap := MiniMaxKeyPoolStatus()
+	if snap.QuarantinedKeyCount != 1 {
+		t.Fatalf("QuarantinedKeyCount = %d, want 1", snap.QuarantinedKeyCount)
+	}
+	if snap.HealthyKeyCount != 2 {
+		t.Fatalf("HealthyKeyCount = %d, want 2", snap.HealthyKeyCount)
+	}
+	if len(snap.QuarantinedLabels) != 1 || snap.QuarantinedLabels[0] != "key_2" {
+		t.Fatalf("QuarantinedLabels = %v, want [key_2]", snap.QuarantinedLabels)
+	}
+	if snap.LastQuarantinedLabel != "key_2" || snap.LastQuarantinedFor != "minimax_auth_error" {
+		t.Fatalf("LastQuarantinedLabel=%q LastQuarantinedFor=%q", snap.LastQuarantinedLabel, snap.LastQuarantinedFor)
+	}
+	if snap.LastQuarantinedAt.IsZero() {
+		t.Fatalf("LastQuarantinedAt is zero")
+	}
+
+	// Acquire must not return the quarantined slot even after multiple attempts.
+	gotLabels := map[string]bool{}
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) && len(gotLabels) < 2 {
+		acquireCtx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+		lease, _, err := miniMaxGlobalKeyPool.Acquire(acquireCtx, nil)
+		cancel()
+		if err != nil || lease == nil {
+			continue
+		}
+		gotLabels[lease.label] = true
+		lease.Release()
+	}
+	if gotLabels["key_2"] {
+		t.Fatalf("Acquire returned quarantined key_2 (got=%v)", gotLabels)
+	}
+	if !gotLabels["key_1"] || !gotLabels["key_3"] {
+		t.Fatalf("Acquire did not surface healthy labels (got=%v, want key_1 and key_3)", gotLabels)
+	}
+
+	// Repeat the same auth error: snapshot should report a single quarantine
+	// (hits increment but no extra key is quarantined).
+	miniMaxGlobalKeyPool.recordError("minimax_auth_error", "key_2")
+	snap = MiniMaxKeyPoolStatus()
+	if snap.QuarantinedKeyCount != 1 {
+		t.Fatalf("QuarantinedKeyCount after repeat = %d, want 1", snap.QuarantinedKeyCount)
+	}
+}
+
+func TestRecordErrorDoesNotQuarantineOnSensitiveOrRateOrDecode(t *testing.T) {
+	resetMiniMaxGlobalKeyPool(t)
+	clearMiniMaxEnv(t)
+	t.Setenv("MINIMAX_API_KEYS", "sk-cp-noq1111,sk-cp-noq2222")
+
+	acquireCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	lease, _, err := miniMaxGlobalKeyPool.Acquire(acquireCtx, nil)
+	if err != nil {
+		t.Fatalf("Acquire returned error: %v", err)
+	}
+	lease.Release()
+
+	// None of these buckets are allowed to move a key into quarantine; the
+	// AC explicitly demands sensitive 1026/1027 not rotate keys.
+	for _, bucket := range []string{
+		"minimax_sensitive_1026",
+		"minimax_sensitive_1027",
+		"minimax_rate_limited",
+		"minimax_decode_error",
+		"minimax_timeout",
+		"minimax_client_error",
+		"minimax_server_error",
+		"minimax_config_error",
+	} {
+		miniMaxGlobalKeyPool.recordError(bucket, "key_1")
+	}
+	snap := MiniMaxKeyPoolStatus()
+	if snap.QuarantinedKeyCount != 0 {
+		t.Fatalf("QuarantinedKeyCount = %d, want 0 (snap=%+v)", snap.QuarantinedKeyCount, snap)
+	}
+	if len(snap.QuarantinedLabels) != 0 {
+		t.Fatalf("QuarantinedLabels = %v, want []", snap.QuarantinedLabels)
+	}
+}
+
+func TestAcquireSkipsQuarantinedKey(t *testing.T) {
+	resetMiniMaxGlobalKeyPool(t)
+	clearMiniMaxEnv(t)
+	t.Setenv("MINIMAX_API_KEYS", "sk-cp-skip1111,sk-cp-skip2222,sk-cp-skip3333")
+
+	// Materialize slots before issuing the auth error (production only records
+	// after a successful lease).
+	acquireCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	lease, _, err := miniMaxGlobalKeyPool.Acquire(acquireCtx, nil)
+	if err != nil {
+		t.Fatalf("Acquire returned error: %v", err)
+	}
+	lease.Release()
+
+	// Mark key_2 quarantined.
+	miniMaxGlobalKeyPool.recordError("minimax_auth_error", "key_2")
+
+	gotLabels := map[string]bool{}
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) && len(gotLabels) < 2 {
+		acquireCtx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+		lease, total, err := miniMaxGlobalKeyPool.Acquire(acquireCtx, nil)
+		cancel()
+		if err != nil || lease == nil {
+			continue
+		}
+		if total != 3 {
+			t.Fatalf("total = %d, want 3 (quarantined key still counts in configured)", total)
+		}
+		gotLabels[lease.label] = true
+		lease.Release()
+	}
+	if gotLabels["key_2"] {
+		t.Fatalf("Acquire returned quarantined key_2 (got=%v)", gotLabels)
+	}
+	if !gotLabels["key_1"] || !gotLabels["key_3"] {
+		t.Fatalf("Acquire did not surface both healthy labels (got=%v)", gotLabels)
+	}
+
+	// Snapshot should report key_2 as quarantined and configured=3.
+	snap := MiniMaxKeyPoolStatus()
+	if snap.ConfiguredKeyCount != 3 {
+		t.Fatalf("ConfiguredKeyCount = %d, want 3", snap.ConfiguredKeyCount)
+	}
+	if snap.QuarantinedKeyCount != 1 || snap.HealthyKeyCount != 2 {
+		t.Fatalf("Quarantined=%d Healthy=%d, want 1/2", snap.QuarantinedKeyCount, snap.HealthyKeyCount)
+	}
 }
