@@ -1,12 +1,45 @@
 {
-  "active_feature_id": "temporal-graph-reprocess-failed-2026-06-04",
+  "active_feature_id": "graph-knowledge-digest-2026-06-10",
   "features": [
+    {
+      "id": "graph-knowledge-digest-2026-06-10",
+      "name": "Graph Knowledge Digest",
+      "title": "Temporal graph personal knowledge digest (Obsidian-friendly Markdown)",
+      "description": "Aggregate temporal graph entities/events/facts over a time window into an Obsidian-friendly Markdown digest under reports/ (symlinked, never committed). Default path makes zero model calls; summary=true makes at most one role-neutral Chat provider call with fallback. Source PRD: tasks/prd-graph-knowledge-digest.md; Ralph PRD: scripts/ralph/prd.json (branch ralph/graph-knowledge-digest, 6 stories).",
+      "scope": [
+        "temporalgraph manager read-only Digest aggregation with limits",
+        "Pure Markdown renderer: YAML frontmatter + 7 fixed H2 sections (role-neutral)",
+        "POST /api/v1/graph/digest writing reports/graph-digest-<start>_<end>.md, metadata-only JSON response",
+        "Optional summary=true single Chat provider call with graceful degradation (mock-tested only)",
+        "CLI chatlog report graph --days/--summary/--base-url via the HTTP endpoint",
+        "Closed-loop verification on the live 127.0.0.1:5030 service without disturbing the graph queue"
+      ],
+      "done_criteria": [
+        "All 6 stories in scripts/ralph/prd.json pass with evidence",
+        "go test ./internal/chatlog/temporalgraph and go build ./... pass",
+        "Digest file verified by path/size/mtime/section count only; no chat-derived content printed",
+        "git status shows no graph-digest-*.md entries; digest run does not increase graph failed count"
+      ],
+      "evidence": [
+        "US-001..US-006 all passes=true in scripts/ralph/prd.json; per-story evidence in scripts/ralph/progress.txt",
+        "go build ./... exit 0; go test ./internal/chatlog/temporalgraph ./internal/chatlog/semantic ./internal/chatlog/dailyreport all ok (2026-06-12)",
+        "node scripts/check-root-harness.mjs 80/80 PASS (2026-06-12)",
+        "Closed loop re-verified 2026-06-12 16:44 on live 127.0.0.1:5030: go run . report graph --days 7 exit 0; reports/graph-digest-2026-06-05_2026-06-12.md size 3932, mtime current run, 7 H2 sections, frontmatter has window_start/window_end",
+        "Idempotent overwrite confirmed (second run exit 0, same file, mtime advanced, file count 1)",
+        "graph failed count 267 before == 267 after, pending 0 unaffected; git status has no graph-digest-*.md report artifacts (docs/graph-digest.md is the intentional new doc)"
+      ],
+      "dependencies": [
+        "temporal-graph-reprocess-failed-2026-06-04"
+      ],
+      "next_step": "PRD complete (6/6). Optional follow-ups: one real summary=true run (user-triggered, quota-sensitive, verify summary_used + file size only); commit the digest code when user asks.",
+      "status": "done"
+    },
     {
       "id": "temporal-graph-reprocess-failed-2026-06-04",
       "name": "Temporal Graph Reprocess Failed Sources 2026-06-04",
       "title": "Reprocess failed temporal graph sources",
       "description": "Requeue temporal graph sources that previously failed, restore a ready Chat provider, and leave the graph worker processing without exposing private chat contents.",
-      "status": "running",
+      "status": "monitoring",
       "scope": [
         "Check runtime temporal graph status through local HTTP endpoints.",
         "Classify failed source error buckets without printing chat content.",
@@ -45,9 +78,73 @@
         {
           "command": "POST /api/v1/graph/rebuild?format=json with reset=false",
           "result": "PASS: accepted; follow-up status showed enqueue_running=true, source_count=6964, pending about 2075, processing=8, failed=41."
+        },
+        {
+          "command": "POST /api/v1/graph/config?format=json with workers=5 enqueue_workers=4",
+          "result": "PASS: graph config and graph_meta both persisted workers=5, enqueue_workers=4."
+        },
+        {
+          "command": "tmux set-environment for MINIMAX_API_KEYS followed by service restart",
+          "result": "PASS: restarted chatlog-alpha with pid environment showing 5 MiniMax keys without printing secret values."
+        },
+        {
+          "command": "go test ./internal/chatlog/dailyreport ./internal/chatlog/semantic ./internal/chatlog/temporalgraph",
+          "result": "PASS: focused graph, semantic, and dailyreport packages passed after graph decode retry and source timeout hardening."
+        },
+        {
+          "command": "runtime graph monitor after deploying bin/chatlog",
+          "result": "PASS: service healthy, running=true, workers=5, processed advanced to 4892, failed held at 17 after recoverable timeout/config failures were requeued, last_error empty."
+        },
+        {
+          "command": "go test ./internal/chatlog/dailyreport ./internal/chatlog/semantic ./internal/chatlog/temporalgraph",
+          "result": "PASS: added coverage for temporal graph prompt redaction/cropping and MiniMax 1026/1027 sensitive errors not switching API keys."
+        },
+        {
+          "command": "runtime graph status plus readonly SQLite failed bucket query after graph/resume",
+          "result": "PASS: workers=5, enqueue_workers=4, failed dropped from 40 to 17, timeout_or_config failed count became 0, while sensitive_1026=1 and sensitive_1027=4 stayed failed and were not requeued."
+        },
+        {
+          "command": "jq empty feature_list.json && ./init.sh",
+          "result": "PASS: feature_list.json parsed, root harness check 77/77, harness skill check 29/29, daily report help, and HTTP endpoint list passed."
+        },
+        {
+          "command": "2026-06-05 20:41 runtime recovery: tmux respawn with chatlog serve, graph/resume, status monitor, readonly failed bucket query",
+          "result": "PASS: recovered from HTTP graph status last_error sql: database is closed; service restarted on 127.0.0.1:5030 with pid_env_key_count=5, timeout failures requeued from failed=62 to failed=17, latest status after quick gate running=true source_count=17355 processed=4980 processing=1 pending=12357 failed=17 workers=5 enqueue_workers=4 last_error empty. Current runtime semantic config after service-config restart is mmx MiniMax-M2.7 chat_max_tokens=4096 chat_temperature=0.3."
+        },
+        {
+          "command": "2026-06-05 21:09 persistent MiniMax-M3 switch: graph pause, service-config backup/update, runtime semantic config POST, graph resume, 60s monitor, failed bucket query, ./init.sh",
+          "result": "PASS: backed up .cache/daily-report-config/chatlog-server.json to .cache/daily-report-config/chatlog-server.json.bak-20260605_210932, persisted and applied chat_provider=mmx chat_model=MiniMax-M3 chat_max_tokens=8192 chat_temperature=0.2, kept pid_env_key_count=5 and workers=5, resumed graph at running=true paused=false processed=5210 processing=19 pending=12107 failed=19 last_error empty. ./init.sh quick gate passed with root harness 80/80 and skill harness 29/29."
+        },
+        {
+          "command": "go test ./internal/chatlog/semantic ./internal/chatlog/temporalgraph",
+          "result": "PASS: compile and behavior checks for miniMax lease context timeout handling and graph recoverable timeout token update."
+        },
+        {
+          "command": "2026-06-05 21:20 lease-context hardening follow-up status/buckets",
+          "result": "PASS: status read `running=true`, `source_count=17355`, `pending=12087`, `processing=17`, `processed=5225`, `failed=26`, `workers=5`, `enqueue_workers=4`, `last_error` empty; `before request` remains traceable and requeue tokens now include it."
+        },
+        {
+          "command": "2026-06-06 20:22 user-requested failed-source reprocess: today log/status check, readonly SQLite bucket query, POST /api/v1/graph/resume?format=json, short monitor",
+          "result": "PASS: today's file log logs/chatlog-alpha-20260606_090057.log was 0B, tmux access log had only HTTP requests, SQLite showed today(+0800) failed=13479 with chat_model_not_configured=13473 and timeout=3. graph/resume requeued recoverable failures without reset: status became running=true, pending=13466, processing=10, processed=7584, failed=13; short monitor advanced to processed=7586, processing=8, failed stayed 13 with buckets json_decode_or_format=10 and sensitive_1027=3."
+        },
+        {
+          "command": "2026-06-06 post-state-update verification: jq empty feature_list.json, ./init.sh, final graph status poll",
+          "result": "PASS: feature_list.json parsed, ./init.sh quick gate passed with root harness 80/80 and skill harness 29/29; final status after verification was running=true, pending=13456, processing=9, processed=7595, failed=13."
+        },
+        {
+          "command": "2026-06-07 high availability recovery: detect startup-entry drift, inject 5 MiniMax keys into tmux, restart serve --config-dir, graph/resume, set workers=5, add scripts/chatlog-ha-guard.sh",
+          "result": "PASS: live config had drifted to glm/glm-5.1 with has_api_key=false while saved config was mmx MiniMax-M2.7. Restarted chatlog-alpha as ./bin/chatlog serve --config-dir .cache/daily-report-config, verified tmux_minimax_key_count=5 and pid_minimax_key_count=5 without printing secrets, graph/resume moved failed from 11079 to 17, graph config reports workers=5 enqueue_workers=1, and short monitor showed processed advancing to 10017 while failed stayed 17."
+        },
+        {
+          "command": "2026-06-07 post-HA verification: jq empty feature_list.json, ./init.sh, final graph status poll",
+          "result": "PASS: feature_list.json parsed, ./init.sh quick gate passed with root harness 80/80 and skill harness 29/29; final status was running=true, workers=5, pending=11037, processing=8, processed=10019, failed=17."
+        },
+        {
+          "command": "2026-06-08 failed-source reprocess: readonly failed bucket query, graph config workers=3, canary requeue 10 ollama_refused rows, then targeted requeue remaining ollama_refused rows",
+          "result": "PASS: current runtime was serve --config-dir with mmx MiniMax-M2.7 and has_api_key=true. Failed buckets before requeue were ollama_refused=3951, minimax_401=141, sensitive_1027=18, json_decode_or_format=10, zero_key_attempts=5, other=1. Canary moved 10 ollama_refused rows from failed to processing and 9 reached processed without failed increasing. Then 3941 remaining ollama_refused rows were requeued only; latest status was running=true, workers=3, pending=3911, processing=8, processed=17050, failed=175, last_error empty. Non-requeued failed rows are auth/sensitive/decode/zero-key/other and should not be blindly retried."
         }
       ],
-      "next_step": "Monitor curl -sS 'http://127.0.0.1:5030/api/v1/graph/status?format=json'. If MiniMax-M3 keeps producing truncated JSON, switch graph extraction back to MiniMax-M2.7 or increase structured-output hardening.",
+      "next_step": "Background graph worker keeps draining pending queue; check GET /api/v1/graph/status periodically. PRD run ralph/temporal-graph-failed-reprocess-parallelism-2026-06-06 archived to archive/2026-06-10-temporal-graph-failed-reprocess-parallelism/ (13/14 passes, US-005 blocked with documented reason).",
       "dependencies": [
         "semantic-minimax-m3-config"
       ]
@@ -456,6 +553,162 @@
       "next_step": "When graph worker drain completes, rerun /api/v1/graph/timeline?keyword=中间件&window=90d to refresh, then re-anchor unverified items (编译报错待解决 / 王勇夜间补测脚本).",
       "dependencies": [
         "temporal-graph-reprocess-failed-2026-06-04"
+      ],
+      "side_task": true
+    },
+    {
+      "id": "ralph-ai-coding-automation-adapter-2026-06-05",
+      "name": "Ralph AI Coding Automation Adapter 2026-06-05",
+      "title": "Adapt Ralph PRD automation harness for chatlog_alpha",
+      "description": "Copy .agents/.claude/scripts/ralph from the AI coding automation template into chatlog_alpha, then adapt the instructions, state files, commit safety, and verification gates for this Go local-tool repository.",
+      "status": "completed",
+      "scope": [
+        "Copy template .agents, .claude, and scripts/ralph assets while excluding .DS_Store, __pycache__, *.pyc, and local cache files.",
+        "Document Ralph / PRD automation rules in AGENTS.md for chatlog_alpha as a Go CLI/TUI/HTTP local-tool product.",
+        "Make developer agents avoid direct commits and move automatic commits into scripts/ralph/ralph.py after Validator success.",
+        "Add scripts/ralph/prd.json and scripts/ralph/progress.txt bootstrap state.",
+        "Extend root harness checks so ./init.sh validates Ralph assets."
+      ],
+      "done_criteria": [
+        ".agents, .claude, and scripts/ralph assets exist without copied cache/system files.",
+        "Ralph developer and validator instructions read the repo-local harness and respect privacy/quota boundaries.",
+        "Ralph automatic commit excludes startup-dirty paths and private/cache outputs.",
+        "python3 scripts/ralph/ralph.py --check passes.",
+        "node scripts/check-root-harness.mjs, node skills/chatlog-http-cli/scripts/check-harness-skill.mjs, and ./init.sh pass."
+      ],
+      "evidence": [
+        {
+          "command": "find .agents .claude scripts/ralph -name '.DS_Store' -o -name '*.pyc' -o -name '__pycache__'",
+          "result": "PASS: no copied or generated cache/system files remained."
+        },
+        {
+          "command": "PYTHONDONTWRITEBYTECODE=1 python3 -B scripts/ralph/ralph.py --check",
+          "result": "PASS: Ralph installation check passed with auto commit enabled."
+        },
+        {
+          "command": "node scripts/check-root-harness.mjs",
+          "result": "PASS: root harness check 77/77 passed with Ralph assets included."
+        },
+        {
+          "command": "node skills/chatlog-http-cli/scripts/check-harness-skill.mjs",
+          "result": "PASS: repo-local harness skill check 29/29 passed."
+        },
+        {
+          "command": "./init.sh",
+          "result": "PASS: quick gate completed; root harness 77/77, skill harness 29/29, daily report help, and HTTP endpoint list passed."
+        }
+      ],
+      "next_step": "Replace scripts/ralph/prd.json with a real PRD-derived story list before running python3 scripts/ralph/ralph.py or python3 scripts/ralph/ralph.py codex for product work.",
+      "dependencies": [
+        "root-harness-bridge"
+      ],
+      "side_task": true
+    },
+    {
+      "id": "global-agents-rules-refresh-2026-06-05",
+      "name": "Global AGENTS Rules Refresh 2026-06-05",
+      "title": "Refresh root AGENTS.md from source-command-create-rules",
+      "description": "Analyze the current chatlog_alpha repository and expand AGENTS.md with project overview, technology stack, structure, code patterns, key files, verification gates, privacy/quota boundaries, and Ralph automation rules.",
+      "status": "completed",
+      "scope": [
+        "Use the repo-local source-command-create-rules skill to refresh root AGENTS.md.",
+        "Preserve existing harness-required strings and safety rules.",
+        "Document chatlog_alpha as a Go local-tool product with CLI, TUI, HTTP API, semantic search, daily report, temporal graph, WeChat DB access, and Ralph automation subsystems.",
+        "Do not touch private reports, runtime data, model provider calls, or unrelated source changes."
+      ],
+      "done_criteria": [
+        "AGENTS.md includes project overview, technology stack, verification commands, structure, code patterns, key files, scope rules, Ralph automation, Definition of Done, and End of Session.",
+        "Root harness check passes.",
+        "Repo-local harness skill check passes.",
+        "./init.sh quick gate passes without running quota- or privacy-sensitive daily report analysis."
+      ],
+      "evidence": [
+        {
+          "command": "node scripts/check-root-harness.mjs",
+          "result": "PASS: root harness check 77/77 passed after AGENTS.md refresh."
+        },
+        {
+          "command": "node skills/chatlog-http-cli/scripts/check-harness-skill.mjs",
+          "result": "PASS: repo-local harness skill check 29/29 passed."
+        },
+        {
+          "command": "./init.sh",
+          "result": "PASS: quick gate completed; root harness 77/77, skill harness 29/29, daily report help, and HTTP endpoint list passed."
+        },
+        {
+          "command": "create-rules refresh after project-local skill conversion",
+          "result": "PASS: AGENTS.md now documents .agents/skills project-local entries including prime, plan-feature, create-rules, and source-command-create-rules without changing active runtime scope."
+        },
+        {
+          "command": "jq empty feature_list.json",
+          "result": "PASS: feature_list.json parsed successfully after AGENTS refresh evidence update."
+        },
+        {
+          "command": "node scripts/check-root-harness.mjs",
+          "result": "PASS: root harness check 80/80 passed after AGENTS.md project-local skills refresh."
+        },
+        {
+          "command": "node skills/chatlog-http-cli/scripts/check-harness-skill.mjs",
+          "result": "PASS: repo-local harness skill check 29/29 passed."
+        },
+        {
+          "command": "./init.sh",
+          "result": "PASS: quick gate completed; root harness 80/80, skill harness 29/29, daily report help, and HTTP endpoint list passed."
+        },
+        {
+          "command": "2026-06-06 create-rules refresh: jq empty feature_list.json; node scripts/check-root-harness.mjs; node skills/chatlog-http-cli/scripts/check-harness-skill.mjs; ./init.sh",
+          "result": "PASS: AGENTS.md now clarifies scripts/ralph/prd.json userStories inspection, reports.backup-* private generated artifact handling, and archive/tasks scoped artifact boundaries. feature_list.json parsed, root harness 80/80, skill harness 29/29, and quick gate passed without running quota-sensitive report/model commands."
+        }
+      ],
+      "next_step": "Use .agents/skills/create-rules/SKILL.md or .agents/skills/source-command-create-rules/SKILL.md for future project-local AGENTS.md refreshes; inspect scripts/ralph/prd.json userStories before running Ralph automation; active temporal graph runtime monitoring remains unchanged.",
+      "dependencies": [
+        "root-harness-bridge",
+        "ralph-ai-coding-automation-adapter-2026-06-05"
+      ],
+      "side_task": true
+    },
+    {
+      "id": "project-command-skills-localization-2026-06-05",
+      "name": "Project Command Skills Localization 2026-06-05",
+      "title": "Convert project commands into local .agents skills",
+      "description": "Convert the project-only .agents/commands shortcuts into Codex-detectable local skills under .agents/skills, without installing global skills or deleting the original command files.",
+      "status": "completed",
+      "scope": [
+        "Create project-local .agents/skills/prime/SKILL.md from the prime command behavior.",
+        "Create project-local .agents/skills/plan-feature/SKILL.md from the plan-feature command behavior.",
+        "Create project-local .agents/skills/create-rules/SKILL.md as a compatibility entry for create-rules while preserving source-command-create-rules.",
+        "Update root harness check so these local skills are verified.",
+        "Do not write to global ~/.agents or ~/.codex skill directories."
+      ],
+      "done_criteria": [
+        "The three new local SKILL.md files exist under .agents/skills.",
+        "Original .agents/commands/*.md files remain in place.",
+        "node scripts/check-root-harness.mjs passes with the new skill files included.",
+        "node skills/chatlog-http-cli/scripts/check-harness-skill.mjs passes.",
+        "feature_list.json remains valid JSON."
+      ],
+      "evidence": [
+        {
+          "command": "find .agents/skills -maxdepth 2 -name 'SKILL.md' -print | sort",
+          "result": "PASS: includes .agents/skills/create-rules/SKILL.md, .agents/skills/plan-feature/SKILL.md, and .agents/skills/prime/SKILL.md."
+        },
+        {
+          "command": "node scripts/check-root-harness.mjs",
+          "result": "PASS: root harness check 80/80 passed with local command skills included."
+        },
+        {
+          "command": "node skills/chatlog-http-cli/scripts/check-harness-skill.mjs",
+          "result": "PASS: repo-local harness skill check 29/29 passed."
+        },
+        {
+          "command": "jq empty feature_list.json",
+          "result": "PASS: feature_list.json parsed successfully."
+        }
+      ],
+      "next_step": "Start a new Codex turn/session if the skill picker does not immediately show the newly added local skills; they are project-local files only.",
+      "dependencies": [
+        "ralph-ai-coding-automation-adapter-2026-06-05",
+        "global-agents-rules-refresh-2026-06-05"
       ],
       "side_task": true
     }

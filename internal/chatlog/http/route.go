@@ -96,6 +96,7 @@ func (s *Service) initBaseRouter() {
 	s.router.GET("/api/v1/graph/timeline", s.handleGraphTimeline)
 	s.router.GET("/api/v1/graph/visualize", s.handleGraphVisualize)
 	s.router.POST("/api/v1/graph/qa", s.handleGraphQA)
+	s.router.POST("/api/v1/graph/digest", s.handleGraphDigest)
 
 	s.router.NoRoute(s.NoRoute)
 }

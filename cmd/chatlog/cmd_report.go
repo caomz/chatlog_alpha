@@ -38,6 +38,10 @@ var (
 	reportSummary             bool
 	reportAnalysisConcurrency int
 
+	reportGraphDays    int
+	reportGraphSummary bool
+	reportGraphBaseURL string
+
 	reportCmd = &cobra.Command{
 		Use:   "report",
 		Short: "Generate reports",
@@ -46,6 +50,11 @@ var (
 		Use:   "daily",
 		Short: "Generate daily WeChat mention report",
 		Run:   runReportDaily,
+	}
+	reportGraphCmd = &cobra.Command{
+		Use:   "graph",
+		Short: "Generate temporal graph digest report via HTTP service",
+		Run:   runReportGraph,
 	}
 )
 
@@ -61,6 +70,10 @@ type reportVisionClient struct {
 func init() {
 	rootCmd.AddCommand(reportCmd)
 	reportCmd.AddCommand(reportDailyCmd)
+	reportCmd.AddCommand(reportGraphCmd)
+	reportGraphCmd.Flags().IntVar(&reportGraphDays, "days", 7, "time window in days")
+	reportGraphCmd.Flags().BoolVar(&reportGraphSummary, "summary", false, "enable model summarization (consumes quota)")
+	reportGraphCmd.Flags().StringVar(&reportGraphBaseURL, "base-url", "http://127.0.0.1:5030", "chatlog HTTP service base URL")
 	reportDailyCmd.Flags().StringVar(&reportDate, "date", "today", "report date: today or YYYY-MM-DD")
 	reportDailyCmd.Flags().StringVar(&reportMention, "mention", dailyreport.DefaultMention, "primary mention name")
 	reportDailyCmd.Flags().StringArrayVar(&reportAliases, "alias", nil, "extra mention alias, repeatable")
@@ -325,4 +338,71 @@ func (c reportVisionClient) AnalyzeText(ctx context.Context, title, data, instru
 		{Role: "system", Content: "你是本地微信聊天记录分析助手。只能基于输入证据输出，不要编造。"},
 		{Role: "user", Content: fmt.Sprintf("%s\n\n数据：\n%s\n\n要求：\n%s", title, data, instruction)},
 	})
+}
+
+func runReportGraph(cmd *cobra.Command, args []string) {
+	if err := runReportGraphHTTP(reportGraphDays, reportGraphSummary, reportGraphBaseURL); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+func runReportGraphHTTP(days int, summary bool, baseURL string) error {
+	baseURL = strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	if !strings.HasPrefix(baseURL, "http://") && !strings.HasPrefix(baseURL, "https://") {
+		baseURL = "http://" + baseURL
+	}
+
+	target := fmt.Sprintf("%s/api/v1/graph/digest?days=%d&format=json", baseURL, days)
+	if summary {
+		target += "&summary=true"
+	}
+
+	client := &http.Client{Timeout: 120 * time.Second}
+	req, err := http.NewRequest(http.MethodPost, target, nil)
+	if err != nil {
+		return fmt.Errorf("failed to build request to %s: %w", target, err)
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("cannot reach %s: %w\nHint: start the service with: chatlog serve", baseURL, err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("failed to read response: %w", err)
+	}
+
+	if resp.StatusCode >= 500 {
+		return fmt.Errorf("server error %d at %s: %s", resp.StatusCode, target, strings.TrimSpace(string(body)))
+	}
+	if resp.StatusCode >= 400 {
+		return fmt.Errorf("request error %d at %s: %s", resp.StatusCode, target, strings.TrimSpace(string(body)))
+	}
+
+	var result struct {
+		Path          string `json:"path"`
+		WindowStart   string `json:"window_start"`
+		WindowEnd     string `json:"window_end"`
+		EntityCount   int    `json:"entity_count"`
+		EventCount    int    `json:"event_count"`
+		FactCount     int    `json:"fact_count"`
+		RelationCount int    `json:"relation_count"`
+		SummaryUsed   bool   `json:"summary_used"`
+	}
+	if err := json.Unmarshal(body, &result); err != nil {
+		return fmt.Errorf("failed to parse response: %w", err)
+	}
+
+	fmt.Printf("path: %s\n", result.Path)
+	fmt.Printf("window_start: %s\n", result.WindowStart)
+	fmt.Printf("window_end: %s\n", result.WindowEnd)
+	fmt.Printf("entity_count: %d\n", result.EntityCount)
+	fmt.Printf("event_count: %d\n", result.EventCount)
+	fmt.Printf("fact_count: %d\n", result.FactCount)
+	fmt.Printf("relation_count: %d\n", result.RelationCount)
+	fmt.Printf("summary_used: %v\n", result.SummaryUsed)
+	return nil
 }

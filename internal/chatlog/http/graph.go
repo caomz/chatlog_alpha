@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -317,4 +319,108 @@ func parseGraphTime(raw string) time.Time {
 		}
 	}
 	return time.Time{}
+}
+
+func (s *Service) handleGraphDigest(c *gin.Context) {
+	g := s.requireGraph(c)
+	if g == nil {
+		return
+	}
+
+	// Parse parameters: days or start/end, summary flag.
+	daysStr := c.DefaultQuery("days", "7")
+	days, _ := strconv.Atoi(daysStr)
+	summaryEnabled := strings.ToLower(c.DefaultQuery("summary", "false")) == "true"
+
+	// Resolve time window.
+	var start, end time.Time
+	if startRaw := c.Query("start"); startRaw != "" {
+		if endRaw := c.Query("end"); endRaw != "" {
+			start = parseGraphTime(startRaw)
+			end = parseGraphTime(endRaw)
+			if start.IsZero() || end.IsZero() || start.After(end) {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "invalid start/end times or start > end"})
+				return
+			}
+		}
+	} else if days > 0 {
+		now := time.Now()
+		end = now
+		start = now.AddDate(0, 0, -days)
+	} else {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "days must be > 0 or start/end must be provided"})
+		return
+	}
+
+	// Call Digest with read-only aggregation.
+	result, err := g.Digest(start, end, temporalgraph.DigestOptions{
+		MaxEntities:   20,
+		MaxEvents:     50,
+		MaxEventsScan: 2000,
+		EnableSummary: summaryEnabled,
+	})
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to aggregate digest: " + err.Error()})
+		return
+	}
+
+	// Render Markdown.
+	markdown := temporalgraph.RenderDigestMarkdown(result)
+
+	// Determine output path: CWD/reports/ (not sandboxed like daily report).
+	wd, _ := os.Getwd()
+	reportsDir := filepath.Join(wd, "reports")
+
+	// Create reports directory if needed.
+	if err := os.MkdirAll(reportsDir, 0o755); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "cannot create reports directory"})
+		return
+	}
+
+	// Write file with idempotent name.
+	startStr := start.Format("2006-01-02")
+	endStr := end.Format("2006-01-02")
+	filename := fmt.Sprintf("graph-digest-%s_%s.md", startStr, endStr)
+	filePath := filepath.Join(reportsDir, filename)
+
+	if err := os.WriteFile(filePath, []byte(markdown), 0o644); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to write digest file"})
+		return
+	}
+
+	// Get file info for response metadata.
+	fileInfo, err := os.Stat(filePath)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to stat file"})
+		return
+	}
+
+	// format=json: return metadata only, no chat content.
+	if c.Query("format") == "json" {
+		c.JSON(http.StatusOK, gin.H{
+			"path":           filePath,
+			"size_bytes":     fileInfo.Size(),
+			"window_start":   result.StartTime.Format(time.RFC3339),
+			"window_end":     result.EndTime.Format(time.RFC3339),
+			"entity_count":   len(result.TopEntities),
+			"event_count":    len(result.EventTimeline),
+			"fact_count":     result.FactCount,
+			"relation_count": result.RelationCount,
+			"summary_used":   result.SummaryUsed,
+		})
+		return
+	}
+
+	// Default: return path and counts.
+	c.JSON(http.StatusOK, gin.H{
+		"ok":             true,
+		"path":           filePath,
+		"window_start":   result.StartTime.Format(time.RFC3339),
+		"window_end":     result.EndTime.Format(time.RFC3339),
+		"entity_count":   len(result.TopEntities),
+		"event_count":    len(result.EventTimeline),
+		"fact_count":     result.FactCount,
+		"relation_count": result.RelationCount,
+		"summary_used":   result.SummaryUsed,
+	})
 }
