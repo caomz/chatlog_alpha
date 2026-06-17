@@ -2005,6 +2005,7 @@
         let hookEventSource = null;
         let hookEventsCache = [];
         let hookStatusTimer = null;
+        let lastLongPollController = null;
         let hermesWeixinEditable = false;
         let hermesQQEditable = false;
         let semanticConnectivityPassed = false;
@@ -3373,12 +3374,19 @@
 	        }
 
 	        async function fetchWithTimeout(url, timeoutMs = 20000) {
+	            if (lastLongPollController) {
+	                try { lastLongPollController.abort(); } catch (e) { /* swallow */ }
+	            }
 	            const controller = new AbortController();
+	            lastLongPollController = controller;
 	            const timer = setTimeout(() => controller.abort(), timeoutMs);
 	            try {
 	                return await fetch(url, { signal: controller.signal });
 	            } finally {
 	                clearTimeout(timer);
+	                if (lastLongPollController === controller) {
+	                    lastLongPollController = null;
+	                }
 	            }
 	        }
 
