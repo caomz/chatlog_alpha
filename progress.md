@@ -1,6 +1,26 @@
 # Progress
 
-Last Updated: 2026-06-16
+Last Updated: 2026-06-17
+
+## Workspace tidy state repair (2026-06-17)
+
+- **Current State**: active feature is now `workspace-tidy-2026-06-17` with `status=done`. The previous active feature `db-runtime-graph-truth-harness-2026-06-12` is marked `discarded` because its recovery implementation was not preserved as the current main-line task; its diagnostic evidence and PRD history remain available for future reference. Current `main` was already clean and synchronized with `origin/main` at commit `4e101144` before this state repair.
+- **What changed**:
+  - `feature_list.json`: `active_feature_id` now points to `workspace-tidy-2026-06-17`; the new workspace tidy feature records the commit/push/harness evidence; `db-runtime-graph-truth-harness-2026-06-12` now has `status=discarded` and a historical next step.
+  - `progress.md`: this section records the state repair so future agents do not resume the discarded DB runtime PRD as the active feature.
+  - `session-handoff.md`: current objective refreshed to the clean-worktree truth; DB runtime recovery is explicitly a future authorized task, not current active work.
+- **Verification Evidence**:
+  - `git status -sb` before repair: `## main...origin/main`; `git status --short` empty.
+  - `git rev-list --left-right --count @{u}...HEAD` before repair: `0 0`.
+  - `jq '.active_feature_id as $id | {active_feature_id:$id, active:(.features[] | select(.id==$id) | {id,status,next_step,evidence_count:(.evidence|length)}), feature_count:(.features|length)}' feature_list.json` before repair confirmed stale active `db-runtime-graph-truth-harness-2026-06-12 status=in_progress`.
+  - `git check-ignore -v reports reports.backup-20260606_124656 openai_prmpt.md` confirms private/local artifacts remain ignored by `.gitignore`.
+- **Not Verified**:
+  - No DB runtime recovery was attempted. No key rescan, bad cache cleanup, service restart, graph resume/rebuild, model call, or private report inspection was performed.
+  - This repair does not prove `session/contact/message_0` DB queryability. It only fixes repo-local state truth after the worktree cleanup.
+- **Blockers/Risks**:
+  - DB recovery remains a separate, potentially destructive runtime task requiring same-turn user authorization before touching keys, cache, or service processes.
+  - The discarded DB runtime PRD still exists as historical evidence in `tasks/`, `scripts/ralph/prd.json`, `progress.md`, and `archive/`; future agents must treat it as history unless the user explicitly reopens it.
+- **Recommended Next Step**: commit and push this state repair, then keep `main` clean. If DB runtime recovery is needed later, start a fresh scoped task from the archived evidence and current runtime truth.
 
 ## US-009 Root state 与完成态记录 (2026-06-16 18:55)
 

@@ -1,5 +1,5 @@
 {
-  "active_feature_id": "db-runtime-graph-truth-harness-2026-06-12",
+  "active_feature_id": "workspace-tidy-2026-06-17",
   "features": [
     {
       "id": "graph-knowledge-digest-2026-06-10",
@@ -797,8 +797,39 @@
       "dependencies": [
         "ralph-auto-merge-branch-2026-06-12"
       ],
-      "next_step": "7/10 stories pass autonomously (US-001/002/003/006/007/008/009). US-004/005/010 remain blocked=true in scripts/ralph/prd.json pending user same-turn authorization for destructive runtime recovery (force WeChat key rescan + bad wcdb_cache cleanup + service restart). US-010 end-to-end acceptance requires US-004 completion. Ralph autonomous loop waits for user authorization or manual handoff.",
-      "status": "in_progress"
+      "next_step": "工作分支已删除，代码实现未保留在当前 main；DB runtime 未真正恢复。历史诊断与 PRD 证据保留在 tasks/prd-db-runtime-graph-truth-harness.md、scripts/ralph/prd.json、progress.md 和 archive/2026-06-17-db-runtime-graph-truth-harness-discarded/。如需恢复，应重新创建小步 PRD 并先取得用户授权处理 key/cache/service restart。",
+      "status": "discarded"
+    },
+    {
+      "id": "workspace-tidy-2026-06-17",
+      "name": "workspace-tidy",
+      "title": "Workspace tidy and state truth repair",
+      "description": "Clean up the long-lived dirty worktree by ignoring private/generated artifacts, staging and committing project harness assets, and repairing root state files so the active feature reflects the current main branch truth.",
+      "scope": [
+        "Protect private/generated local artifacts with .gitignore rules for reports, reports.backup-*, __pycache__, *.pyc, and openai_prmpt.md",
+        "Commit repo-local agent/Ralph harness assets, PRD archives, task docs, hidden serve command, HA guard, and root state files already present in the worktree",
+        "Mark discarded DB runtime recovery state as historical so future agents do not treat it as the active executable feature",
+        "Verify clean worktree, synchronized origin/main, and repo-local harness gates"
+      ],
+      "done_criteria": [
+        "git status --short is empty after commit and push",
+        "origin/main and local main are synchronized with ahead/behind 0/0",
+        "node scripts/check-root-harness.mjs passes 80/80",
+        "node skills/chatlog-http-cli/scripts/check-harness-skill.mjs passes 29/29",
+        "./init.sh quick gate passes",
+        "reports, reports.backup-*, .cache, logs, outputs, .env*, openai_prmpt.md, and Python bytecode are not staged or committed"
+      ],
+      "evidence": [
+        "Commit 4e101144 chore: tidy chatlog alpha workspace created from 58 staged files; git status --short clean afterward",
+        "git push origin main succeeded; local main and origin/main synchronized at 4e101144 before this state repair follow-up",
+        "git check-ignore -v reports reports.backup-20260606_124656 openai_prmpt.md confirms private/local artifacts are ignored",
+        "node scripts/check-root-harness.mjs -> Root harness check: 80/80 passed",
+        "node skills/chatlog-http-cli/scripts/check-harness-skill.mjs -> Harness skill check: 29/29 passed",
+        "./init.sh quick gate passed after workspace tidy commit"
+      ],
+      "dependencies": [],
+      "next_step": "Workspace tidy complete. Keep main clean; if DB runtime recovery is needed, start a new explicitly authorized recovery task rather than resuming the discarded dirty-worktree PRD state.",
+      "status": "done"
     }
   ]
 }
