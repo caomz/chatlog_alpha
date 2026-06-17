@@ -830,7 +830,7 @@
       "dependencies": [
         "workspace-tidy-2026-06-17"
       ],
-      "next_step": "Commit and push this recovery patch on main. Future DB failures should first check /api/v1/db/tables status and the explicit 'decrypted database is unreadable' error before doing any key rescan or cache cleanup.",
+      "next_step": "Recovery patch has been committed and pushed to main. Future DB failures should first check /api/v1/db/tables status and the explicit 'decrypted database is unreadable' error before doing any key rescan or cache cleanup.",
       "status": "done"
     },
     {

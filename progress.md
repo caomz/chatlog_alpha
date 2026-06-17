@@ -28,7 +28,7 @@ Last Updated: 2026-06-17
 - **Blockers/Risks**:
   - None for the scoped core DB recovery.
   - If a future DB table query returns `decrypted database is unreadable; all_keys.json may be stale or invalid`, then key rescan/cache cleanup becomes the next justified step. Until that explicit error appears, do not batch-delete cache or re-scan keys by default.
-- **Recommended Next Step**: commit and push this recovery patch on `main`, then verify clean `main...origin/main`.
+- **Recommended Next Step**: monitor future DB failures by first checking `/api/v1/db/tables` status and the explicit `decrypted database is unreadable` error. Do not rescan keys or clean cache unless that error appears or the user explicitly requests deeper recovery.
 
 ## Workspace tidy state repair (2026-06-17)
 
