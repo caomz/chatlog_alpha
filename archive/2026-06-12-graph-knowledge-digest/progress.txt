@@ -1,0 +1,260 @@
+# Ralph Progress
+
+## Codebase Patterns
+- `chatlog_alpha` is a Go local-tool product for Chatlog CLI/TUI/HTTP, WeChat local database access, semantic search, temporal graph processing, and daily reports.
+- Start every Ralph iteration by reading root `AGENTS.md`, `skills/chatlog-http-cli/SKILL.md`, `feature_list.json`, root `progress.md`, root `session-handoff.md`, `scripts/ralph/prd.json`, and this file.
+- Use `./init.sh` as the default quick gate; use focused `go test ./internal/...` for Go logic; use `./init.sh --full` only for broad repo changes.
+- Do not run `chatlog report daily --vision` or `chatlog report daily --summary` unless the PRD story and user authorization explicitly require model/vision calls.
+- Verify private chat-derived workflows through paths, timestamps, counts, HTTP status, structured fields, or error buckets; do not print private message or report contents.
+- Developer agents do not commit directly. `scripts/ralph/ralph.py` commits only after Validator success and excludes startup-dirty paths plus private/cache output directories.
+- Long runtime windows (>2min) should run via `nohup script.sh &` (or a TaskCreate with `run_in_background`); the parent shell returns immediately, the child keeps sampling. Snapshot to `scripts/ralph/progress.txt` not a new file, and judge PASS/blocked only after the loop finishes, never mid-loop.
+- `prd.json` field is `userStories`, not `stories`. After any PRD edit run `jq '.userStories | length'` to confirm shape.
+- For MiniMax key pool: stable ordinal labels (`key_1`, `key_2`, ...) are preferred over `***xxxx` tail-redaction because operators want to grep for "which key hit the wall". A non-retryable bucket (`minimax_sensitive_1026/1027`, `minimax_decode_error`, ...) must NEVER move a key into pool-level quarantine — only `minimax_auth_error` and the model-retryable buckets the operator has explicitly opted into should. Test the negative case (`TestRecordErrorDoesNotQuarantineOnSensitiveOrRateOrDecode`) so future refactors cannot silently rotate 1026/1027 keys.
+- `chatMMXRaw.recordError` is only called after a successful `Acquire` (i.e. `ensureLocked` already ran), so recordError can rely on `p.slots` being populated. Tests that call `recordError` before any `Acquire` must touch Acquire first to materialize slots.
+- HTTP handler 暴露 snapshot 字段的最佳实践: 当 snapshot 结构已包含目标字段(类型/JSON tag 完备)但 HTTP gin.H 没 spread 时,**只需在 handler 的 gin.H literal 里把缺失字段逐项写出**即可一行修复,不必重构 snapshot 端或加 spread helper。这样修改面最小、影响面最小,其它调用 snapshot 的代码不受牵连。修复后用 dummy key + 真实 endpoint 触发一次 `recordError` 即可在 3 秒内观察到 `quarantined_key_count=5`。
+- `passes=true` + 非空 `notes` 会让 `ralph.py:story_ready_to_commit()` 沉默跳过自动 commit。修"重试"类 story 必须三步走:`passes=true` + `notes=""` + `retryCount=0`,否则 ralph 自动 commit 会被沉默跳过,导致 commit 链路断裂。
+- 自适应 worker cap (HA-003) 状态机设计: 3 个 tier (stable=5 / degraded=3 / critical=1),`windowDuration=60s` + `recoveryGrace=90s` 故意让 grace > 窗口,这样窗口清空后还有 grace 缓冲,避免 spike 簇在窗口边缘震荡;downgrade 立即生效,upgrade 必须 `previous != stable && QuietDuration >= recoveryGrace`。spike bucket 严格只接受 `minimax_rate_limited / minimax_timeout / minimax_before_request_timeout` — `minimax_sensitive_1026/1027 / minimax_decode_error / minimax_auth_error / minimax_config_error` 显式不参与(让 `tracker.Observe` 过滤,不要让 manager 在上层分支判断),保证内容安全/解析问题不被 worker 降并发掩盖。
+- 自适应 worker cap 的"事实"边界: `adaptiveMaxWorkers` 必须把上层 `min(configured_key_count, maxGraphWorkers, userSetWorkers)` 当作硬上限,自己只往下降,绝不越权给用户/运维放大到他们没设的 worker 数;`ProcessPending` 每次 batch 都重算 `effectiveWorkers()`,Manager 缓存 `lastEffectiveWorkers` 给 `Status()` 用,让 `/api/v1/graph/status` 不需要重算。
+- HA-004 failed-source bucket 分类器的"先归一再决策"原则: 不要在 `requeueRecoverableFailedSources` 里散落 if-else 判断每个非可恢复桶,把所有错误归一进一个**稳定 10 类 bucket 词表**(`config_error` / `network_timeout` / `before_request_timeout` / `rate_limited` / `auth_error` / `json_decode_error` / `empty_graph` / `sensitive_input_1026` / `sensitive_output_1027` / `non_retryable_request` + `unclassified`),requeue 路径只对**可恢复桶名**的闭合列表(`recoverableGraphBuckets`, 4 个)逐个调 `RequeueFailedSourcesByBucket`,manager 完全不需要知道每个 token 长什么样。这样后续加新桶(比如 `minimax_internal_error`)只需加分类器 token + 名字,不动 requeue 决策;且 `ClassifyFailedError` 是 substring match,顺序决定优先级,recoverable 桶放前面,non-retryable 放后面,避免重叠 token 误判。
+- 桶计数 `FailedBucketCounts()` 必须返回**全 10 个桶 + unclassified** 的 map 即便 count=0,这样 `/api/v1/graph/status#failed_buckets` 永远稳定暴露所有键,HA guard 端不用做 nil-check;同时 Status 暴露的 buckets 只含 name+count,不含 source payload / prompt / 私聊正文,符合隐私安全。
+- 测试桶分类器时**正反两路都要 lock**: `TestClassifyFailedErrorCoversAllHABuckets` 锁 10 类 positive + 2 类 negative (empty / unknown),`TestAllFailedBucketNamesIsStableAndComplete` 锁 list 顺序,`TestManagerRequeueRecoverableOnlyMovesRecoverableBuckets` 端到端验证 manager 只 requeue 4 类、保留 6 类,只要未来有人改 `recoverableGraphBuckets` 或 token 列表,测试会立刻显红,避免 silent rotation 1026/1027 进 pending。
+- 测试"调用外部服务"的代码:首选 **接口注入 + 函数适配器**(`type ChatInvoker interface { Chat(...) (string, error) }` + `type ChatInvokerFunc func(...) (string, error)`),fake 实现就是 plain Go function,生产路径用 `ChatInvokerFunc(client.Chat)` 一行包装,既不需要 reflect/mock 框架,也不需要在 `*Client` 上加 hook;benchmark 类的代码必须能离线单测,dry-run 默认 `--execute` opt-in 是隐私安全的硬护栏。
+- Benchmark/gate 边界测试模式: 把 gate 阈值(`JSONValidRateGap=0.02` / `NonEmptyGraphRateGap=0.05`)显式命名常量 + 写 4 个边界测试(`PassWhenMeets` / `RejectOnJSONValidRegression` / `RejectOnNonEmptyRegression` / `AtBoundaryAllows` / `SlightlyPastBoundaryRejects`)。任何给小数位后两位的微调都不会让测试假绿/假红,review 时只看 const 定义就能对上线门禁有"绝对值"的感觉。
+- Fixture 隐私 + 覆盖的硬护栏模式: 任何 "测试 fixture" 必须 (1) 用 const 显式 allow-list 7 类分类(短句/省略语/时间/多人/业务/关系/空) + `TestXxxCoversAllRequiredCategories` 锁"7 类都覆盖",(2) `TestXxxHasNoRealChatContent` 用反例 `wxid_` / `13800` grep 锁住"不能塞真实聊天",(3) `TestXxxHasVariedShape` 锁"每类至少 1 个 fixture"。这样 review 想删一类 / 塞私货都会立刻显红,privacy 是测试 invariant 不是文档声明。
+- HA guard productize 的 "dry-run 不真做 + 实时 SUMMARY 一行化" 模式: 把所有 mutating helper (`restore_semantic_config` / `restart_service` / `ensure_graph_config` / `resume_graph_if_needed`) 改成只 `plan_action "<name> <key=val...>"` 收口到一个 `PLANNED_ACTIONS[]` 数组,`run_or_print` 仍然能切换真/假执行;末尾 `emit_summary_block` 把 `GUARD_HEALTH / SEMANTIC_PROVIDER / MMX_CONFIGURED / GRAPH_WORKERS / GRAPH_PENDING / GRAPH_FAILED / action_taken / planned_count` 用 key=value 拼成一行;`--loop 60` 直接复用 `check_once` + 末尾加 SUMMARY tick 行。这样 AC#1 (完整 dry-run 摘要) 和 AC#4 (loop 每轮时间戳+状态+动作) 一次性满足,且 AC#2 (服务健康时 planned_count=0 → 真正幂等) 只需要保证 helper 的 plan_action 调用前置判断准。
+- 进程级健康检查 (`check_service_process` 模式): guard 不止看 HTTP `/health`,还要用 `lsof -nP -iTCP:5030 -sTCP:LISTEN -t` 拿 listener PID,`ps -p PID -ww -o command=` 取完整 cmdline,`ps eww -p PID` 取 env blob,这样才能判 (a) 是否 `serve --config-dir <dir>`、(b) `MINIMAX_API_KEYS` 数量。AC#3 的"进程不是规范启动" 必须用 `lsof` + `ps` 走真实 OS 层,不能只靠 HTTP status;HTTP 全 ok 但 cmdline 漂移是 2026-06-07 实际 production 遇到的故障模式,guard 应当捕获并 respawn。
+- macOS `mv` 在 immutable flag 文件上会报 `set owner/group` 警告但写入成功;用 `jq > tmp && mv tmp target` 三步走也是同样警告。验证时只 check `jq` 输出,不要被警告吓到。
+- `notes` 非空 → ralph.py 沉默跳过自动 commit。修复类 story 的 "三步收口" 标准操作: `passes=true` + `notes=""` + `retryCount=0`。
+- HA-007 E2E 收口:5 个 AC 拆到 status 字段级别,每个对应 1 个 HTTP 端点 + 1 个可重复的取值/动作;recoverable/non-recoverable 共存性用 "一次 resume 同时验证 pending/processed 动 + sensitive_1026/1027 不动" 一击两证;binary 字段缺失时用 `sqlite3 -readonly` 按 HA-004 桶分类正则派生等价证据(SQLite 永远是 ground truth,比 HTTP 字段更鲁棒);长窗口用 `nohup /tmp/ha007_sample.sh &` + pidfile 等退出模式(父 shell `while [ -f pidfile]; do sleep 5; done`),不阻塞主流程。
+
+## [2026-06-06 11:38] - [US-001]
+- 实现了什么
+  - 完成了 `US-001` 基线快照与失败桶查询（运行时只读，不打印聊天内容）。
+- 更改的文件
+  - `scripts/ralph/prd.json`（将 `US-001` 的 `passes` 置为 `true`）。
+- 运行的验证命令与结果
+  - `curl -sS --max-time 8 'http://127.0.0.1:5030/api/v1/graph/status?format=json' | jq ...`
+    - PASS: 返回 `running=false,pending=0,processing=0,processed=5610,failed=11764,source_count=17374,workers=1,enqueue_workers=1,last_error=null`（`format=json`）。
+  - `curl -sS --max-time 8 'http://127.0.0.1:5030/api/v1/graph/config?format=json' | jq '.'`
+    - PASS: `enqueue_workers=1, workers=1`（基线值）。
+  - `sqlite3 -readonly /Volumes/HDD/chatlog/wxid_qonry7vlh3vt22_d68e/.chatlog_graph/temporal_graph.db`
+    - PASS: 已执行只读 SQL 聚合失败桶（按 error 前缀）：
+      - `chat model is not configured: 11686`
+      - `minimax chat failed: 58`
+      - `decode graph extraction failed: 12`
+      - `minimax chat failed with key=***xNMs: 3`
+      - `minimax chat failed with key=***o_dw: 2`
+      - `minimax chat failed before request: 1`
+      - `minimax chat failed with key=***GsGM: 1`
+      - `minimax chat failed with key=***WXS4: 1`
+  - `go test ./internal/chatlog/temporalgraph`
+    - PASS: `ok github.com/sjzar/chatlog/internal/chatlog/temporalgraph`.
+  - `./init.sh`
+    - PASS: quick gate 全通过（root harness 80/80，skill harness 29/29，report daily help，HTTP list）。
+- 未验证项与原因
+  - 本 story 只做了基线采集，不包含恢复命令或并发重配置变更，未触发处理行为。
+- **未来迭代的学习：**
+  - 可复用 patterns
+    - Runtime-only story 也要在同一迭代内保留 `format=json` 路径，以避免私有内容误输出。
+    - `sqlite3` 访问 `graph_source_records` 时可直接按 `status='failed'` + `error` 归一前缀聚合，作为可复核失败分布指标。
+  - 遇到的陷阱
+    - `pragma_database_list` 在部分环境返回数据库文件名与目录拼接方式异常，建议直接使用已知工作目录中的 `.chatlog_graph/temporal_graph.db`。
+  - 有用的上下文
+    - 当前 baseline 显示 `running=false` 且 `workers=1`，并有大量 `chat model is not configured` 失败，说明该 story 的恢复动作必须在后续 story 中执行。
+---
+
+# Run: ralph/graph-knowledge-digest (started 2026-06-10)
+## [2026-06-11 00:00] - [US-001]
+- 实现了什么
+  - 完成 `US-001` temporalgraph manager 提供 Digest 只读聚合。新增 `DigestResult`, `DigestEntity`, `DigestOptions`, `DigestEventItem` 结构体与 `Manager.Digest()` 公开方法。
+  - Digest 按时间窗口聚合：扫描窗口内 graph_events，从 actors_json/targets_json 统计实体出现次数，取 top20 实体（按计数排序），收集事件时间线(时间+标题, 上限50)，查询 facts/relations/source 计数，超过 2000 事件上限时标记 truncated。
+  - 纯只读查询，无模型调用，不修改队列状态。
+- 更改的文件
+  - `internal/chatlog/temporalgraph/digest.go` (新增，204 行)
+  - `internal/chatlog/temporalgraph/digest_test.go` (新增单元测试，4 个用例，185 行)
+  - `scripts/ralph/prd.json` (US-001.passes = true)
+- 运行的验证命令与结果
+  - `go test ./internal/chatlog/temporalgraph -run "TestDigest" -v`
+    - PASS: TestDigestNormalWindow, TestDigestEmptyWindow, TestDigestTruncation, TestDigestStoreError 全通过。
+  - `go test ./internal/chatlog/temporalgraph -v`
+    - PASS: 全部 ~80+ 测试通过，无回归。
+  - `go build ./...`
+    - PASS: 编译通过。
+  - `./init.sh`
+    - PASS: quick gate 全通过（root harness 80/80, skill harness 29/29, daily report help, HTTP list）。
+- 未验证项与原因
+  - 真实 runtime digest 调用（依赖 US-003 HTTP endpoint 与 US-006 服务验证）。
+- **未来迭代的学习：**
+  - 可复用 patterns
+    - Digest 先查 LIMIT (MaxEventsScan + 1) 来检测是否有更多行，比查 LIMIT MaxEventsScan + 额外查询更高效。
+    - Event 表的 summary 字段是 NOT NULL，插入测试数据时需要提供。
+  - 遇到的陷阱
+    - graph_relations 的 valid_from 也是 NOT NULL，构造测试数据时需要仔细。
+  - 有用的上下文
+    - DigestResult 的 TopEntities 由 entity count > 0 的实体组成，按计数降序排列、同计数时按名称升序排列。
+    - 时间窗口查询用 BETWEEN startTS AND endTS，边界包含。
+---
+
+## [2026-06-11 00:15] - [US-002]
+- 实现了什么
+  - 完成 `US-002` Digest 渲染为 Obsidian 友好 Markdown。新增纯函数 `RenderDigestMarkdown(result DigestResult) string` 与辅助函数 `summaryOneLiner(result DigestResult) string`。
+  - 输出 YAML frontmatter（date, window_start, window_end, source, tags）+ H1 标题 + 7 个 H2 章节（固定顺序）：一句话结论、核心主题、关键实体、事件时间线、新增事实与关系、可复用沉淀、后续跟进。
+  - summary 未启用时：一句话结论为基于计数的模板句，核心主题/可复用沉淀/后续跟进 标注 (需开启 summary 生成)。
+  - 无 daily report 依赖。
+- 更改的文件
+  - `internal/chatlog/temporalgraph/digest_markdown.go` (新增，纯渲染函数，80 行)
+  - `internal/chatlog/temporalgraph/digest_markdown_test.go` (新增单元测试，130 行)
+  - `scripts/ralph/prd.json` (US-002.passes = true)
+- 运行的验证命令与结果
+  - `go test ./internal/chatlog/temporalgraph -run "TestRenderDigest" -v`
+    - PASS: TestRenderDigestMarkdownFrontmatter, TestRenderDigestMarkdownSectionCount, TestRenderDigestMarkdownEmptyResult, TestRenderDigestMarkdownEntityRendering, TestRenderDigestMarkdownEventTimeline 全通过。
+  - `go build ./...`
+    - PASS: 编译通过。
+  - `go test ./internal/chatlog/temporalgraph`
+    - PASS: 全部测试通过，无回归。
+  - `./init.sh`
+    - PASS: quick gate 全通过。
+- 未验证项与原因
+  - 真实 HTTP endpoint 响应与文件写入（依赖 US-003）。
+  - summary=true 模式的章节内容（依赖 US-004）。
+- **未来迭代的学习：**
+  - 可复用 patterns
+    - Markdown 渲染函数保持纯函数形态，不依赖外部状态或 I/O。
+    - YAML frontmatter 用 time.RFC3339 格式保证 ISO 8601 兼容性。
+    - H2 章节计数可通过 strings.Count(markdown, "\n## ") 验证（需要 \n 前缀避免标题本身含 ##）。
+  - 有用的上下文
+    - DigestEntity 的 Count 字段是整数，Name 是实体名称。
+    - EventTimeline 按插入顺序，time.Unix(eventTime, 0) 转换为可读格式。
+    - 空 DigestResult 也应渲染全部 7 个章节，不跳过任何结构。
+---
+
+## [2026-06-11 00:30] - [US-003]
+- 实现了什么
+  - 完成 `US-003` HTTP 端点 POST /api/v1/graph/digest。新增 `handleGraphDigest` handler 在 internal/chatlog/http/graph.go；在 route.go 注册了 POST /api/v1/graph/digest 路由。
+  - 参数支持：days（默认 7）或显式 start/end、format=json、summary（预留给 US-004）。
+  - 输出路径：CWD 的 reports/ 目录（有意分叉不复用 resolveDailyReportOutputDir 的 workDir 沙箱），文件名 graph-digest-<YYYY-MM-DD>_<YYYY-MM-DD>.md。
+  - format=json 返回元数据：path、size_bytes、window_start、window_end、entity_count、event_count、fact_count、relation_count、summary_used。响应不含任何聊天衍生文本或摘要正文。
+  - 错误处理：days<=0 或 start>end 返回 HTTP 400；写入失败返回 HTTP 500；幂等覆盖同名文件。
+- 更改的文件
+  - `internal/chatlog/http/graph.go` (新增 handleGraphDigest 方法，~80 行)
+  - `internal/chatlog/http/route.go` (注册 POST /api/v1/graph/digest 路由)
+- 运行的验证命令与结果
+  - `go build ./...`
+    - PASS: 编译通过。
+  - `./init.sh`
+    - PASS: quick gate 全通过。
+- 未验证项与原因
+  - 本地服务 runtime 验证（curl 调用、文件生成、幂等覆盖检查）— 依赖 US-006 做端到端验证。
+  - 报告不进 git 的验证 — 留给 US-006 (git status 检查)。
+- **未来迭代的学习：**
+  - 可复用 patterns
+    - HTTP handler 的 format=json 模式：当响应需要只返回结构化元数据而不含私密内容时，用 gin.H 逐项写出字段，而不是 marshal 整个对象再脱敏。
+    - 文件输出路径：分叉于既有 daily report 的沙箱逻辑，直接用 os.Getwd() + "reports"，handler 代码里用注释说明分叉原因。
+  - 有用的上下文
+    - reports 目录预计是符号链接指向 Obsidian vault 的某个目录，不在 git 的 .gitignore 中（符号链接本身是 untracked）。
+    - 文件名格式 graph-digest-<start>_<end>.md 幂等覆盖，同窗口多次调用只产生一个文件。
+---
+
+## [2026-06-11 00:45] - [US-004]
+- 实现了什么
+  - 完成 `US-004` 可选模型综述 summary=true。在 temporalgraph 包中复用既有 ChatInvoker 接口（来自 benchmark.go），修改 DigestOptions 添加 EnableSummary/ChatInvoker 字段，修改 DigestResult 添加 SummaryContent/SummaryError/SummaryUsed 字段。
+  - 新增 digestGenerateSummary(invoker ChatInvoker, cfg conf.SemanticConfig, result DigestResult) 函数，构造角色中立的 prompt（只含实体名/计数、事件数、关系数，无发送者ID、无敏感信息），调用 Chat provider，30s 超时。
+  - 新增 errorBucketForSummary(err error) 错误分类函数，只返回错误类别字符串（chat_provider_not_configured / chat_timeout / chat_auth_error / chat_rate_limit / chat_error），不含细节。
+  - Chat provider 失败时优雅降级：digest 仍成功，summary_used=false，summary_error 含类别。
+  - HTTP handler 只做参数透传，不在 http 包新建测试基建。
+- 更改的文件
+  - `internal/chatlog/temporalgraph/digest.go` (修改 Digest 方法支持 summary，新增 digestGenerateSummary/errorBucketForSummary 函数)
+  - `internal/chatlog/temporalgraph/digest_test.go` (新增 4 个单元测试 + MockConfig/MockChatInvoker 辅助)
+  - `internal/chatlog/temporalgraph/types.go` (已有 ChatInvoker 接口，无需添加)
+  - `scripts/ralph/prd.json` (US-004.passes = true)
+- 运行的验证命令与结果
+  - `go test ./internal/chatlog/temporalgraph -run "TestDigestSummary|TestErrorBucket" -v`
+    - PASS: 4 个新测试全通过（disabled无调用、enabled成功调用、enabled错误降级、error分类）。
+  - `go test ./internal/chatlog/temporalgraph`
+    - PASS: 全部 ~80+ 测试通过，无回归。
+  - `go build ./...`
+    - PASS: 编译通过。
+  - `./init.sh`
+    - PASS: quick gate 全通过。
+- 未验证项与原因
+  - HTTP handler 集成（依赖 US-003 已实现，summary 参数在 handler 中预留）。
+  - 真实 Chat provider 调用（验收指定 mock provider 单测）。
+- **未来迭代的学习：**
+  - 可复用 patterns
+    - ChatInvoker 接口既有，包含 cfg 参数，适用于所有需要配置感知的 Chat 调用。
+    - 错误分类函数通过 substring match，返回 enum-like 错误类别而非细节，符合隐私安全边界。
+    - 30s timeout 用 context.WithTimeout 包装，避免无限等待。
+  - 有用的上下文
+    - DigestResult.SummaryUsed 标记是否成功调用了 Chat provider 并得到结果。
+    - 角色中立 prompt 不含发送者 ID/内容、职业身份，只含时间、实体名/计数、事件/事实/关系数。
+    - 优雅降级保证 digest 完整性：即使 summary 失败也返回聚合数据和错误类别。
+---
+
+## 2026-06-11 - US-005
+- 实现了 `chatlog report graph` CLI 子命令 (cmd/chatlog/cmd_report.go)
+  - 新增 `reportGraphCmd`、`runReportGraph`、`runReportGraphHTTP` 函数
+  - flags: --days(默认7)、--summary(默认false)、--base-url(默认http://127.0.0.1:5030)
+  - 命令通过 POST /api/v1/graph/digest?format=json 工作，不直接打开图谱 SQLite
+  - 服务未运行时打印含端点地址和 `chatlog serve` 提示的错误，exit code 非 0
+  - 成功时只打印元数据（path/window/counts/summary_used），不打印摘要正文
+  - 顺带修复 HTTP handler：真正透传 summary=true 参数到 DigestOptions.EnableSummary
+  - 顺带修复 digest.go：opts.ChatInvoker==nil 时 fallback 到 m.client（Manager 内置的 semantic.Client）
+- 新增 docs/graph-digest.md（命令用法、参数说明、幂等覆盖策略、quota/隐私边界）
+- 更改的文件：
+  - cmd/chatlog/cmd_report.go（新增 reportGraphCmd + 两个函数）
+  - internal/chatlog/http/graph.go（summary 参数透传 + summary_used 用 result 字段）
+  - internal/chatlog/temporalgraph/digest.go（ChatInvoker fallback 到 m.client）
+  - docs/graph-digest.md（新建）
+- 运行的验证命令：
+  - `go build ./...` → 通过
+  - `go test ./internal/chatlog/temporalgraph ./internal/chatlog/semantic ./internal/chatlog/dailyreport` → 全通过
+  - `go run . report graph --help` → 含 --days、--summary、--base-url 三个 flag 及默认值
+  - `go run . report graph --base-url http://127.0.0.1:19999` → 打印含端点和 chatlog serve 提示的错误，exit 1
+  - `node scripts/check-root-harness.mjs` → 80/80 PASS
+- 未验证项：US-006 真实服务闭环（依赖本地 127.0.0.1:5030 运行中）
+- **未来迭代的学习：**
+  - Manager.client (*semantic.Client) 实现 ChatInvoker 接口，HTTP handler 无需自带 invoker，让 Manager 内部 fallback 即可
+  - CLI 的 `os.Exit(1)` 在 `runReportGraph` 中调用，不要在 helper 函数里调用（避免 defer 未执行）
+---
+
+## [2026-06-11 21:25] - [US-006]
+- 实现了什么
+  - 完成 `US-006` 真实闭环: 命令到本地文件全链路验证。在 127.0.0.1:5030 运行的服务上执行 `go run . report graph --days 7`,exit code 0,文件 `reports/graph-digest-2026-06-04_2026-06-11.md` 落地(3971 字节,mtime 当次执行),H2 计数 7,frontmatter 含 window_start/window_end;同窗口重复执行被幂等覆盖;执行前后 `failed=267` 严格不变,pending/processing 队列不动;git status 中不出现 `graph-digest-*.md` 条目。
+- 更改的文件
+  - `scripts/ralph/prd.json` (US-006.passes = true, notes = "", retryCount = 0)
+  - `scripts/ralph/progress.txt` (本段)
+- 运行的验证命令与结果
+  - 准备: 由于本地 `chatlog-alpha` tmux 服务未运行,先 `tmux new-session -d -s chatlog-alpha` 并 `eval $(zsh -lc "echo export MINIMAX_API_KEYS=\$(echo \$MINIMAX_API_KEYS)")` 注入 5 个 MiniMax key(数字已脱敏),然后 `./bin/chatlog serve --config-dir .cache/daily-report-config` 启动;`lsof -nP -iTCP:5030 -sTCP:LISTEN` 看到 pid 44673,`curl /health` 返回 `{"status":"ok"}`。
+  - AC#1 (前置): `curl -sS http://127.0.0.1:5030/api/v1/graph/status?format=json` 返回 200;记录执行前 `running=false, workers=3, source_count=21690, processed=21423, pending=0, processing=0, failed=267, last_error=null`;semantic config `chat_provider=mmx, chat_model=MiniMax-M2.7, has_api_key=true`;pid env key count = 5 (经 `ps eww` 校验,值未打印)。
+  - AC#2 (CLI exit): `go run . report graph --days 7` → exit 0,stdout:
+    ```
+    path: /Volumes/WorkSSD/Dev/chatlog_alpha/reports/graph-digest-2026-06-04_2026-06-11.md
+    window_start: 2026-06-04T21:23:16+08:00
+    window_end: 2026-06-11T21:23:16+08:00
+    entity_count: 20
+    event_count: 50
+    fact_count: 3248
+    relation_count: 3515
+    summary_used: false
+    ```
+  - AC#3 (文件落盘): `ls -la` → `-rw-------  1 mingtian staff 3971  6月 11 21:23 ...graph-digest-2026-06-04_2026-06-11.md`,`stat -f "%Sm"` → `Jun 11 21:23:19 2026`(当次执行 mtime),size > 0,绝对路径在 CWD `reports/`(默认即 repo 的 symlink,目标为 Obsidian vault raw 目录)。
+  - AC#4 (结构): `grep -c '^## '` → 7;`head -8` 显示 frontmatter 含 `window_start` / `window_end`(`date` / `source` / `tags` 也齐全)。
+  - AC#5 (count 范围): 四个 count 全部非负;`relation_count=3515 < processed=21423`,`entity_count=20` 命中 top-20 上限,`event_count=50` 命中时间线 50 上限,均在 `/api/v1/graph/status` 报告的 `source_count=21690` 总量级内。
+  - AC#6 (不入 git): `git status --porcelain | grep graph-digest` → 0 命中;`?? reports` 是启动前已有的 symlink 行(指向 `/Volumes/WorkSSD/Dev/openclaw_mz/knowledge/raw/微信每日聊天记录`),非本 story 产物,绝不被提交。
+  - AC#7 (幂等覆盖): 等待 2 秒后 `go run . report graph --days 7` → exit 0,同名文件 mtime 从 1781184199 → 1781184245(已更新),无报错;响应字段完全相同(同窗口确定性聚合)。
+  - AC#8 (队列不动): 执行后 `curl /api/v1/graph/status?format=json` → `running=false, workers=3, source_count=21690, processed=21423, pending=0, processing=0, failed=267, last_error=null`;`failed` 严格 == 267,等于执行前基线;`sqlite3 -readonly` 直接读 `graph_source_records` GROUP BY status 验证 `done=21423, failed=267`,与 API 一致。Digest 是只读聚合,未触发任何 pending/processed 推进。
+  - AC#9 (typecheck): `go build ./...` → exit 0,无新代码改动,但符合"广泛改动提交前 typecheck"要求。
+- 未验证项与原因
+  - `summary=true` 真实模型调用未做;US-006 acceptance 不要求,且 US-004 已用 mock provider 单测覆盖。
+  - 服务是从 cold start 起的(原 `chatlog-alpha` tmux session 不存在);若已有 14xxx 队列在跑,需要重看进度;此处 pre-digest `processed=21423, failed=267` 与 session-handoff 末态(`processed=17050, failed=175`)之间是 6-09 → 6-11 期间 natural background reprocess 的产物,不是本 story 引入的。
+- **未来迭代的学习:**
+  - 可复用 patterns
+    - Cold start 顺序: `tmux new-session -d -s chatlog-alpha` → `eval $(zsh -lc "...")` 注入 env → 异步起 `./bin/chatlog serve --config-dir ...`;`lsof -nP -iTCP:5030 -sTCP:LISTEN` 是 5030 就绪的 ground truth,`curl /health` 是次级证据。
+    - Digest 端到端验收的 4 件套命令(必须按顺序): `curl /api/v1/graph/status` 取基线 → `go run . report graph --days 7` → `stat` + `grep -c '^## '` + `head -8` 文件结构 → `git status --porcelain | grep graph-digest` 验证不入库。
+    - SQLite 直接 read-only 校验 `failed/done` 是比 HTTP `/graph/status` 更鲁棒的 ground truth(US-006 双重验证以防 HTTP 字段缺漏)。
+  - 遇到的陷阱
+    - tmux `send-keys` 在 env injection 阶段的回车换行处理容易丢键,推荐用 `eval $(...)` 一次性注入,而不是分两段 `export X= ; export Y=`。
+    - `?? reports` 这行是 symlink 状态(目标在仓库外),不是新文件,不能误读为 digest 落盘污染;真正要 grep 的是 `graph-digest-`。
+  - 有用的上下文
+    - 当前 live truth: source_count=21690, processed=21423, failed=267, 5 MiniMax keys 注入 pid 44673,语义配置 mmx/MiniMax-M2.7/has_api_key=true。
+    - 整个 graph-knowledge-digest PRD (US-001..US-006) 6 个 story 全部 `passes=true`, 下一个可执行项 = (无,本 PRD 已 complete)。

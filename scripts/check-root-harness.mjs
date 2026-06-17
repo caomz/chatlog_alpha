@@ -11,6 +11,18 @@ await fileExists('feature_list.json');
 await fileExists('progress.md');
 await fileExists('session-handoff.md');
 await fileExists('init.sh');
+await fileExists('.agents/commands/prime.md');
+await fileExists('.agents/skills/prime/SKILL.md');
+await fileExists('.agents/skills/plan-feature/SKILL.md');
+await fileExists('.agents/skills/create-rules/SKILL.md');
+await fileExists('.agents/skills/ralph/SKILL.md');
+await fileExists('.claude/commands/prime.md');
+await fileExists('.claude/skills/ralph/SKILL.md');
+await fileExists('scripts/ralph/ralph.py');
+await fileExists('scripts/ralph/CLAUDE.md');
+await fileExists('scripts/ralph/VALIDATOR.md');
+await fileExists('scripts/ralph/prd.json');
+await fileExists('scripts/ralph/progress.txt');
 
 const agents = await readText('AGENTS.md');
 const claude = await readText('CLAUDE.md');
@@ -18,6 +30,11 @@ const progress = await readText('progress.md');
 const handoff = await readText('session-handoff.md');
 const init = await readText('init.sh');
 const featureListText = await readText('feature_list.json');
+const ralphDeveloper = await readText('scripts/ralph/CLAUDE.md');
+const ralphValidator = await readText('scripts/ralph/VALIDATOR.md');
+const ralphRunner = await readText('scripts/ralph/ralph.py');
+const ralphPrdText = await readText('scripts/ralph/prd.json');
+const ralphProgress = await readText('scripts/ralph/progress.txt');
 
 checkIncludes(agents, 'Startup Workflow', 'AGENTS.md documents startup workflow');
 checkIncludes(agents, 'Definition of Done', 'AGENTS.md documents Definition of Done');
@@ -26,6 +43,8 @@ checkIncludes(agents, 'feature_list.json', 'AGENTS.md routes state artifacts');
 checkIncludes(agents, 'One feature at a time', 'AGENTS.md enforces one active feature');
 checkIncludes(agents, 'Stay in scope', 'AGENTS.md documents scope boundary');
 checkIncludes(agents, 'End of Session', 'AGENTS.md documents end-of-session routine');
+checkIncludes(agents, 'Ralph / PRD Automation', 'AGENTS.md documents Ralph automation');
+checkIncludes(agents, 'Developer agents must not commit directly', 'AGENTS.md keeps commits behind Ralph validator');
 checkIncludes(claude, '@AGENTS.md', 'CLAUDE.md imports AGENTS.md');
 checkIncludes(progress, 'Verification Evidence', 'progress.md records verification evidence');
 checkIncludes(progress, 'Recommended Next Step', 'progress.md has restart marker');
@@ -41,6 +60,19 @@ checkNotIncludesDefaultRun(init, '--vision', 'init.sh does not run --vision as a
 checkNotIncludesDefaultRun(init, '--summary', 'init.sh does not run --summary as a command');
 await executable('init.sh');
 checkFeatureList(featureListText);
+checkRalphPrd(ralphPrdText);
+checkIncludes(ralphDeveloper, 'skills/chatlog-http-cli/SKILL.md', 'Ralph developer reads repo harness skill');
+checkIncludes(ralphDeveloper, '不要执行 `git commit`', 'Ralph developer does not commit directly');
+checkIncludes(ralphDeveloper, './init.sh', 'Ralph developer uses init quick gate');
+checkIncludes(ralphDeveloper, 'chatlog report daily --vision', 'Ralph developer documents vision quota boundary');
+checkIncludes(ralphValidator, 'skills/chatlog-http-cli/SKILL.md', 'Ralph validator reads repo harness skill');
+checkIncludes(ralphValidator, './init.sh', 'Ralph validator uses init quick gate');
+checkIncludes(ralphValidator, '不要执行 `git commit`', 'Ralph validator does not commit');
+checkIncludes(ralphRunner, 'FORBIDDEN_COMMIT_PREFIXES', 'Ralph runner has forbidden commit prefixes');
+checkIncludes(ralphRunner, 'story_ready_to_commit', 'Ralph runner commits only after story readiness check');
+checkIncludes(ralphRunner, 'CHECK_ONLY', 'Ralph runner has installation check mode');
+checkIncludes(ralphProgress, 'Codebase Patterns', 'Ralph progress has Codebase Patterns');
+checkIncludes(ralphProgress, 'chatlog_alpha', 'Ralph progress is adapted to chatlog_alpha');
 
 const failed = checks.filter((check) => !check.pass);
 for (const check of checks) {
@@ -130,6 +162,31 @@ function checkFeatureList(text) {
   }
 }
 
+function checkRalphPrd(text) {
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+    checks.push(pass('scripts/ralph/prd.json parses as JSON'));
+  } catch (error) {
+    checks.push(fail(`scripts/ralph/prd.json parses as JSON (${error.message})`));
+    return;
+  }
+
+  checks.push(typeof parsed.project === 'string' && parsed.project.length > 0
+    ? pass('scripts/ralph/prd.json has project')
+    : fail('scripts/ralph/prd.json has project'));
+  checks.push(typeof parsed.branchName === 'string' && parsed.branchName.startsWith('ralph/')
+    ? pass('scripts/ralph/prd.json has ralph branchName')
+    : fail('scripts/ralph/prd.json has ralph branchName'));
+  const stories = Array.isArray(parsed.userStories) ? parsed.userStories : [];
+  checks.push(stories.length > 0 ? pass('scripts/ralph/prd.json has userStories') : fail('scripts/ralph/prd.json has userStories'));
+  for (const field of ['id', 'title', 'description', 'acceptanceCriteria', 'priority', 'passes', 'notes', 'retryCount', 'blocked']) {
+    checks.push(stories.every((story) => Object.hasOwn(story, field))
+      ? pass(`all Ralph stories include ${field}`)
+      : fail(`all Ralph stories include ${field}`));
+  }
+}
+
 function pass(message) {
   return { pass: true, message };
 }
@@ -137,4 +194,3 @@ function pass(message) {
 function fail(message) {
   return { pass: false, message };
 }
-

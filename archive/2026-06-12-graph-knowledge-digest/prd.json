@@ -1,0 +1,128 @@
+{
+  "project": "chatlog_alpha",
+  "branchName": "ralph/graph-knowledge-digest",
+  "description": "Temporal Graph 个人知识沉淀摘要 (Graph Knowledge Digest): 按时间窗口聚合图谱中的实体/事件/事实，生成 Obsidian 友好的 Markdown 摘要到 reports/，默认零模型调用，summary 显式开启。产出物本地可看，永不提交。摘要内容保持角色中立，不内置任何职业身份 prompt。来源 PRD: tasks/prd-graph-knowledge-digest.md",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "temporalgraph manager 提供 Digest 只读聚合",
+      "description": "作为开发者，我需要 temporal graph manager 提供按时间窗口聚合的 Digest 方法，以便上层 HTTP/CLI 拿到结构化摘要数据而不是各自拼查询。",
+      "acceptanceCriteria": [
+        "internal/chatlog/temporalgraph 新增 manager 公开方法 Digest(start, end time.Time, opts DigestOptions) (DigestResult, error)，命名风格与包内现有方法一致",
+        "DigestResult 至少包含: 时间窗口 start/end、top 实体列表(名称+窗口内出现次数，默认上限 20)、窗口内事件时间线条目(时间+标题，默认上限 50)、facts 计数、relations 计数、涉及 source 计数",
+        "top 实体的窗口内出现次数通过解析窗口内 graph_events 的 actors_json/targets_json 在 Go 侧统计，内部事件扫描上限默认 2000 并在 DigestResult 暴露 truncated 标记；不修改 ApplyExtraction、不依赖 graph_evidence(该表无 entity 行，已核实 store.go:568/575/582 只写 relation/event/fact)",
+        "Digest 只调用 store 的只读查询，不调用任何 Chat provider，不修改队列状态: 测试中调用 Digest 前后 store 的 pending/failed 计数完全一致",
+        "窗口内无数据时返回零值 DigestResult 且 error 为 nil，不 panic；store 查询出错时返回非 nil error 而非部分结果(单测可用已关闭的 store 触发)",
+        "go test ./internal/chatlog/temporalgraph 新增并通过四个用例: 正常窗口返回数据且实体计数与合成事件中的出现次数一致、空窗口返回零值、超出上限时 top 实体和时间线被截断到 limit、store 错误上抛",
+        "go build ./... 通过 (typecheck)"
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": "",
+      "retryCount": 0,
+      "blocked": false
+    },
+    {
+      "id": "US-002",
+      "title": "Digest 渲染为 Obsidian 友好 Markdown",
+      "description": "作为知识管理用户，我想让 DigestResult 渲染成带 frontmatter 和固定章节的 Markdown 文本，以便文件直接放进 Obsidian vault 无需二次整理。",
+      "acceptanceCriteria": [
+        "internal/chatlog/temporalgraph 新增渲染函数(纯函数，输入 DigestResult 输出 Markdown string)，不引入 internal/chatlog/dailyreport 依赖",
+        "输出头部为 YAML frontmatter，含字段: date、window_start、window_end、source: chatlog temporal graph、tags: [chatlog, graph-digest]",
+        "输出含 1 个 H1 标题(含窗口日期)和按固定顺序的 7 个 H2 章节: 一句话结论、核心主题、关键实体、事件时间线、新增事实与关系、可复用沉淀、后续跟进",
+        "summary 未启用时: 一句话结论为基于计数的模板句，核心主题/可复用沉淀/后续跟进三个章节存在且内容标注 (需开启 summary 生成)，关键实体/事件时间线/新增事实与关系由聚合数据填充",
+        "渲染单测使用合成数据(不依赖真实聊天数据)断言: frontmatter 字段齐全、H2 章节数恰好为 7 且顺序正确、空 DigestResult 也能渲染出全部章节",
+        "go test ./internal/chatlog/temporalgraph 通过",
+        "go build ./... 通过 (typecheck)"
+      ],
+      "priority": 2,
+      "passes": true,
+      "notes": "",
+      "retryCount": 0,
+      "blocked": false
+    },
+    {
+      "id": "US-003",
+      "title": "HTTP 端点 POST /api/v1/graph/digest 生成摘要文件",
+      "description": "作为用户，我想通过本地常驻 HTTP 服务一次调用生成摘要文件，以便在 serve 进程持有图谱 SQLite 的情况下随时产出。",
+      "acceptanceCriteria": [
+        "internal/chatlog/http/route.go 的 graph 路由组注册 POST /api/v1/graph/digest，handler 放在 internal/chatlog/http/graph.go",
+        "支持参数: days(默认 7)或显式 start/end、format=json、summary(默认 false，本 story 中 summary=true 行为与 false 相同，模型调用由 US-004 实现)",
+        "调用成功后在服务进程工作目录(CWD)下的 reports/ 生成 graph-digest-<YYYY-MM-DD>_<YYYY-MM-DD>.md，文件内容来自 US-002 渲染函数；有意不复用 resolveDailyReportOutputDir 的 workDir 沙箱语义(digest 要落 repo 的 reports symlink 进知识库)，需在 handler 代码注释中说明这一分叉",
+        "format=json 的 200 响应只含元数据字段: path(绝对路径)、size_bytes、window_start、window_end、entity_count、event_count、fact_count、relation_count、summary_used，响应体中不出现任何聊天衍生文本或摘要正文",
+        "days<=0 或 start>end 时返回 HTTP 400 与明确错误信息，且不生成新文件",
+        "目标目录不可写或写入失败时返回 HTTP 500 与错误类别字符串(不含聊天衍生内容)，绝不返回 200: 写入函数单测覆盖(可用只读临时目录触发)",
+        "在本地服务运行状态下执行 curl -s -X POST 'http://127.0.0.1:5030/api/v1/graph/digest?days=7&format=json' 返回 200，响应字段齐全；以响应 path 字段为准 ls -la 显示文件存在、size > 0、修改时间为当次执行",
+        "同窗口重复调用为幂等覆盖(同名文件被覆盖，不报错)，行为在响应或代码注释中明确",
+        "go build ./... 通过 (typecheck)"
+      ],
+      "priority": 3,
+      "passes": true,
+      "notes": "",
+      "retryCount": 0,
+      "blocked": false
+    },
+    {
+      "id": "US-004",
+      "title": "可选模型综述 summary=true (角色中立，失败降级)",
+      "description": "作为用户，我想在显式开启 summary 时让当前 Chat provider 生成一段综述填充 一句话结论/核心主题/可复用沉淀/后续跟进，以便摘要有真正的归纳，而不只是计数模板。",
+      "acceptanceCriteria": [
+        "summary 逻辑与全部 mock 单测位于 internal/chatlog/temporalgraph(Chat provider 以接口注入)，http handler 只做参数透传，不在 http 包新建测试基建",
+        "仅当请求带 summary=true 时才调用 Chat provider，整个 digest 请求最多发起 1 次模型调用: 单测用计数 mock provider 断言 summary=false 时调用次数为 0、summary=true 时为 1",
+        "发送给模型的 payload 复用 internal/chatlog/temporalgraph/helpers.go 既有脱敏路径: 不含 raw talker_id/sender_id，内容截断；prompt 文案保持角色中立(事项归纳/待跟进项)，代码中不出现任何职业身份设定文案",
+        "Chat provider 未配置或调用失败时 digest 仍成功生成(降级为模板内容)，JSON 响应 summary_used=false 且附 summary_error 字段，该字段只含错误类别字符串，不含 prompt 或模型输出内容: 单测用返回 error 的 mock provider 断言此降级路径",
+        "summary 成功时 JSON 响应 summary_used=true，文件中 核心主题/可复用沉淀/后续跟进 章节不再含 (需开启 summary 生成) 占位文案: 单测用返回固定文本的 mock provider 断言",
+        "验收只使用 mock provider 单测，不发起真实模型调用(quota/隐私敏感，真实调用由用户事后自行执行一次并只核对 summary_used 与文件 size)",
+        "go test ./internal/chatlog/temporalgraph 通过",
+        "go build ./... 通过 (typecheck)"
+      ],
+      "priority": 4,
+      "passes": true,
+      "notes": "",
+      "retryCount": 0,
+      "blocked": false
+    },
+    {
+      "id": "US-005",
+      "title": "CLI 子命令 chatlog report graph",
+      "description": "作为用户，我想用一条本地命令生成摘要，以便配合 cron/launchd 做定期沉淀，不必手写 curl。",
+      "acceptanceCriteria": [
+        "cmd/chatlog/cmd_report.go 新增子命令 report graph，flags: --days(默认 7)、--summary(默认 false)、--base-url(默认 http://127.0.0.1:5030)",
+        "命令通过 POST /api/v1/graph/digest 工作，不直接打开图谱 SQLite",
+        "go run . report graph --help 输出包含 --days、--summary、--base-url 三个 flag 及其默认值",
+        "服务未运行时(对一个未监听的 base-url 执行)命令打印含目标端点地址和启动提示(chatlog serve)的明确错误，exit code 非 0",
+        "成功时 stdout 只打印: 文件绝对路径、窗口 start/end、entity/event/fact/relation 各 count、summary_used，不打印摘要正文或聊天衍生文本",
+        "服务端返回 500 时 CLI 打印错误类别并以非零 exit code 退出",
+        "新增 docs/graph-digest.md: 包含命令用法、参数说明、同窗口幂等覆盖策略、quota/隐私边界四节，风格参照 docs/daily-report.md",
+        "node scripts/check-root-harness.mjs 通过",
+        "go build ./... 通过 (typecheck)"
+      ],
+      "priority": 5,
+      "passes": true,
+      "notes": "",
+      "retryCount": 0,
+      "blocked": false
+    },
+    {
+      "id": "US-006",
+      "title": "真实闭环: 命令到本地文件全链路验证",
+      "description": "作为用户，我要确认从 CLI 命令到 reports/ 本地文件的完整链路在真实运行的服务上成立，且产出物不进 git、不干扰图谱处理队列。",
+      "acceptanceCriteria": [
+        "前置: chatlog-alpha 服务在 127.0.0.1:5030 运行中(GET /api/v1/graph/status 返回 200)；记录执行前 status 的 failed 计数",
+        "执行 go run . report graph --days 7，exit code 为 0",
+        "以 stdout 打印的绝对 path 为准: stat 该文件显示修改时间为当次执行且 size > 0，且该路径位于服务进程 CWD 的 reports/ 下(默认部署即 repo 的 reports symlink)",
+        "grep -c '^## ' 该文件返回 7；head -8 显示 frontmatter 含 window_start/window_end(验证只看结构，不输出章节正文)",
+        "stdout 的 entity/event/fact/relation 各 count 非负，且不超过 GET /api/v1/graph/status?format=json 报告的对应总量级",
+        "git status --porcelain 输出中不出现任何 graph-digest-*.md 条目(注意: reports 是指向外部目录的 symlink，?? reports 一行是启动前已有状态，不属于本 story，也绝不能被提交)",
+        "以相同窗口再次执行 go run . report graph --days 7，exit code 0，文件被幂等覆盖且无报错",
+        "执行后 GET /api/v1/graph/status 的 failed 计数不大于执行前记录值，pending 队列处理不受 digest 影响",
+        "go build ./... 通过 (typecheck)"
+      ],
+      "priority": 6,
+      "passes": true,
+      "notes": "",
+      "retryCount": 0,
+      "blocked": false
+    }
+  ]
+}

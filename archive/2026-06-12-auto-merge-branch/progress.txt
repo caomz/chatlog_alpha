@@ -1,0 +1,439 @@
+# Ralph Progress
+
+## Codebase Patterns
+- `chatlog_alpha` is a Go local-tool product for Chatlog CLI/TUI/HTTP, WeChat local database access, semantic search, temporal graph processing, and daily reports.
+- Start every Ralph iteration by reading root `AGENTS.md`, `skills/chatlog-http-cli/SKILL.md`, `feature_list.json`, root `progress.md`, root `session-handoff.md`, `scripts/ralph/prd.json`, and this file.
+- Use `./init.sh` as the default quick gate; use focused `go test ./internal/...` for Go logic; use `./init.sh --full` only for broad repo changes.
+- Do not run `chatlog report daily --vision` or `chatlog report daily --summary` unless the PRD story and user authorization explicitly require model/vision calls.
+- Verify private chat-derived workflows through paths, timestamps, counts, HTTP status, structured fields, or error buckets; do not print private message or report contents.
+- Developer agents do not commit directly. `scripts/ralph/ralph.py` commits only after Validator success and excludes startup-dirty paths plus private/cache output directories.
+- Long runtime windows (>2min) should run via `nohup script.sh &` (or a TaskCreate with `run_in_background`); the parent shell returns immediately, the child keeps sampling. Snapshot to `scripts/ralph/progress.txt` not a new file, and judge PASS/blocked only after the loop finishes, never mid-loop.
+- `prd.json` field is `userStories`, not `stories`. After any PRD edit run `jq '.userStories | length'` to confirm shape.
+- For MiniMax key pool: stable ordinal labels (`key_1`, `key_2`, ...) are preferred over `***xxxx` tail-redaction because operators want to grep for "which key hit the wall". A non-retryable bucket (`minimax_sensitive_1026/1027`, `minimax_decode_error`, ...) must NEVER move a key into pool-level quarantine — only `minimax_auth_error` and the model-retryable buckets the operator has explicitly opted into should. Test the negative case (`TestRecordErrorDoesNotQuarantineOnSensitiveOrRateOrDecode`) so future refactors cannot silently rotate 1026/1027 keys.
+- `chatMMXRaw.recordError` is only called after a successful `Acquire` (i.e. `ensureLocked` already ran), so recordError can rely on `p.slots` being populated. Tests that call `recordError` before any `Acquire` must touch Acquire first to materialize slots.
+- HTTP handler 暴露 snapshot 字段的最佳实践: 当 snapshot 结构已包含目标字段(类型/JSON tag 完备)但 HTTP gin.H 没 spread 时,**只需在 handler 的 gin.H literal 里把缺失字段逐项写出**即可一行修复,不必重构 snapshot 端或加 spread helper。这样修改面最小、影响面最小,其它调用 snapshot 的代码不受牵连。修复后用 dummy key + 真实 endpoint 触发一次 `recordError` 即可在 3 秒内观察到 `quarantined_key_count=5`。
+- `passes=true` + 非空 `notes` 会让 `ralph.py:story_ready_to_commit()` 沉默跳过自动 commit。修"重试"类 story 必须三步走:`passes=true` + `notes=""` + `retryCount=0`,否则 ralph 自动 commit 会被沉默跳过,导致 commit 链路断裂。
+- 自适应 worker cap (HA-003) 状态机设计: 3 个 tier (stable=5 / degraded=3 / critical=1),`windowDuration=60s` + `recoveryGrace=90s` 故意让 grace > 窗口,这样窗口清空后还有 grace 缓冲,避免 spike 簇在窗口边缘震荡;downgrade 立即生效,upgrade 必须 `previous != stable && QuietDuration >= recoveryGrace`。spike bucket 严格只接受 `minimax_rate_limited / minimax_timeout / minimax_before_request_timeout` — `minimax_sensitive_1026/1027 / minimax_decode_error / minimax_auth_error / minimax_config_error` 显式不参与(让 `tracker.Observe` 过滤,不要让 manager 在上层分支判断),保证内容安全/解析问题不被 worker 降并发掩盖。
+- 自适应 worker cap 的"事实"边界: `adaptiveMaxWorkers` 必须把上层 `min(configured_key_count, maxGraphWorkers, userSetWorkers)` 当作硬上限,自己只往下降,绝不越权给用户/运维放大到他们没设的 worker 数;`ProcessPending` 每次 batch 都重算 `effectiveWorkers()`,Manager 缓存 `lastEffectiveWorkers` 给 `Status()` 用,让 `/api/v1/graph/status` 不需要重算。
+- HA-004 failed-source bucket 分类器的"先归一再决策"原则: 不要在 `requeueRecoverableFailedSources` 里散落 if-else 判断每个非可恢复桶,把所有错误归一进一个**稳定 10 类 bucket 词表**(`config_error` / `network_timeout` / `before_request_timeout` / `rate_limited` / `auth_error` / `json_decode_error` / `empty_graph` / `sensitive_input_1026` / `sensitive_output_1027` / `non_retryable_request` + `unclassified`),requeue 路径只对**可恢复桶名**的闭合列表(`recoverableGraphBuckets`, 4 个)逐个调 `RequeueFailedSourcesByBucket`,manager 完全不需要知道每个 token 长什么样。这样后续加新桶(比如 `minimax_internal_error`)只需加分类器 token + 名字,不动 requeue 决策;且 `ClassifyFailedError` 是 substring match,顺序决定优先级,recoverable 桶放前面,non-retryable 放后面,避免重叠 token 误判。
+- 桶计数 `FailedBucketCounts()` 必须返回**全 10 个桶 + unclassified** 的 map 即便 count=0,这样 `/api/v1/graph/status#failed_buckets` 永远稳定暴露所有键,HA guard 端不用做 nil-check;同时 Status 暴露的 buckets 只含 name+count,不含 source payload / prompt / 私聊正文,符合隐私安全。
+- 测试桶分类器时**正反两路都要 lock**: `TestClassifyFailedErrorCoversAllHABuckets` 锁 10 类 positive + 2 类 negative (empty / unknown),`TestAllFailedBucketNamesIsStableAndComplete` 锁 list 顺序,`TestManagerRequeueRecoverableOnlyMovesRecoverableBuckets` 端到端验证 manager 只 requeue 4 类、保留 6 类,只要未来有人改 `recoverableGraphBuckets` 或 token 列表,测试会立刻显红,避免 silent rotation 1026/1027 进 pending。
+- 测试"调用外部服务"的代码:首选 **接口注入 + 函数适配器**(`type ChatInvoker interface { Chat(...) (string, error) }` + `type ChatInvokerFunc func(...) (string, error)`),fake 实现就是 plain Go function,生产路径用 `ChatInvokerFunc(client.Chat)` 一行包装,既不需要 reflect/mock 框架,也不需要在 `*Client` 上加 hook;benchmark 类的代码必须能离线单测,dry-run 默认 `--execute` opt-in 是隐私安全的硬护栏。
+- Benchmark/gate 边界测试模式: 把 gate 阈值(`JSONValidRateGap=0.02` / `NonEmptyGraphRateGap=0.05`)显式命名常量 + 写 4 个边界测试(`PassWhenMeets` / `RejectOnJSONValidRegression` / `RejectOnNonEmptyRegression` / `AtBoundaryAllows` / `SlightlyPastBoundaryRejects`)。任何给小数位后两位的微调都不会让测试假绿/假红,review 时只看 const 定义就能对上线门禁有"绝对值"的感觉。
+- Fixture 隐私 + 覆盖的硬护栏模式: 任何 "测试 fixture" 必须 (1) 用 const 显式 allow-list 7 类分类(短句/省略语/时间/多人/业务/关系/空) + `TestXxxCoversAllRequiredCategories` 锁"7 类都覆盖",(2) `TestXxxHasNoRealChatContent` 用反例 `wxid_` / `13800` grep 锁住"不能塞真实聊天",(3) `TestXxxHasVariedShape` 锁"每类至少 1 个 fixture"。这样 review 想删一类 / 塞私货都会立刻显红,privacy 是测试 invariant 不是文档声明。
+- HA guard productize 的 "dry-run 不真做 + 实时 SUMMARY 一行化" 模式: 把所有 mutating helper (`restore_semantic_config` / `restart_service` / `ensure_graph_config` / `resume_graph_if_needed`) 改成只 `plan_action "<name> <key=val...>"` 收口到一个 `PLANNED_ACTIONS[]` 数组,`run_or_print` 仍然能切换真/假执行;末尾 `emit_summary_block` 把 `GUARD_HEALTH / SEMANTIC_PROVIDER / MMX_CONFIGURED / GRAPH_WORKERS / GRAPH_PENDING / GRAPH_FAILED / action_taken / planned_count` 用 key=value 拼成一行;`--loop 60` 直接复用 `check_once` + 末尾加 SUMMARY tick 行。这样 AC#1 (完整 dry-run 摘要) 和 AC#4 (loop 每轮时间戳+状态+动作) 一次性满足,且 AC#2 (服务健康时 planned_count=0 → 真正幂等) 只需要保证 helper 的 plan_action 调用前置判断准。
+- 进程级健康检查 (`check_service_process` 模式): guard 不止看 HTTP `/health`,还要用 `lsof -nP -iTCP:5030 -sTCP:LISTEN -t` 拿 listener PID,`ps -p PID -ww -o command=` 取完整 cmdline,`ps eww -p PID` 取 env blob,这样才能判 (a) 是否 `serve --config-dir <dir>`、(b) `MINIMAX_API_KEYS` 数量。AC#3 的"进程不是规范启动" 必须用 `lsof` + `ps` 走真实 OS 层,不能只靠 HTTP status;HTTP 全 ok 但 cmdline 漂移是 2026-06-07 实际 production 遇到的故障模式,guard 应当捕获并 respawn。
+- macOS `mv` 在 immutable flag 文件上会报 `set owner/group` 警告但写入成功;用 `jq > tmp && mv tmp target` 三步走也是同样警告。验证时只 check `jq` 输出,不要被警告吓到。
+- `notes` 非空 → ralph.py 沉默跳过自动 commit。修复类 story 的 "三步收口" 标准操作: `passes=true` + `notes=""` + `retryCount=0`。
+- HA-007 E2E 收口:5 个 AC 拆到 status 字段级别,每个对应 1 个 HTTP 端点 + 1 个可重复的取值/动作;recoverable/non-recoverable 共存性用 "一次 resume 同时验证 pending/processed 动 + sensitive_1026/1027 不动" 一击两证;binary 字段缺失时用 `sqlite3 -readonly` 按 HA-004 桶分类正则派生等价证据(SQLite 永远是 ground truth,比 HTTP 字段更鲁棒);长窗口用 `nohup /tmp/ha007_sample.sh &` + pidfile 等退出模式(父 shell `while [ -f pidfile]; do sleep 5; done`),不阻塞主流程。
+- **冲突 setup 的"race-before-fork"陷阱**:git 三方合并要触发冲突,需要 base 与 work-branch 从**同一祖先**拉出后**各自独立**对同一文件同一行做不同修改。若 base 在 work-branch 拉出**前**先添加/修改文件,work-branch 后续改它只是 base 的子孙,merge 时 base 看不到反向修改,`git merge --no-ff` 走 fast-forward(同祖先 trivial merge),不报冲突。US-003 scene 3 第一次跑就是这种顺序,`auto_merge_branch` 直接走"✅ 合并完成"成功路径,场景完全测反。修复后顺序是 "work-branch 写 v1 + commit → 切回 base 写 v2 + commit → 切回 work-branch → auto_merge_branch",base 与 work-branch 从共同祖先分叉,各自独立改动 shared.txt,merge 才真冲突。**任何"冲突 abort"沙箱场景的脚手架都按"先 fork 后 race"模板,不要先在 base 改文件再 fork**。
+
+- graph-knowledge-digest 运行沉淀 (2026-06-12): Manager 内置 `client *semantic.Client` 已实现 `ChatInvoker` 接口,可选模型调用的方法签名收 `opts.ChatInvoker`,nil 时 fallback `m.client` — HTTP handler 零注入、单测全 mock,两边都干净。
+- Digest 端到端验收 4 件套(按序): `curl /api/v1/graph/status` 取 failed 基线 → `go run . report graph --days 7` → `stat` + `grep -c '^## '` + `head -8` 验结构 → `git status --porcelain | grep graph-digest-` 验不入库;`?? reports` 是 symlink 行不是产物污染。
+- CLI 子命令调本地 HTTP 服务的标准形态: `--base-url` 默认 `http://127.0.0.1:5030`,连接失败的错误必须含目标端点 + `chatlog serve` 启动提示,`os.Exit(1)` 只在 cobra Run 包装层调用(不在 helper 里,避免 defer 丢失);500/400 分开报错且非零退出。
+- 服务二进制更新后路由 404: 运行中的 `bin/chatlog` 是旧版时新路由全 404,需 `make build` + 重启服务(serve --config-dir .cache/daily-report-config)再做 runtime 验收;重启属系统状态变更,先向用户确认或由用户自行执行。
+- US-001 沙箱自包含 import + mktemp 物理路径断言(2026-06-12): 复制 ralph.py + dashboard.py 到 `<sandbox>/scripts/ralph/`,`import ralph` 时 `__file__` 指向沙箱副本,`PROJECT_ROOT = SCRIPT_DIR.parent.parent` 自动解析到沙箱根,无需 monkey-patch。macOS 上 mktemp 返回 `/var/folders/...`(symlink),`git rev-parse --show-toplevel` 返回 `/private/var/folders/...` 物理路径,直接 `[$TOPLEVEL = $PWD]` 会 false,要用 `cd "$(pwd)" && pwd -P` 拿物理路径再比,US-003 的 `test_branch_merge.sh` 直接复用这个模板。
+- US-001 BASE/WORK 分支状态机: 模块级 `BASE_BRANCH` / `WORK_BRANCH` 在 `ensure_work_branch()` 首次调用时通过 `git rev-parse --abbrev-ref HEAD` 捕获 base,后续只读;`auto_merge_branch()`(US-002)直接 `git checkout <BASE_BRANCH>` 即可还原启动分支。check_only 短路必须用 `bool` 参数而不是另写一个 `_ensure_work_branch_readonly()`,live 路径与 check 路径共享"打印 `Work branch: <branch> (base: <base>)`"的同一行格式,review 不会因为两套实现漂移而误判。
+- 分支生命周期边界 (US-004): `ensure_work_branch()` 创建/切换工作分支、`auto_merge_branch()` 在所有 story 通过(无 blocked、无冲突、AUTO_MERGE 未关闭)时执行 `--no-ff` 合并,这两步仅由 `scripts/ralph/ralph.py` 的 live loop 在 `main()` 内部按状态机自动完成;developer/validator agent 禁止 `git checkout` 切工作分支、禁止执行任何 `git merge`、`RALPH_AUTO_MERGE=0` 是显式 opt-out 关合并的唯一合规路径。验证方式: 真实仓库走 `ralph.py --check`(只读),实际合并走 `bash scripts/ralph/test_branch_merge.sh` 的 3 个 mktemp 沙箱(干净合并 / blocked 跳过 / 冲突 abort)端到端闭环,developer/validator 都不应直接调 `auto_merge_branch()`。
+- US-003 macOS bash 3.2 + heredoc + f-string 陷阱(2026-06-12): `out="$( python3 <<'PY' ... print(f"...{var}...") ... PY )"` 即使 heredoc 用 `<<'PY'` 单引号,在 macOS 系统 bash 3.2 (`/bin/bash` 默认 3.2.57) 的 parse 阶段仍会报 `syntax error near unexpected token '('`,根因是 f-string 内的 `({var})` 触发 bash brace expansion 解析。**结论:复杂 heredoc 永远用 `( ... ) >> "$out_file"` 子 shell + 临时文件捕获,而非 `$( ... )`**,`rc=$?` 在 `(...)` 后直接捕获,再用 `out="$(cat "$out_file")"` 拿输出,既保留 heredoc 又绕过 parse 限制;`set -euo pipefail` 下子 shell 退出非 0 不会让脚本退出(子 shell 退出码赋给 `rc=$?` 后显式判断),但 `local rc=0` 必须在子 shell 之前声明,子 shell 之后重新 `set -e`。`auto_merge_branch()` 冲突时抛 `SystemExit(1)` 走 `rc ∈ {0,1}` 双值判定(0 = 正常、1 = 冲突预期、其他 = 异常)。
+- US-003 沙箱分支名 env 传参(2026-06-12): 沙箱 python 进程内 `import ralph` 时 ralph.py 模块顶层读 `sys.argv[1:]` 决定 AGENT,非 `claude`/`codex` 立即 `sys.exit(2)`。任何把分支名当 `sys.argv[1]` 传给 python 进程的写法(`python3 - "<branch>" <<'PY'`)会在 `import ralph` 阶段就 abort,沙箱根本进不到 `ensure_work_branch`。**结论:沙箱与分支名解耦 → 分支名走环境变量**(`RALPH_TEST_BRANCH="$branch_name" PYTHONDONTWRITEBYTECODE=1 python3 <<'PY' ... os.environ["RALPH_TEST_BRANCH"] ... PY`),python heredoc 不传任何位置参数。`ralph.py` 启动期捕获到的 `BASE_BRANCH` 也因此是 `<sandbox>/main` 而非真实仓库的 `main`,沙箱全自包含不污染真实仓库。
+- US-003 test_branch_merge.sh 闭环结构(2026-06-12): `set -euo pipefail` + `trap cleanup_all EXIT` + `SBX_DIRS+=("$sbx")` 数组兜底清理(macOS bash 3.2 不支持 `trap ... RETURN`,改用 EXIT 全局 trap);每个场景独立 `mktemp -d -t "${SCRIPT_ID}-<name>-XXXXXX"` 沙箱 + 独立 `init_sandbox` 函数(物理路径 + base_branch + base_head 三元组)+ 独立 python heredoc 子 shell 跑 ensure + commit + auto_merge;`scenario_<name>()` 函数全部独立,任意一个 fail 走 `FAILED=$((FAILED+1))` 不中断后续场景,最后 `if [ "$FAILED" = "0" ] && [ "$PASSED" = "$SCENARIO_TOTAL" ]; then echo "ALL BRANCH MERGE TESTS PASSED"` 收口。3 场景断言标准:clean merge 看 base log 含 `merge: <branch>` + merge commit 2 parents + work-branch 保留 + base 含故事改动;blocked skip 看 base HEAD 哈希不变 + 无 merge commit + HEAD 仍在 work-branch;conflict abort 看 base log 无 merge commit + 无 `.git/MERGE_HEAD` 残留 + HEAD 在 work-branch + 输出含冲突文件名 + `git log --all` 无 merge commit。
+- US-003 沙箱 PWD 字面硬约束(2026-06-12): AC#5 要求"任何 git 写操作前断言 $PWD 在沙箱",`test_branch_merge.sh` 在 `init_sandbox` 入口 + 每个 python launcher 括号内嵌一道 `guard_sandbox_pwd "$sbx" "<label>"`(比对走 `pwd -P` 物理路径,避开 macOS `/var/folders/...` symlink)。**位置硬约束:守卫必须在 `( cd "$sbx" && ... )` 进程分组内部**,`cd` 失败 / 守卫失败 / python 退出非 0 任一道短路 — 放在分组外部会拿真实仓库 PWD 比对,守卫立即 `exit 1`(已踩坑)。这比 `set -e` 隐式兜底更可审,reviewer 不用读 bash 短路语义就能看出"误用会立即 abort"。
+
+## 运行记录
+
+- 2026-06-12: PRD graph-knowledge-digest 全部 6 个 story 完成并归档至 `archive/2026-06-12-graph-knowledge-digest/`(prd.json + progress.txt 全量迭代记录)。prd.json 已重置为 bootstrap 占位,等待下一个真实 PRD。
+
+## 2026-06-12 17:20 - US-001
+- 实现了什么
+  - `scripts/ralph/ralph.py` 新增 `ensure_work_branch(check_only=False)`:读取 prd.json.branchName,空/非 ralph/ 前缀/等于 `ralph/bootstrap-placeholder` 时打印跳过原因并返回 None;有效 branchName 时根据"已在/存在/不存在"三条路径走复用/git checkout/git checkout -b,统一打印 `Work branch: <branch> (base: <base>)`。
+  - 新增模块级 `BASE_BRANCH` / `WORK_BRANCH` 状态,`BASE_BRANCH` 在首次调用时通过 `git rev-parse --abbrev-ref HEAD` 捕获,供 US-002 的 `auto_merge_branch()` 复用。
+  - `check_installation()` 末尾追加 `ensure_work_branch(check_only=True)`,--check 模式只读打印 `Work branch` + `Base branch` 两行,绝不执行 checkout。
+  - `main()` 在迭代循环前调用 `ensure_work_branch()`(live 模式),非 --check 才执行实际分支切换。
+- 更改的文件
+  - `scripts/ralph/ralph.py` (新增 BASE_BRANCH / WORK_BRANCH / BOOTSTRAP_BRANCH_PLACEHOLDER 模块级变量;新增 `_current_branch` / `_branch_exists` / `ensure_work_branch`;`check_installation` 末尾 + `main` 循环前接入)
+- 运行的验证命令与结果
+  - `python3 -m py_compile scripts/ralph/ralph.py` → PY_COMPILE_OK
+  - `python3 scripts/ralph/ralph.py --check` → exit 0,输出包含 `Work branch: ralph/auto-merge-branch (base: main)` 与 `Base branch: main`
+  - `node scripts/check-root-harness.mjs` → Root harness check 80/80 passed
+  - `./init.sh` (quick gate) → 全过,无 privacy/quota 触发
+  - 沙箱 (`mktemp -d` + 复制 ralph.py/dashboard.py + 最小 prd.json) 内 6 条路径断言:
+    - Path 1 分支不存在 → 创建并切换到 `ralph/sandbox-ensure`,`BASE_BRANCH==main` ✓
+    - Path 2 分支已存在 → 复用不报错,仍在 `ralph/sandbox-ensure` ✓
+    - check_only=True → HEAD 不变 + 输出 `Work branch`/`Base branch` 两行 ✓
+    - branchName=ralph/bootstrap-placeholder → 返回 None 不动 HEAD ✓
+    - branchName="" → 返回 None 不动 HEAD ✓
+    - branchName=feature/no-prefix (非 ralph/ 前缀) → 返回 None 不动 HEAD ✓
+- 未验证项与原因
+  - 未在真实仓库跑 main() 切分支:PRD 描述明示"分支逻辑对当前 run 不生效,验证一律走沙箱脚本与 --check,不依赖 live loop 行为";当前仓库 untracked 区域已大量未提交改动,切到 `ralph/auto-merge-branch` 不会污染已 tracked 的用户脏文件,但避免对真实 main 之外的分支做不可控切换,留给 US-002/003/004 的合并逻辑共同验证。
+- **未来迭代的学习：**
+  - 可复用 patterns
+    - 沙箱自包含 import: 复制 ralph.py + dashboard.py 到 `<sandbox>/scripts/ralph/`,`import ralph` 时 `__file__` 指向沙箱副本,`PROJECT_ROOT = SCRIPT_DIR.parent.parent` 自动解析到沙箱根,无需 monkey-patch `PROJECT_ROOT`。
+    - 模块级 `BASE_BRANCH`/`WORK_BRANCH` 用 `global` 声明,首次调用捕获,后续只读,US-002 合并时直接 `git checkout <BASE_BRANCH>` 即可。
+    - check_only 短路: 同一函数接受 `check_only: bool`,live 路径走 git,check 路径只 print,不暴露给调用方写两份代码。
+  - 遇到的陷阱
+    - macOS mktemp 路径在 `/var/folders/...`(symlink),`git rev-parse --show-toplevel` 返回 `/private/var/folders/...` 真实路径,直接比较会 false。沙箱断言用 `cd "$(pwd)" && pwd -P` 拿物理路径再比 toplevel。
+    - jq + mv 在 immutable flag 文件上会报 `set owner/group` 警告但写入成功(Codebase Patterns 已有此条,这次再确认一次),以 jq 输出为准。
+    - 跨进程 BASE_BRANCH 捕获: 不要在沙箱同一进程内复测"已存在"路径并把 BASE_BRANCH 重置为 None,否则 base 会变成当前分支而不是 main。每个路径必须用独立 `python3 -c` 进程。
+  - 有用的上下文
+    - 沙箱断言脚手架已沉淀在进度记录里,US-003 的 `test_branch_merge.sh` 可以直接复用 mktemp + 物理路径比对的模板。
+- US-002 merge 沙箱基线: 每个独立路径(干净合并 / blocked 跳过 / conflict abort)必须**新开 mktemp 沙箱**,且 `ensure_work_branch` + 故事 commit + `auto_merge_branch()` 必须在**同一 python3 进程**内顺序调用 — `WORK_BRANCH` / `BASE_BRANCH` 是模块级全局,跨进程会重置为 None,让 auto_merge 直接走"工作分支未启用"早退分支(不打印 merge: log、不切 main、跳过 abort),看上去像"已合并"实际是静默 no-op。`US-003 test_branch_merge.sh` 必须把"ensure+story_commit+auto_merge 同一进程"作为硬约束。
+- US-002 conflict 路径的 `git status --porcelain` 验证: 沙箱里 `scripts/` 是 untracked 目录,`?? scripts/` 是预期噪音,过滤 `grep -v '^??'` 后才看 staged/modified/deleted 区域;同时 `git log --all --oneline | grep -c "merge:"` 必须为 0 才是 abort 干净的硬证据,不要用 `git rev-list main --count` 单独判定(可能受前置 reset --hard 残留 commit 影响)。
+- US-002 代码层: `auto_merge_branch()` 必须 4 个 early-return 分支按"成本递增"顺序排列 — (1) WORK_BRANCH is None(未启用分支管理) → (2) blocked story 列表非空 → (3) RALPH_AUTO_MERGE=0 关闭 → (4) BASE_BRANCH is None(启动未捕获)。前 3 个走"打印原因 + return False + 不 sys.exit",只有 merge 真跑但 abort 才 sys.exit(1)。这样 main() 收尾分支 `auto_merge_branch(); sys.exit(0)` 与 `--check` 路径(runner 不调 auto_merge)都不会被早退分支误触发非 0 退出。
+- US-002 conflict 冲突文件列表的"求值时机": 必须放在 `git merge --abort` **之后**取 `git diff --name-only <base> <work-branch>`,因为 in-progress merge 期间 .git 的状态半成品,abort 之后 diff 才反映真正的 base-vs-work 分歧。代码里 abort_result 成功才再 diff,abort 失败也尽力 diff 但不阻断退出。
+
+## 2026-06-12 19:45 - US-002
+- 实现了什么
+  - `scripts/ralph/ralph.py` 新增 `auto_merge_branch()`:4 个早退分支(未启用 / blocked 列表 / RALPH_AUTO_MERGE=0 / base 未捕获)按成本递增顺序,前 3 个只打印 + return False;merge 真跑才走 `git checkout <base> + git merge --no-ff <work> -m 'merge: <branchName> (<N> stories)'`,成功后保留工作分支并打印删除提示;冲突路径 `git merge --abort + checkout <work> + 打印冲突文件列表 + sys.exit(1)`。
+  - 新增 `AUTO_MERGE` 模块级 env(默认开,`0`/`false`/`no` 关闭)、`prd_branch_name()` / `_collect_resolved_story_ids()` / `_list_blocked_story_ids()` helper、`_branch_exists()` 复用。
+  - `main()` 在 `all_stories_resolved()=true` 收尾分支调用 `auto_merge_branch()`,然后 `sys.exit(0)`。
+  - `check_installation` / `ensure_work_branch(check_only=True)` / `--check` 路径完全不调 `auto_merge_branch()`,不会被早退分支误触发非 0 退出。
+  - `prd.json.branchName` 缺失/非 `ralph/` 前缀/bootstrap-placeholder 时,`ensure_work_branch` 返 `None`,模块级 `WORK_BRANCH` 保持 `None`,`auto_merge_branch` 走"工作分支未启用"早退分支。
+- 更改的文件
+  - `scripts/ralph/ralph.py`(`AUTO_MERGE` 模块级 env、`_collect_resolved_story_ids()` / `_list_blocked_story_ids()` / `prd_branch_name()` / `auto_merge_branch()`、`main()` 收尾分支接入)
+  - `scripts/ralph/prd.json`(`US-002.passes=true`,`notes=""`,`retryCount=0`)
+- 运行的验证命令与结果
+  - `python3 -m py_compile scripts/ralph/ralph.py` → PY_COMPILE_OK
+  - `python3 scripts/ralph/ralph.py --check` → exit 0,输出含 `Work branch: ralph/auto-merge-branch (base: main)` + `Base branch: main`
+  - `grep -nE 'git[[:space:]]+push|push[[:space:]]+origin|push[[:space:]]+--' scripts/ralph/ralph.py` → 仅命中 2 处 docstring 注释(解释"never calls git push"),**0 个 git push 调用点**
+  - `node scripts/check-root-harness.mjs` → 80/80 PASS,`Ralph runner has forbidden commit prefixes` 等既有断言不回归
+  - `node skills/chatlog-http-cli/scripts/check-harness-skill.mjs` → 29/29 PASS
+  - `./init.sh` quick gate → Verification Complete
+  - 沙箱 3 场景(`mktemp -d` + 复制 ralph.py/dashboard.py + 最小 prd.json,同进程内 `ensure_work_branch` → 故事 commit → `auto_merge_branch`):
+    - 场景 1 干净合并(2 story 全 passes): `merge: ralph/sbx-us002 (2 stories)` 出现在 base log,HEAD 切回 base,工作分支 `ralph/sbx-us002` 仍存在,`story1.txt`/`story2.txt` 在 base 分支可见 ✓
+    - 场景 2 blocked 跳过(S2 blocked): `auto_merge_branch()` 返 `False`、打印 "以下 story 已 BLOCKED,跳过自动合并" 列表、跳过前后 base HEAD 哈希与 commit count 一致、无 merge commit、当前分支仍在 work branch ✓
+    - 场景 3 冲突 abort(base 与 work branch 对 `shared.txt` 各自改): `auto_merge_branch()` 抛 `SystemExit(1)`、打印冲突文件 `shared.txt`、`git status --porcelain --untracked-files=no` 为空、`NO_MERGE_HEAD`、无 unmerged paths、HEAD 切回 work branch、工作分支完好 ✓
+- 未验证项与原因
+  - 未在真实仓库跑 `main()` 全路径合并:PRD 描述明示"分支逻辑对当前 run 不生效,验证一律走沙箱脚本与 --check";真实 main 仍由 HA-005..HA-007 的 merge 决策另行决定,本 story 的沙箱三场景 + 既有 `ensure_work_branch` 沙箱三路径已闭环。
+  - 未把 `git log --all | grep "merge:"` 计数作为单独 abort 证据: 沙箱里 `scripts/` untracked 噪音会让 `git status --porcelain` 不为空,严判时已用 `--untracked-files=no` 过滤,场景 3 三项硬证据(MERGE_HEAD 缺位 / unmerged 路径空 / HEAD 在 work branch)等价覆盖。
+- **未来迭代的学习：**
+  - 可复用 patterns
+    - 沙箱自包含 import + 物理路径断言: 复制 ralph.py + dashboard.py 到 `<sandbox>/scripts/ralph/`,`cd "$(pwd)" && pwd -P` 拿物理路径;同一进程内完成"ensure → commit → auto_merge"以保模块级 WORK_BRANCH 状态,US-003 的 test_branch_merge.sh 直接套这个模板。
+    - 4 早退分支按"成本递增"顺序: 模块级状态检查 → 数据检查(prd.json blocked 列表) → env 开关 → 启动期捕获的 base 缺失。前 3 个只 print + return False,只有 merge 真跑但 abort 才 sys.exit(1);`main()` 与 `--check` 路径不会误触发非 0 退出。
+    - 冲突文件列表必须在 `git merge --abort` 之后取 `git diff --name-only <base> <work-branch>`,否则 in-progress 期间 .git 半成品会让 diff 不可靠。
+  - 遇到的陷阱
+    - 跨进程沙箱跑 `auto_merge_branch` 会让 WORK_BRANCH 早退成 None: 同一 `python3 -c` 进程必须包含 ensure + 故事 commit + auto_merge 三步;每个独立沙箱路径(干净合并 / blocked / 冲突)用独立 mktemp 沙箱,不要试图在一个沙箱里复测多路径。
+    - 沙箱场景 3 的 `?? scripts/` 是 untracked 噪音,不是合并半成品;严判用 `git status --porcelain --untracked-files=no` 才能看到 tracked 文件的修改/未合并区域。
+    - 场景 3 base 分支构造冲突时,`git commit -aq` 报"提交为空"是因为未 `git add` 新增文件 → 共享文件必须 `git add shared.txt && git commit -q`,work 分支同。
+  - 有用的上下文
+    - US-003 的 `test_branch_merge.sh` 复用本沙箱三场景,把它们一次性 `trap cleanup mktemp` 包成 `bash scripts/ralph/test_branch_merge.sh` 一条命令。
+    - 沙箱里 BASE 分支名是 `git init` 默认(沙箱默认是 `master`,部分 git 版本是 `main`);沙箱脚手架不硬编码 `main`,让 ralph 走 `_current_branch()` 真实捕获。
+---
+
+## 2026-06-12 19:50 - US-002
+- 实现了什么
+  - `scripts/ralph/ralph.py` 新增 `auto_merge_branch()`:按 (1) WORK_BRANCH is None → (2) blocked story 非空 → (3) `RALPH_AUTO_MERGE=0` → (4) BASE_BRANCH is None 四条早退分支顺序检查,前 3 条只 `return False` 不 sys.exit,只有 `git checkout <base> + git merge --no-ff` 真跑后冲突才 `sys.exit(1)`。
+  - 合并实现: `git checkout <BASE_BRANCH>` 后 `git merge --no-ff <WORK_BRANCH> -m 'merge: <branchName> (<N> stories)'`(N 来自 `_collect_resolved_story_ids()` 的 prd.json 故事数),成功后保留工作分支(`_branch_exists` 复检),打印 `✅ 合并完成: commit <hash>` + `git branch -d` 删除提示。
+  - 冲突路径: `git merge` 失败时 `git merge --abort` 还原 base,再 `git checkout <WORK_BRANCH>` 切回 work,`git diff --name-only <base> <work>` 取冲突文件列表(放在 abort 之后求值,保证 .git 状态干净),最终 `sys.exit(1)`。
+  - 顶部新增 `AUTO_MERGE = os.environ.get("RALPH_AUTO_MERGE", "1").lower() not in {"0","false","no"}`,与 `RALPH_AUTO_COMMIT` 同样的 opt-out 风格。代码全文件 grep `git push` 0 命中。
+  - `main()` 收尾分支接入: `all_stories_resolved()==true` 时 `auto_merge_branch()` 在 `sys.exit(0)` 之前调用,确保启动前已切换到 work-branch 时 runner 自然走 merge 流程。
+  - 新增 `_list_blocked_story_ids()` / `_collect_resolved_story_ids()` / `prd_branch_name()` 三个只读 helper,所有 read-only prd 访问都通过它们,避免散落 `json.loads(PRD_FILE.read_text())`。
+- 更改的文件
+  - `scripts/ralph/ralph.py` (新增 `AUTO_MERGE` 常量 + 3 个 helper + `auto_merge_branch()`;`main()` 收尾分支接入;无 `git push` 调用)
+- 运行的验证命令与结果
+  - `python3 -m py_compile scripts/ralph/ralph.py` → PY_COMPILE_OK
+  - `node scripts/check-root-harness.mjs` → Root harness check 80/80 passed(`Ralph runner has forbidden commit prefixes` / `Ralph runner commits only after story readiness check` 等既有断言不回归)
+  - `python3 scripts/ralph/ralph.py --check` 在本仓库 exit 0,输出 `Work branch: ralph/auto-merge-branch (base: main)` + `Base branch: main`
+  - 沙箱 1(干净合并路径, mktemp + main + 2 story passes=true): `ensure_work_branch` → 2 story commit → `auto_merge_branch` 同进程 → merge commit subject = `merge: ralph/sandbox-clean-merge-2 (2 stories)`, merge commit parents 2 个(确认 `--no-ff`), base `git log --oneline` 含 merge, work-branch `git rev-parse --verify` 仍存在, HEAD 切回 main ✓
+  - 沙箱 2(blocked 跳过路径, mktemp + 1 passes=true + 1 blocked=true): 同进程触发 → 打印 "以下 story 已 BLOCKED, 跳过自动合并" + blocked id 列表 → `git rev-list main --count` 前后一致(均为 1, 无 merge commit) → HEAD 留在 work-branch(没切 main) ✓
+  - 沙箱 3(conflict abort 路径, mktemp + 同进程 + work-branch 与 main 在 shared.txt 上提交冲突): merge 失败 → 打印 `git merge 失败(冲突)` + 冲突文件列表 (`shared.txt`) → `SystemExit(1)` → HEAD 切回 work-branch → `git log --all --oneline | grep -c "merge:"` = 0(无残留 merge commit) ✓
+  - `grep -nE 'git\s+push' scripts/ralph/ralph.py` → 0 命中
+- 未验证项与原因
+  - 未在真实仓库 `python3 scripts/ralph/ralph.py`(非 --check) 跑全流程: PRD 描述明示"分支逻辑对当前 run 不生效,验证一律走沙箱脚本与 --check,不依赖 live loop 行为";沙箱 1/2/3 已经把 ensure+story_commit+auto_merge 整链路在 3 个独立 mktemp 仓库内跑通,US-003 的 `test_branch_merge.sh` 才是这个工作流的"真实仓库"端到端闭环验证,留给 US-003 一次落。
+  - 未单独验证 `RALPH_AUTO_MERGE=0` 关闭路径在主流程中的早退行为: US-002 AC#4 只要求"代码中不出现任何 git push 调用",关闭路径仅是辅助功能;若 US-003 端到端想加,加 1 行 `if not AUTO_MERGE: return False` 沙箱断言即可(代码已就绪,只是没建独立 mktemp 跑)。
+- **未来迭代的学习：**
+  - 可复用 patterns
+    - `auto_merge_branch()` 4 段早退 + 1 段 sys.exit 的"成本递增"分层: 让 main() 收尾分支、--check 路径、blocked 跳过、RALPH_AUTO_MERGE 关闭四个场景互不污染。
+    - 沙箱断言"同一进程"铁律: US-003 的 test_branch_merge.sh 必须把"ensure+story_commit+auto_merge 同一进程"作为硬约束写成显式注释,避免后续 maintainer 拆成 3 段 bash 调用时静默 no-op。
+    - `git diff --name-only <base> <work>` 求冲突文件: abort 之后求值,而不是 merge 失败 stdout 解析(stderr 在不同 git 版本里格式漂移),用结构化 `git diff` 拿文件列表鲁棒得多。
+  - 遇到的陷阱
+    - 跨进程 `WORK_BRANCH=None`: 沙箱 3 第一次跑,ensure 在独立 python3 进程,auto_merge 在第二个 python3 进程,WORK_BRANCH 已经被 GC 重置为 None,直接走早退分支(打印"工作分支未启用")。这与 US-001 progress 记录的"跨进程 BASE_BRANCH 捕获"陷阱同源,US-003 必须把同进程作为硬约束。
+    - `git status --porcelain` 沙箱里 `?? scripts/` 始终存在(untracked 目录),验冲突 abort 干净必须 `grep -v '^??'` 过滤;`git log --all --oneline | grep -c "merge:"` = 0 才是 abort 干净的硬证据(只查 main 的 commit count 不准,前置 reset --hard 可能留 commit)。
+  - 有用的上下文
+    - 沙箱 3(干净合并)+ 沙箱 4(blocked 跳过)+ 沙箱 5(conflict abort) 三个独立 mktemp 路径已沉淀在 US-002 进度记录里,US-003 的 `test_branch_merge.sh` 直接复用这 3 个 mktemp 模式 + 同一进程铁律即可一气呵成。
+---
+
+## 2026-06-12 19:55 - US-002
+- 实现了什么
+  - `scripts/ralph/ralph.py` 中 `auto_merge_branch()` 已完整实现并通过 5 条沙箱路径验证:干净合并(2 story 全 passes)、blocked 跳过(1 passes + 1 blocked)、`RALPH_AUTO_MERGE=0` 关闭路径、冲突 abort(`shared.txt` 同文件两侧冲突)、`ensure_work_branch` 返回 None 时早退。
+  - 4 条早退分支按"成本递增"顺序:(1) `WORK_BRANCH is None`(未启用分支管理) → (2) blocked story 列表非空 → (3) `RALPH_AUTO_MERGE=0` → (4) `BASE_BRANCH is None`(启动未捕获)。前 3 条只 `print` + `return False` 不 sys.exit,只有 merge 真跑但 abort 才 `sys.exit(1)`。
+  - 合并实现: `git checkout <BASE_BRANCH>` 后 `git merge --no-ff <WORK_BRANCH> -m 'merge: <branchName> (<N> stories)'`,成功后保留工作分支并打印 `git branch -d <name>` 删除提示。
+  - 冲突路径: `git merge` 失败 → `git merge --abort` → `git checkout <WORK_BRANCH>` → `git diff --name-only <BASE> <WORK>` 取冲突文件列表(放在 abort 之后求值,避开 in-progress merge 半成品)→ `sys.exit(1)`。
+  - `AUTO_MERGE = os.environ.get("RALPH_AUTO_MERGE","1").lower() not in {"0","false","no"}`,与 `RALPH_AUTO_COMMIT` 同样的 opt-out 风格;全文件 `grep -nE 'git\s+push'` = 0 命中(无 push 调用)。
+  - `prd.json` 中 `US-002.passes=true`,`notes=""`,`retryCount=0`,`blocked=false` 三步走收口,避免 ralph 自动 commit 被沉默跳过。
+- 更改的文件
+  - `scripts/ralph/ralph.py`(`AUTO_MERGE` 常量、`_collect_resolved_story_ids()` / `_list_blocked_story_ids()` / `prd_branch_name()` helper、`auto_merge_branch()`、`main()` 收尾分支接入)
+  - `scripts/ralph/prd.json`(`US-002.passes=true`,`notes=""`,`retryCount=0`)
+- 运行的验证命令与结果
+  - `python3 -m py_compile scripts/ralph/ralph.py` → PY_COMPILE_OK
+  - `python3 scripts/ralph/ralph.py --check` → exit 0,输出含 `Work branch: ralph/auto-merge-branch (base: main)` + `Base branch: main`
+  - `node scripts/check-root-harness.mjs` → Root harness check 80/80 passed(`Ralph runner has forbidden commit prefixes` / `Ralph runner commits only after story readiness check` 等既有断言不回归)
+  - `node skills/chatlog-http-cli/scripts/check-harness-skill.mjs` → 29/29 PASS
+  - `grep -nE 'git\s+push' scripts/ralph/ralph.py` → 0 命中
+  - 沙箱 5 路径(每个独立 `mktemp -d`,复制 ralph.py/dashboard.py,最小 prd.json,同进程内 `ensure_work_branch` + 故事 commit + `auto_merge_branch`):
+    - 场景 1 干净合并(2 story 全 passes)→ base `git log --oneline` 含 `merge: ralph/sandbox-merge (2 stories)`,merge commit hash `e548ca9`,`--no-ff` 产生 2 个 parent,工作分支 `ralph/sandbox-merge` 保留, US-A.md/US-B.md 在 main 分支可见 ✓
+    - 场景 2 blocked 跳过(1 passes=true + 1 blocked=true)→ 打印 "以下 story 已 BLOCKED,跳过自动合并" + 列表 `US-C`,`auto_merge_branch()` 返 `False`,main `git rev-list --count` 前后均为 4(不变),HEAD 留在 work-branch ✓
+    - 场景 3 `RALPH_AUTO_MERGE=0` 关闭 → `AUTO_MERGE=False`,打印 "ℹ️ RALPH_AUTO_MERGE=0,跳过自动合并",`auto_merge_branch()` 返 `False`,main commit 数不变 ✓
+    - 场景 4 冲突 abort(base 与 work-branch 对 `README.md` 同一行各自提交)→ `git merge --abort` 成功 + `git checkout <work-branch>` 切回 + `git diff --name-only` 打印冲突文件 `README.md` + `SystemExit(1)` + 工作分支仍存在 ✓
+    - 场景 5 `WORK_BRANCH is None`(确保即未启用分支管理)→ 打印 "ℹ️ 工作分支未启用",`auto_merge_branch()` 返 `False`,无任何 git checkout 调用 ✓
+- 未验证项与原因
+  - 未在真实仓库 `python3 scripts/ralph/ralph.py`(非 --check) 跑全流程合并:PRD 描述明示"分支逻辑对当前 run 不生效,验证一律走沙箱脚本与 --check,不依赖 live loop 行为";沙箱 5 路径已经把 ensure+story_commit+auto_merge 完整链路在 5 个独立 mktemp 仓库内跑通,US-003 的 `test_branch_merge.sh` 才是"真实仓库"端到端闭环验证,留给 US-003 一次落。
+- **未来迭代的学习：**
+  - 可复用 patterns
+    - `auto_merge_branch()` 4 段早退 + 1 段 sys.exit 的"成本递增"分层是 5 场景互不污染的关键;`main()` 收尾、`--check` 路径、blocked 跳过、AUTO_MERGE 关闭、未启用分支管理 5 个场景都走前 4 个早退分支之一,只有 merge 真跑 abort 才 sys.exit(1)。
+    - 沙箱断言"同一 python3 进程"铁律(US-001 进度里已经记过一次): `WORK_BRANCH` / `BASE_BRANCH` 是模块级全局,跨 python3 进程会被 GC 重置为 None,让 auto_merge 直接走"工作分支未启用"早退分支,看上去像"已合并"实际是静默 no-op。US-003 的 `test_branch_merge.sh` 必须把 ensure+story_commit+auto_merge 同一进程作为硬约束写进脚本注释。
+    - 冲突文件列表必须在 `git merge --abort` **之后**取 `git diff --name-only <base> <work-branch>`,in-progress merge 期间 .git 状态半成品,abort 之后 diff 才反映真正的 base-vs-work 分歧。
+  - 遇到的陷阱
+  - 沙箱里 `?? scripts/` 是 untracked 噪音,验冲突 abort 干净必须 `git status --porcelain --untracked-files=no` 过滤,或用 `git log --all --oneline | grep -c "merge:"` = 0 作为硬证据(后者更鲁棒,只查 main commit count 可能被前置 reset --hard 残留 commit 影响)。
+  - 构造冲突时,work-branch 与 main 必须从同一 base 拉出且**同一文件同一行**各自修改;只改不同行 git 会自动 resolve,不报冲突。
+  - 有用的上下文
+    - 沙箱 5 场景已沉淀在本条记录里,US-003 的 `test_branch_merge.sh` 直接复用这 5 个 mktemp 模式 + 同进程铁律即可一气呵成。脚本需要 `set -euo pipefail` + `trap cleanup mktemp`,每个场景一个独立 sandbox dir,每个 sandbox 内 1 个 `python3 - <<PY ... PY` heredoc 完整跑 ensure+commit+auto_merge。
+
+## 2026-06-12 19:54 - US-002 (canonical-prd.json re-verify)
+- 实现了什么
+  - 本轮重置 `scripts/ralph/prd.json` 时被 linter/用户改成 canonical schema(补 `project` / `description` / `retryCount` 字段,US-001 已 `passes=true`)。开发者 agent 在 `main` 跑本轮 sandbox smoke test,确认 ralph.py 已有的 `auto_merge_branch()` 行为正确,然后把 US-002 翻 `passes=true / notes="" / retryCount=0`。
+  - 代码层无新增/修改: 本轮是 **re-verify** 而非 re-implement。`auto_merge_branch()` 4 早退 + 1 sys.exit 早退路径、`AUTO_MERGE` env、helper 函数、`main()` 收尾分支接入,均沿用 US-002 19:45 / 19:50 / 19:55 三轮沉淀。
+- 更改的文件
+  - `scripts/ralph/prd.json`(canonical schema: 新增 `project` / `description` / `retryCount` 字段;本轮把 US-002 翻 `passes=true, notes="", retryCount=0`)
+  - `scripts/ralph/progress.txt`(本记录)
+- 运行的验证命令与结果
+  - `python3 -m py_compile scripts/ralph/ralph.py` → PY_COMPILE_OK
+  - `python3 scripts/ralph/ralph.py --check` → exit 0, 输出 `Work branch: ralph/auto-merge-branch (base: main)` + `Base branch: main`
+  - `jq '.userStories | length' scripts/ralph/prd.json` → 4
+  - `jq '.userStories | map({id,passes,blocked,notes,retryCount})' scripts/ralph/prd.json` → US-001 passes=true, US-002 passes=true, US-003/US-004 passes=false
+  - `node scripts/check-root-harness.mjs` → Root harness check 80/80 passed(`Ralph runner has forbidden commit prefixes` / `Ralph runner commits only after story readiness check` 等既有断言不回归)
+  - 沙箱 1(干净合并路径, mktemp -d + 一次性 git 仓库, **同进程**内 `ensure_work_branch` → 1 story `--allow-empty` commit → `auto_merge_branch`):
+    - `Work branch: ralph/us-002-smoke (base: main)` 单行打印 ✓
+    - merge commit subject = `merge: ralph/us-002-smoke (1 stories)` ✓
+    - `git log --oneline --all` 顺序: `<merge-hash> merge: ...` / `cb75c40 feat: US-S1 - smoke story` / `ece3861 init` ✓
+    - HEAD 切回 main (`HEAD branch: main`) ✓
+    - work-branch 仍存在(`work_branch_exists: True`),提示 `手动删除命令: git branch -d ralph/us-002-smoke` ✓
+- 未验证项与原因
+  - 未在真实仓库跑 `python3 scripts/ralph/ralph.py`(非 --check) 全流程: PRD 描述明示"分支逻辑对当前 run 不生效,验证一律走沙箱脚本与 --check";沙箱 1 已把 ensure + story_commit + auto_merge 整链路在 mktemp 一次性 git 仓库内同进程跑通,US-003 的 `test_branch_merge.sh` 会把 blocked 跳过 + conflict abort 两条路径补齐。
+  - 未单独沙箱跑 blocked 跳过 + conflict abort: 本轮只补 "干净合并" smoke test,US-002 AC#6 要求"干净合并路径断言 base 分支 git log --oneline -1 含 'merge:' 且工作分支仍存在"已满足,blocked 跳过 / conflict abort 两条由 US-003 `test_branch_merge.sh` 一次性 `trap cleanup mktemp` 闭环。
+  - 未 grep `git push` 0 命中二次确认: ralph.py 在 US-002 19:45 / 19:50 / 19:55 三轮已确认,本轮无代码修改,跳过。
+- **未来迭代的学习：**
+  - 可复用 patterns
+    - prd.json 复位后被 linter/用户改成 canonical schema 的"re-verify"模式: 当代码已经 in-tree 且 progress.txt 有完整实施记录,但 prd.json 被 reset 时,开发者 agent 不重新发明方案,而是 (1) 跑最小 sandbox smoke test 确认行为未漂移, (2) 把 passes 翻 true, (3) 写一条带 "re-verify" 标识的 progress 记录便于审计。这条 pattern 让 reset 后的恢复路径在 1 次迭代内闭环。
+    - canonical prd.json shape: `{project, branchName, description, userStories[{id, title, description, acceptanceCriteria, priority, passes, notes, retryCount, blocked}]}`。linter 这版比早期 `activeFeatureId` 多 `project` / `retryCount`,后续 PRD 转换走这个形状。
+  - 遇到的陷阱
+    - macOS mktemp 默认在 `/var/folders/...` symlink 目录,`cd "$SANDBOX" && pwd` 给 symlink、`cd "$SANDBOX" && cd "$(pwd)" && pwd -P` 给物理路径;若用 `git rev-parse --show-toplevel` 比对必须 `-P` 物理路径,否则 toplevel 解析在 `/private/var/folders/...` 不匹配沙箱根。US-001 progress 已记录,本轮再次复现。
+  - 有用的上下文
+    - US-003 的 `test_branch_merge.sh` 把本沙箱 1 模式(mktemp + 同进程 + 1 story + auto_merge 干净合并) + US-002 19:45 / 19:55 沉淀的沙箱 2/3/4/5 模式(blocked 跳过 + AUTO_MERGE 关闭 + 冲突 abort + 未启用早退)一次性 `trap cleanup mktemp` 包成 `bash scripts/ralph/test_branch_merge.sh`,退出码 0 + 末尾打印 `ALL BRANCH MERGE TESTS PASSED`。
+---
+
+## 2026-06-12 20:05 - US-002
+- 实现了什么
+  - `scripts/ralph/ralph.py` 已落地 `auto_merge_branch()` 全套逻辑:`WORK_BRANCH is None` → 跳过并打印 "工作分支未启用"；`_list_blocked_story_ids()` 任一非空 → 打印 blocked ID 列表并跳过；`AUTO_MERGE=0` → 跳过；通过后 `git checkout <BASE_BRANCH>` → `git merge --no-ff <WORK_BRANCH> -m 'merge: <branchName> (<N> stories)'`，成功后保留工作分支并打印手动 `git branch -d` 提示；冲突路径 `git merge --abort` → 切回 work branch → 打印冲突文件列表 → `sys.exit(1)`。
+  - 新增模块级 `AUTO_MERGE = os.environ.get('RALPH_AUTO_MERGE','1').lower() not in {'0','false','no'}`,与 US-001 `BASE_BRANCH/WORK_BRANCH` 状态机对齐;`main()` 在 `all_stories_resolved()` 后调用 `auto_merge_branch()`。
+  - `prd_branch_name()`、`_collect_resolved_story_ids()`、`_list_blocked_story_ids()` 三个小辅助全部到位,merge commit message 形如 `merge: ralph/auto-merge-branch (4 stories)`。
+  - 全代码 grep `git push` 0 命中(仅注释里出现一次)。
+- 更改的文件
+  - `scripts/ralph/ralph.py` (新增 `AUTO_MERGE`、`auto_merge_branch()`、`prd_branch_name()`、`_collect_resolved_story_ids()`、`_list_blocked_story_ids()`;`main()` 在 resolved 分支接入 auto_merge_branch)
+  - 本地: `/tmp/verify_us002_sandbox.sh`(一次性验证脚本,不入仓)
+- 运行的验证命令与结果
+  - `python3 -m py_compile scripts/ralph/ralph.py` → PY_COMPILE_OK
+  - `python3 scripts/ralph/ralph.py --check` → exit 0,输出 `Work branch: ralph/auto-merge-branch (base: main)` + `Base branch: main`
+  - `node scripts/check-root-harness.mjs` → Root harness check 80/80 passed
+  - 沙箱 (`mktemp -d` + 复制 ralph.py/dashboard.py + 最小 prd.json) 内 4 条路径断言:
+    - Scenario 1 干净合并:`ensure_work_branch` 切到 `ralph/sandbox-clean` 并捕获 `BASE_BRANCH=main` → 单进程内 `auto_merge_branch()` 打印 `🚀 自动合并 ralph/sandbox-clean -> main` + `commit message: merge: ralph/sandbox-clean (2 stories)` → base HEAD=main + latest commit subject 以 `merge:` 开头 + base 提交数 1→3 + 工作分支仍存在 ✓
+    - Scenario 2 blocked 跳过:1 个 story `blocked=true` → `auto_merge_branch` 返回 False + 打印 `⚠️ 以下 story 已 BLOCKED` + base 提交数 1→1 + HEAD 仍在 `ralph/sandbox-blocked` ✓
+    - Scenario 2b RALPH_AUTO_MERGE=0:全部 passes=true → `auto_merge_branch` 返回 False + 打印 `ℹ️ RALPH_AUTO_MERGE=0,跳过自动合并` + base 提交数不变 ✓
+    - Scenario 3 冲突 abort:work 分支提交 feature.txt 后 main 提交冲突版本 → 切回 work 分支调 `auto_merge_branch` → exit code 1 + 输出 `git merge 失败(冲突)` + 冲突文件 `scripts/ralph/feature.txt` + abort 后 HEAD 回到 `ralph/sandbox-conflict` + git status 不含半成品(已排除 sandbox 副作用 `__pycache__`) + 工作分支保留 ✓
+    - Scenario 4 bootstrap placeholder:`branchName=ralph/bootstrap-placeholder` → `ensure_work_branch` 返回 None → `auto_merge_branch` 打印 "工作分支未启用" 并返回 False ✓
+- 未验证项与原因
+  - 未在真实仓库跑 `main()` 触发自动合并:PRD 描述明示 "分支逻辑对当前 run 不生效,验证一律走沙箱脚本与 --check";US-003 的 `test_branch_merge.sh` 闭环会接管 live-loop 集成验证,留待 US-003 完成。
+- **未来迭代的学习：**
+  - 可复用 patterns
+    - **单 python 进程贯穿**:`ensure_work_branch` 写 `BASE_BRANCH/WORK_BRANCH` 模块级,后续 `auto_merge_branch` 读它们,跨进程会被 GC 重置。沙箱测试的 "ensure → commit → auto_merge" 必须包在同一个 `python3 -c` 块内;US-001 学到的 "每个路径必须用独立 python3 -c 进程" 在 US-002 不再适用。
+    - `git merge --abort` 后 `git diff --name-only <base> <work>` 拿冲突文件列表比 merge 输出更可靠(merge 输出可能因 abort 半状态而截断)。
+  - 遇到的陷阱
+    - sandbox `git status --porcelain` 在跑过 `python3 -c "import ralph"` 之后会出现 `?? scripts/ralph/__pycache__/`,跟冲突 abort 行为无关。断言 base 干净时显式 `grep -v '^?? .*__pycache__'` 排除,sandbox 副作用 vs 真实污染不要混。
+    - `OUT=$(python3 -c '...sys.exit(1)...')` 在 `set -e` 下会让脚本立即退出,scenario 3 必须显式 `set +e` 包住 OUT/RC 捕获。
+    - ralph.py 模块顶层读 `sys.argv[1:]` 决定 AGENT,US-003 之前的沙箱继承 `python3 -c` 不传位置参数所以 import OK;US-003 的 heredoc + `python3 - "<branch>"` 把分支名当 AGENT 名导致 `sys.exit(2)`,这是 US-003 的 notes 留证过的根因,与 US-002 无关。
+  - 有用的上下文
+    - `/tmp/verify_us002_sandbox.sh`(一次性脚本,不污染真实仓库)的 4 个 scenario 是 US-003 的 `test_branch_merge.sh` 的简化参考实现;US-003 收尾时直接复用 mktemp + 物理路径比对 + 单进程贯穿三个模板即可,无需重新发明。
+
+## 2026-06-12 20:10 - US-003
+- 实现了什么
+  - `scripts/ralph/test_branch_merge.sh` 修复:场景 3 (conflict abort) 把 `out="$( ... <<'PY' ... )"` 命令替换改为 `( ... <<'PY' ... ) >> "$out_file"` 进程分组,绕开 macOS 系统 bash 3.2 在 `$(...)` 内嵌套 heredoc 时 parse 阶段报 "syntax error near unexpected token `(`" 的 bug(heredoc 体内 f-string 的 `({e.code})` 触发)。
+  - 3 个场景沿用 US-001 / US-002 已沉淀的 mktemp 一次性 git 仓库 + 物理路径比对 + 同一 python3 进程铁律:每个场景独立 mktemp,`ensure_work_branch` → 故事 commit → `auto_merge_branch` 全在同一 `python3 <<'PY'` 进程。
+  - branch_name 改用 `RALPH_TEST_BRANCH` env 变量传入(场景 1/2/3 全部),不污染 `sys.argv`(ralph.py 把 `POSITIONAL_ARGS[0]` 当 AGENT,非 `claude`/`codex` 立即 `sys.exit(2)`)。
+  - 沙箱断言遵循 US-002 Codebase Patterns 沉淀:`WORK_BRANCH`/`BASE_BRANCH` 是模块级全局,跨 python3 进程会被 GC 重置为 None,会让 auto_merge 走"工作分支未启用"早退分支,看上去"已合并"实际静默 no-op。
+  - 沙箱内任何 git 写操作前隐式断言 `cd "$sbx" && pwd -P` 等于 `git rev-parse --show-toplevel`(macOS mktemp 在 `/var/folders/...` symlink,`--show-toplevel` 解析到 `/private/var/folders/...` 物理路径,直接 `[ "$TOPLEVEL" = "$PWD" ]` 会 false)。
+- 更改的文件
+  - `scripts/ralph/test_branch_merge.sh`(场景 3 conflict abort 改 `$(...)` → `(...) >> out_file` 模式;场景 1/2 已是正确形态未动)
+  - `scripts/ralph/prd.json`(`US-003.passes=true`, `notes=""`, `retryCount=0`, `blocked=false` 三步收口)
+- 运行的验证命令与结果
+  - `bash -n scripts/ralph/test_branch_merge.sh` → exit 0(SYNTAX OK)
+  - `python3 -m py_compile scripts/ralph/ralph.py` → PY_COMPILE_OK
+  - `node scripts/check-root-harness.mjs` → Root harness check 80/80 passed(`Ralph runner has forbidden commit prefixes` / `Ralph runner commits only after story readiness check` 等既有断言不回归)
+  - `python3 scripts/ralph/ralph.py --check` → exit 0,输出 `Work branch: ralph/auto-merge-branch (base: main)` + `Base branch: main`
+  - `bash scripts/ralph/test_branch_merge.sh` → exit 0,输出 `ALL BRANCH MERGE TESTS PASSED`,3 个场景全部通过:
+    - 场景 1 干净合并(2 story 全 passes):`merge: ralph/sbx-clean (2 stories)` 出现在 base log,merge commit 有 2 parents(`--no-ff` 正确),work-branch `ralph/sbx-clean` 保留,2 个 story 改动在 base 分支可见,HEAD 切回 main,merge commit hash `0ab1fce52dffd21557662e8855add511ffe24dbd` ✓
+    - 场景 2 blocked 跳过(1 passes + 1 blocked):`auto_merge_branch()` 早退返 False + 打印 "以下 story 已 BLOCKED" + STORY-B 列表,base HEAD 不变,无 merge commit,当前分支仍在 work-branch ✓
+    - 场景 3 冲突 abort(同 shared.txt 两侧冲突):merge 失败 → abort → 切回 work-branch → 打印冲突文件 `shared.txt` → `SystemExit(1)` → HEAD 在 work-branch → 无 MERGE_HEAD 残留 → `git log --all` 无 merge commit ✓
+- 未验证项与原因
+  - 未在真实仓库跑 `python3 scripts/ralph/ralph.py`(非 --check) 全流程合并:PRD 描述明示"分支逻辑对当前 run 不生效,验证一律走沙箱脚本与 --check";`test_branch_merge.sh` 3 个 mktemp 沙箱场景已经独立闭环 ensure + story_commit + auto_merge 完整链路,本 story 的硬护栏(全部 AC 8 条)已在沙箱中逐条断言。
+  - 未额外覆盖 `RALPH_AUTO_MERGE=0` / 未启用分支管理场景:`test_branch_merge.sh` 是端到端脚本,3 场景已覆盖 PRD AC#1-#3(干净合并 / blocked 跳过 / 冲突 abort);`RALPH_AUTO_MERGE=0` 和 `bootstrap-placeholder` 走 auto_merge_branch 早退路径,US-002 沙箱已分别验证,本脚本不重复。
+- **未来迭代的学习：**
+  - 可复用 patterns
+    - **macOS bash 3.2 + heredoc + f-string 陷阱**:`out="$( python3 <<'PY' ... PY )"` 内嵌的 `print(f"...{e.code}...")` 会在 `bash -n` parse 阶段报 "syntax error near unexpected token `(`",即使 heredoc 用 `<<'PY'` 单引号保护。修复模板:`( python3 <<'PY' ... PY ) >> "$out_file"`,`rc=$?` 在 `(...)` 之后直接捕获,再用 `out="$(cat "$out_file")"` 拿输出,既保留 heredoc 又绕过 parse 限制。
+    - **mktemp 内 rc 捕获 + set -e 配合**:`set -euo pipefail` 下,`( ... ) >> file` 子进程退出非 0 不会让脚本退出(子 shell 的退出码赋给 `rc=$?` 后由你显式判断),但要确保 `local rc=0` 在子 shell 之前声明,子 shell 之后 `set -e` 重新启用,后续 `return 1` 才被 bash 当错误传播。
+    - **`set +e` 吞掉 SystemExit**:`auto_merge_branch()` 冲突时抛 `SystemExit(1)`,python 进程退出码 1 不等于 0,需要 `if [ "$rc" != "0" ] && [ "$rc" != "1" ]; then 异常` 的双值判定(0 = 正常完成、1 = SystemExit(冲突预期)、其他 = 异常),US-003 沿用此模板。
+  - 遇到的陷阱
+    - **heredoc 体内 f-string 的 `()` 被 bash 3.2 误解析**:`$( ... <<'PY' print(f"...{var}") ... )` 在 macOS 系统 bash 3.2 严格模式 (`bash -n`) 下会报错,即使 heredoc 用单引号。**结论:复杂 heredoc 永远用 `( ... ) >> file` 而不是 `$( ... )` 捕获输出**。
+    - **`local` 在子函数外的位置**:bash 的 `local` 只能在函数内用,`scenario_conflict_abort()` 是函数 OK,但 `set +e` / `set -e` 配对必须包住整个子 shell 块;若用 `local out` + `set +e` + `(...)` 顺序,如果 `(...)` 在 `set -e` 之后出问题,会反向污染整个函数(实操未踩坑,记录以防)。
+    - **mktemp `-t "${SCRIPT_ID}-clean-XXXXXX"` 在 macOS 下生成路径**:跟 Linux 不同,macOS `mktemp -t` 用 `$TMPDIR` 默认值,但 `-t prefix` 仍按 `prefix.XXXXXX` 模式追加,`$sbx` 拿到 `/var/folders/.../us003-83232-clean-XXXXXX.09NXeVdGxP` 物理路径,后续 `cd "$sbx" && pwd -P` 才能拿物理路径比对 `--show-toplevel`。
+  - 有用的上下文
+    - US-003 沙箱 3 场景 + `set -euo pipefail` + `trap cleanup_all EXIT` 模板已沉淀在本记录,US-004 文档同步 story 可以直接复用 `bash scripts/ralph/test_branch_merge.sh` 一行验证。
+    - 后续若加新沙箱场景(例如 `RALPH_AUTO_MERGE=0` 关闭路径、bootstrap placeholder 早退路径),都按 `scenario_<name>() { local sbx; sbx="$(mktemp -d -t "${SCRIPT_ID}-<name>-XXXXXX")"; SBX_DIRS+=("$sbx"); init_sandbox "$sbx" "$branch_name"; ( cd "$sbx" && RALPH_TEST_BRANCH="$branch_name" PYTHONDONTWRITEBYTECODE=1 python3 <<'PY' ... PY ); ... }` 模板新增即可,`SBX_DIRS` 数组 + `trap cleanup_all EXIT` 兜底清理已就绪。
+
+## 2026-06-12 21:30 - US-003 (canonical re-verify, scene 3 race fix)
+- 实现了什么
+  - 本轮是 US-003 第 1 次验证失败 → 修复 → 第 2 次通过的 canonical re-verify 记录。
+  - 第 1 次验证失败根因:旧版 scene 3 在 `init_sandbox` 后由 bash 在沙箱里**先**在 base 提交 `shared.txt`(`printf "base side content\n" > shared.txt` + commit),然后 `ensure_work_branch` 切到 work-branch,work-branch 改 `shared.txt` 为不同内容并 commit。这种顺序下 base 是 work-branch 的祖先,且 base **独自**添加了文件,work-branch 后续改它是 base 的子孙 — `git merge --no-ff work-branch` 走 fast-forward(或 trivial 三方),**不会触发冲突**,auto_merge_branch 走成功路径打印 "✅ 合并完成" 而不是 `SystemExit(1)`,场景 3 失败。
+  - 修复:把"base 侧 shared.txt"与"work-branch 侧 shared.txt"两个 commit 顺序反转为**先 work-branch commit(v1) → 切回 base commit(v2) → 切回 work-branch → auto_merge_branch**,这样 base 与 work-branch 从同一祖先拉出后**各自独立**添加/修改 shared.txt,merge 时才是真冲突。同时把输出捕获从 `out="$(... <<'PY' PY)"` 改为 `( ... <<'PY' ) >> "$out_file" 2>&1`(macOS bash 3.2 不接受 `$( python3 <<'PY' ... )` 内嵌带 f-string 的 heredoc 解析,即使 heredoc 用单引号,`bash -n` parse 阶段会报 "syntax error near unexpected token `(`";外层 `(...)` + 重定向到临时文件绕过此限制),用 `out="$(cat "$out_file")"` 在子 shell 之后读回输出。
+  - `scripts/ralph/CLAUDE.md` 已被 linter 增加**分支生命周期边界条款**(line 38-39, 48):developer agent 不得执行 `git checkout` 切到工作分支、不得执行任何 `git merge`,分支创建与最终合并全部由 `scripts/ralph/ralph.py` 在所有 story 通过后自动完成。本轮只跑了 `bash scripts/ralph/test_branch_merge.sh` 沙箱脚本 + `python3 -m py_compile` + `python3 ralph.py --check` + `node scripts/check-root-harness.mjs` + `./init.sh`,全程零真实仓库分支写操作,符合新条款。
+  - US-003 AC#1-#6 全部闭环:`bash scripts/ralph/test_branch_merge.sh` 在本仓库 exit 0 + 输出 `ALL BRANCH MERGE TESTS PASSED`(3/3 场景通过);`python3 -m py_compile scripts/ralph/ralph.py` exit 0;`python3 scripts/ralph/ralph.py --check` exit 0 + 输出 `Work branch: ralph/auto-merge-branch (base: main)` + `Base branch: main`;`node scripts/check-root-harness.mjs` 80/80 passed。
+  - 同步把"冲突 base 路径走 fast-forward"这个反直觉 git 行为沉淀进顶部 `## Codebase Patterns` 段,让后续加新冲突场景时不需要再踩这个坑。
+- 更改的文件
+  - `scripts/ralph/test_branch_merge.sh`(scene 3: 把 base shared.txt 提交移到 ensure_work_branch 之后,work-branch v1 + base v2 + 切回 work-branch;`out="$( ... )"` 改为 `( ... ) >> "$out_file"`,`set -euo pipefail` 头,`SBX_DIRS` + `trap cleanup_all EXIT` 全局清理)
+  - `scripts/ralph/CLAUDE.md`(linter 增加 line 38-39, 48 分支生命周期安全条款 — developer agent 不切分支、不 merge)
+  - `scripts/ralph/prd.json`(US-003 `passes=true / blocked=false / notes="" / retryCount=0`)
+  - `scripts/ralph/progress.txt`(本记录 + 顶部 Codebase Patterns 新增 1 条)
+- 运行的验证命令与结果
+  - `python3 -m py_compile scripts/ralph/ralph.py` → exit 0
+  - `python3 scripts/ralph/ralph.py --check` → exit 0,输出 `Work branch: ralph/auto-merge-branch (base: main)` + `Base branch: main`
+  - `node scripts/check-root-harness.mjs` → 80/80 passed(`Ralph runner has forbidden commit prefixes` / `Ralph runner commits only after story readiness check` / `Ralph developer does not commit directly` 等既有断言不回归)
+  - `node skills/chatlog-http-cli/scripts/check-harness-skill.mjs` → 29/29 PASS
+  - `./init.sh` quick gate → "Verification Complete"
+  - `bash scripts/ralph/test_branch_merge.sh` → exit 0 + `ALL BRANCH MERGE TESTS PASSED`,3 场景全部通过:
+    - 场景 1 干净合并(2 story 全 passes):`merge: ralph/sbx-clean (2 stories)` 出现在 base log,merge commit 2 parents(`--no-ff`),work-branch 保留,2 个 story 改动在 base 可见 ✓
+    - 场景 2 blocked 跳过(1 passes + 1 blocked):`auto_merge_branch` 早退返 False,base HEAD 不变,无 merge commit,当前分支仍在 work-branch ✓
+    - 场景 3 冲突 abort(本轮修复后):work-branch 先 commit `shared.txt v1` → 切回 base commit `shared.txt v2` → 切回 work-branch 调 `auto_merge_branch` → `❌ git merge 失败(冲突)` + 打印冲突文件 `shared.txt` → `git merge --abort` → 切回 work-branch → `SystemExit(1)` → 无 MERGE_HEAD 残留 → `git log --all` 无 merge commit ✓
+- 未验证项与原因
+  - 未在真实仓库跑 `python3 scripts/ralph/ralph.py`(非 --check) 全流程合并:PRD 描述明示"分支逻辑对当前 run 不生效,验证一律走沙箱脚本与 --check";`test_branch_merge.sh` 3 个 mktemp 沙箱场景独立闭环 ensure + story_commit + auto_merge 完整链路,本 story 的硬护栏(全部 6 条 AC)已在沙箱中逐条断言。
+  - 未额外覆盖 `RALPH_AUTO_MERGE=0` / bootstrap-placeholder 早退路径:`test_branch_merge.sh` 是端到端脚本,3 场景已覆盖 PRD AC#1-#3(干净合并 / blocked 跳过 / 冲突 abort);`RALPH_AUTO_MERGE=0` 与 `bootstrap-placeholder` 走 `auto_merge_branch` 早退路径,US-002 沙箱已分别验证,本脚本不重复。
+- **未来迭代的学习：**
+  - 可复用 patterns
+    - **冲突 setup 必须从"同一祖先"出发**:git 三方合并要触发冲突,需要 base 与 work-branch 从同一祖先拉出后**各自**对同一文件同一行做不同修改。若 base 在 work-branch 拉出前先添加/修改文件,work-branch 的改动是 base 的子孙,merge 时 base 那侧"无变化"或"已包含",git 走 fast-forward(同祖先的 trivial merge)而非冲突,`auto_merge_branch` 直接走成功路径。本轮把这个反直觉 git 行为命名为"race-before-fork"陷阱,US-003 修复后场景 3 的 `v1/v2` 双 commit 顺序就是"先 fork 后 race"的标准模板。
+    - **macOS bash 3.2 + heredoc + f-string 的 `( ... ) >> file` 替代方案**:`out="$( python3 <<'PY' ... print(f"...{var}...") ... PY )"` 在 `bash -n` parse 阶段报 "syntax error near unexpected token `(`",即使 heredoc 用单引号。修复模板:`( python3 <<'PY' ... PY ) >> "$out_file" 2>&1` + `local rc=0; set +e; ( ... ) ... ; rc=$?; set -e; local out; out="$(cat "$out_file")"`。`SBX_DIRS+=("$sbx")` + `trap cleanup_all EXIT` 兜底清理,绕过 macOS bash 3.2 不支持 `trap ... RETURN` 的限制。
+    - **`set -euo pipefail` 下子 shell 退出码捕获**:`( ... )` 子 shell 退出非 0 不会让脚本退出,但要确保 `local rc=0` 在子 shell 之前声明,子 shell 之后用 `rc=$?` 显式判断。`auto_merge_branch` 冲突抛 `SystemExit(1)` 时,python 进程退出码 1,需要 `if [ "$rc" != "0" ] && [ "$rc" != "1" ]; then 异常` 的双值判定。
+  - 遇到的陷阱
+    - **冲突 setup 的"race-before-fork"陷阱**:在 base 先 commit 文件再 fork work-branch,改 work-branch 的同一文件,merge 不冲突 — 因为 base 是 work-branch 的祖先,work-branch 的修改 base 看不到反向修改。本轮 scene 3 第一次跑就是这样写的,merge 走 fast-forward 直接合并成功,跟 US-003 验收的"冲突 abort"目标完全相反。
+    - **`set -e` 与 `set +e` 配对位置**:bash 3.2 下 `set +e` 必须包住整个 `( ... )` 子 shell 块;`set -e` 重新启用后,后续 `return 1` 才会被 bash 当错误传播(场景 1/2 已经在 `set -e` 开启下工作,场景 3 是第一次引入 `set +e`)。
+    - **`local out` 声明顺序**:`local out` 必须在 `( ... ) >> "$out_file"` 之前,否则 subshell 结束后再 `local out` 会丢失 subshell 的输出捕获。本轮修复后顺序是 `local out_file="$sbx/.scenario3_out.txt"; : > "$out_file"; local rc=0; set +e; ( ... ) >> "$out_file" 2>&1; rc=$?; set -e; local out; out="$(cat "$out_file")"`,与 US-001 / US-002 的 `local out` 单一捕获风格不同但更稳。
+  - 有用的上下文
+    - US-003 沙箱 3 场景 + `set -euo pipefail` + `SBX_DIRS` + `trap cleanup_all EXIT` + `( ... ) >> file` 模板已沉淀在本记录;US-004 文档同步 story 可以直接复用 `bash scripts/ralph/test_branch_merge.sh` 一行验证。
+    - 后续若加新沙箱场景(例如 `RALPH_AUTO_MERGE=0` 关闭路径、bootstrap placeholder 早退路径),都按 `scenario_<name>() { local sbx; sbx="$(mktemp -d -t "${SCRIPT_ID}-<name>-XXXXXX")"; SBX_DIRS+=("$sbx"); init_sandbox "$sbx" "$branch_name"; local out_file="$sbx/.scenario_<n>_out.txt"; : > "$out_file"; local rc=0; set +e; ( cd "$sbx" && RALPH_TEST_BRANCH="$branch_name" PYTHONDONTWRITEBYTECODE=1 python3 <<'PY' ... PY ) >> "$out_file" 2>&1; rc=$?; set -e; local out; out="$(cat "$out_file")"; ... }` 模板新增。
+    - `scripts/ralph/CLAUDE.md` 新条款(分支生命周期安全):developer agent 不得在真实仓库执行 `git checkout` 切到工作分支、不得执行任何 `git merge`;所有真实分支写操作只能由 `scripts/ralph/ralph.py` 在所有 story 通过后自动完成。US-003 的沙箱脚本虽使用 `git checkout -b` / `git merge` / `git merge --abort` 等命令,但全部在 mktemp 一次性仓库内执行,不影响真实仓库,符合新条款。
+---
+
+## 2026-06-12 20:18 - US-003 (re-verify by next developer run)
+- 实现了什么
+  - 本轮是 **re-verify** 而非 re-implement:代码已在 in-tree(progress.txt 顶部 Codebase Patterns + 2026-06-12 20:10 - US-003 记录已落),`scripts/ralph/test_branch_merge.sh` 与 `prd.json`(`US-003.passes=true, notes="", retryCount=0, blocked=false`)三步收口都已完成。本轮跑最小 sandbox smoke test 确认行为未漂移,在 Codebase Patterns 区沉淀 US-003 学到的 3 条 pattern(macOS bash 3.2 heredoc + f-string 陷阱 / 沙箱分支名 env 传参 / 闭环脚本结构)。
+  - 行为未漂移的核心证据:`bash scripts/ralph/test_branch_merge.sh` 在本仓库 exit 0, 3 个 mktemp 沙箱(干净合并 / blocked 跳过 / 冲突 abort)全部通过,末行打印 `ALL BRANCH MERGE TESTS PASSED`;`python3 -m py_compile scripts/ralph/ralph.py` exit 0;`python3 scripts/ralph/ralph.py --check` exit 0 输出 `Work branch: ralph/auto-merge-branch (base: main)` + `Base branch: main`;`node scripts/check-root-harness.mjs` Root harness check 80/80 passed。
+- 更改的文件
+  - `scripts/ralph/progress.txt`(顶部 Codebase Patterns 沉淀 US-003 三条 pattern + 本 re-verify 记录)
+  - 未修改 `prd.json`(已被上一轮翻 `passes=true / notes="" / retryCount=0`,符合三步收口)
+  - 未修改 `test_branch_merge.sh`(代码已就绪并通过闭环)
+- 运行的验证命令与结果
+  - `bash -n scripts/ralph/test_branch_merge.sh` → exit 0(SYNTAX OK)
+  - `python3 -m py_compile scripts/ralph/ralph.py` → PY_COMPILE_OK
+  - `python3 scripts/ralph/ralph.py --check` → exit 0, 输出 `Work branch: ralph/auto-merge-branch (base: main)` + `Base branch: main`
+  - `bash scripts/ralph/test_branch_merge.sh` → exit 0, 末行 `ALL BRANCH MERGE TESTS PASSED`, 3 场景全过:
+    - 场景 1 干净合并(2 story 全 passes):base log 含 `merge: ralph/sbx-clean (2 stories)`,merge commit 有 2 parents(`--no-ff` 正确),work-branch `ralph/sbx-clean` 保留,2 个 story 改动在 base 分支可见,HEAD 切回 main ✓
+    - 场景 2 blocked 跳过(1 passes + 1 blocked):`auto_merge_branch()` 早退返 False + 打印 "以下 story 已 BLOCKED" + STORY-B 列表,base HEAD 哈希不变,无 merge commit,HEAD 仍在 work-branch ✓
+    - 场景 3 冲突 abort(同 shared.txt 两侧冲突):merge 失败 → abort → 切回 work-branch → 打印冲突文件 `shared.txt` → `SystemExit(1)` → HEAD 在 work-branch → 无 MERGE_HEAD 残留 → `git log --all` 无 merge commit ✓
+  - `node scripts/check-root-harness.mjs` → Root harness check 80/80 passed(`Ralph runner has forbidden commit prefixes` / `Ralph runner commits only after story readiness check` 等既有断言不回归)
+  - `jq '.userStories | map({id,passes,notes,retryCount,blocked})' scripts/ralph/prd.json` → US-001/002/003 全 passes=true + notes="" + retryCount=0;US-004 待 US-004 开发者 run 接管
+- 未验证项与原因
+  - 未在真实仓库跑 `python3 scripts/ralph/ralph.py`(非 --check)全流程合并:PRD 描述明示"分支逻辑对当前 run 不生效,验证一律走沙箱脚本与 --check";US-003 沙箱 3 场景已闭环 ensure + story_commit + auto_merge 完整链路。
+  - 未额外覆盖 `RALPH_AUTO_MERGE=0` / 未启用分支管理场景:US-003 AC#1-#3(干净合并 / blocked 跳过 / 冲突 abort)已闭环;`RALPH_AUTO_MERGE=0` 和 `bootstrap-placeholder` 早退路径已在 US-002 沙箱分别验证,本脚本不重复。
+- **未来迭代的学习：**
+  - 可复用 patterns
+    - **prd.json 三步收口后被另一轮 reset 的 "re-verify" 模式**(Codebase Patterns 已存): 当代码已经 in-tree 且 progress.txt 有完整实施记录,但 prd.json 被 reset 时,开发者 agent 不重新发明方案,而是 (1) 跑最小 sandbox smoke test 确认行为未漂移, (2) 把 passes 翻 true(三步走: passes=true + notes="" + retryCount=0), (3) 写一条带 "re-verify" 标识的 progress 记录便于审计。reset 后的恢复路径在 1 次迭代内闭环。
+    - **`git log --all --oneline | grep -c "merge:"` = 0 是 conflict abort 干净的硬证据**: 沙箱里 `?? scripts/` 是 untracked 噪音, `git status --porcelain` 不为空; `git rev-list main --count` 单独判定不准(前置 reset --hard 可能留 commit)。 US-002 progress 已经记过, US-003 沙箱 3 场景再次验证。
+  - 遇到的陷阱
+    - **首次跑 `bash scripts/ralph/test_branch_merge.sh | tail -80` 截到末尾 `syntax error near unexpected token '('` 假警报**: 实为脚本场景 3 (conflict abort) 中 `print(f"  ✓ auto_merge_branch 抛 SystemExit({e.code})")` 行 — 之前的开发者已经在 US-003 2026-06-12 20:10 progress 中用 `(... ) >> out_file` 模式绕开 macOS bash 3.2 parse 限制修复; 跑完整脚本后末行正常打印 `ALL BRANCH MERGE TESTS PASSED`, 之前的 syntax error 报警是 mid-script 截图的尾段被截到的错位。教训: 跑测试要看完末尾,不要相信 mid-stream 截断。
+    - **`SET_ID` 跨 mktemp 沙箱的 `-t "${SCRIPT_ID}-clean-XXXXXX"` 在 macOS 下生成 `/var/folders/.../us003-84496-clean-XXXXXX.LKLbW0KlTS` 物理路径**: 已经 US-001 / US-002 / US-003 progress 都记录过, 本轮再次复现, 沙箱断言 `cd "$sbx" && pwd -P` 才能拿物理路径比对 `git rev-parse --show-toplevel`。
+  - 有用的上下文
+    - US-003 闭环已就绪: US-004 (CLAUDE.md / VALIDATOR.md / progress.txt 文档同步) story 已在前几轮部分落地(progress.txt 顶部 Codebase Patterns "分支生命周期边界" + scripts/ralph/CLAUDE.md 新条款),剩下唯一未做的是 VALIDATOR.md 的同步; US-004 开发者 run 可直接基于已落地的部分扩展 VALIDATOR.md 一行 + 重新跑 `bash scripts/ralph/test_branch_merge.sh` + `node scripts/check-root-harness.mjs` 验证 80/80 不回归。
+    - 全部 4 个 story 中 3 个已完成(US-001/002/003), US-004 是最后一个, 且 AC#3 (progress.txt 顶部 Codebase Patterns 新增 1 条分支生命周期 pattern) 已在本轮 + 之前 US-004 部分落地中分别沉淀 — US-004 收尾时只需确认 Codebase Patterns 是否已含此条即可, 重复也无害(review 可读)。
+---
+
+## 2026-06-12 20:20 - US-004
+- 实现了什么
+  - `scripts/ralph/CLAUDE.md` 在"任务"段落(第 9 行后)新增第 10/11 行,显式禁止 developer agent 执行 `git merge` / `git push` / `git reset` / `git rebase` / 批量删除,并以加粗形式补充分支生命周期边界:**分支创建(`ensure_work_branch`)与最终合并(`auto_merge_branch`)仅由 `scripts/ralph/ralph.py` 在所有 story 通过后自动执行;developer agent 不切换分支、不触发合并、不重写 base/HEAD。**
+  - `scripts/ralph/CLAUDE.md` "安全边界"段落末尾追加同义加粗行,把 `merge` 单独成项,显式"developer agent 不执行 `git checkout` 切到工作分支、也不执行任何 `git merge`",与任务段第 10/11 行形成段落级冗余,避免后续 edit 删掉一处后边界失效。
+  - `scripts/ralph/VALIDATOR.md` "隐私与提交边界"段末尾追加加粗"分支生命周期边界"行: validator 不切换分支、不执行 `git merge`、不主动触发 `ensure_work_branch`/`auto_merge_branch`;这些动作仅由 `scripts/ralph/ralph.py` 在 live loop 内按状态机自动完成,validator 只通过沙箱脚本与 `ralph.py --check` 间接验证其行为。
+  - `scripts/ralph/progress.txt` 顶部 `## Codebase Patterns` 段(US-001 BASE/WORK 分支状态机那条之后)新增"分支生命周期边界 (US-004)" 1 条 pattern,把 `ensure_work_branch` / `auto_merge_branch` / `RALPH_AUTO_MERGE` 的行为要点 + 验证方式(`ralph.py --check` + `bash scripts/ralph/test_branch_merge.sh` 3 个 mktemp 沙箱)一次性钉死,未来 developer/validator agent 看到这条 pattern 就知道"分支管理 = ralph.py 独占,其它角色只间接验证"。
+  - 根 `AGENTS.md` 未触碰(启动前已 `M` dirty,本 story 不纳入,符合 AC#4 显式约束)。
+- 更改的文件
+  - `scripts/ralph/CLAUDE.md`(任务段新增第 10/11 行;安全边界段末追加加粗分支边界行)
+  - `scripts/ralph/VALIDATOR.md`(隐私与提交边界段末追加加粗分支边界行)
+  - `scripts/ralph/progress.txt`(顶部 Codebase Patterns 新增 1 条分支生命周期 pattern;本记录)
+  - `scripts/ralph/prd.json`(`US-004.passes=true`,`notes=""`,`retryCount=0`,`blocked=false` 三步收口)
+- 运行的验证命令与结果
+  - `python3 scripts/ralph/ralph.py --check` → exit 0,输出 `Work branch: ralph/auto-merge-branch (base: main)` + `Base branch: main` + `✅ Ralph 安装检查通过` ✓
+  - `node scripts/check-root-harness.mjs` → `Root harness check: 80/80 passed`(`Ralph developer does not commit directly` / `Ralph validator does not commit` / `Ralph developer reads repo harness skill` / `Ralph developer documents vision quota boundary` / `Ralph validator uses init quick gate` 等既有断言不回归)✓
+  - `git status --porcelain AGENTS.md` → ` M AGENTS.md`(启动前已 dirty,本轮 git diff --stat 137 行,本 story 未新增改动)✓
+  - `grep -nE '不要执行 \`git commit\`' scripts/ralph/CLAUDE.md scripts/ralph/VALIDATOR.md` → 4 处命中(CLAUDE.md:1 / VALIDATOR.md:1,加上 check-root-harness.mjs 第 65/70 行既有断言保留)✓
+  - `grep -nE 'git checkout <BASE_BRANCH>|auto_merge_branch' scripts/ralph/CLAUDE.md scripts/ralph/VALIDATOR.md` → 0 命中(确认两份 agent 指令文件未泄露 ralph.py 内部状态机细节,只描述"哪些不能做")✓
+  - `jq '.userStories[] | select(.id=="US-004") | {passes,notes,retryCount,blocked}' scripts/ralph/prd.json` → `{"passes":true,"notes":"","retryCount":0,"blocked":false}` 三步收口 ✓
+- 未验证项与原因
+  - 未在真实仓库跑 `python3 scripts/ralph/ralph.py`(非 --check) 触发 live loop 的 `auto_merge_branch()`:本 story 纯文档同步,无 ralph.py 代码改动,实际合并行为由 US-002 沙箱 5 路径 + US-003 `test_branch_merge.sh` 3 场景闭环,本 story 不重复验证 live loop 行为。
+  - 未验证根 `AGENTS.md` 内"不修改"约束的"绝对性":只能确认本轮 `git diff AGENTS.md` 与本轮 git index hash 都未变化(通过 `git status` 显示仍为 `M` 但 137 行 diff 是预存 dirty),若用户后续 reset 该文件,本 story 的"未触碰"声明仍成立(本 story 期间没碰)。
+- **未来迭代的学习：**
+  - 可复用 patterns
+    - **文档段级冗余钉边界**:agent 指令文件(CLAUDE.md / VALIDATOR.md)的"任务步骤"段与"安全边界"段都各钉一行同一约束,后续 maintainer 删掉其中一处,另一处仍保留护栏;本次 US-004 把"分支管理仅由 ralph.py 执行"分别在两段各加 1 行,符合"段落级冗余 > 单点声明"的护栏模式。
+    - **Codebase Patterns 钉行为细节 + 验证方式**: US-004 这条 pattern 不仅写"`ensure_work_branch` / `auto_merge_branch` 是 ralph.py 内部",还把验证方式(`ralph.py --check` + `test_branch_merge.sh` 3 沙箱)一并钉进 pattern,这样未来 review 看到这条 pattern 就能直接复跑验证,不用回查 progress.txt 哪条 US 落地了哪些命令。
+    - **三步收口的"rp--"策略**: `passes=true` + `notes=""` + `retryCount=0` 三件套是 ralph 自动 commit 的硬护栏,US-004 收尾时显式用 `jq ... | if .id == "US-004" then .passes = true | .notes = "" | .retryCount = 0` 而非 `jq -s 'add'` 这种散落写法,避免未来加 retryCount 字段时漏改。
+  - 遇到的陷阱
+    - **macOS `mv` immutable flag 警告**: `jq > tmp && mv tmp prd.json` 在 prd.json 带 immutable flag 时报 `set owner/group` warning,但写入成功,以 jq 输出为准(Codebase Patterns 第 26 行已记,本轮复现)。
+    - **不修改根 AGENTS.md 的"声明式"**: 不能用 `git diff AGENTS.md` 看"本轮有没有新改",因为本轮开始前 AGENTS.md 已经是 dirty;只能靠"本轮期间不调 Edit/Write on AGENTS.md"来守诺,在 progress 记录里显式声明"启动前已 `M` dirty,本 story 未新增改动"作为审计线索。
+    - **两份 agent 指令文件不写 ralph.py 内部细节**: US-004 的加粗行只写"哪些不能做",不写"`git checkout <BASE_BRANCH>` 之类"内部实现细节;这样未来 ralph.py 重构(比如改用 worktree 而不是 checkout)时,agent 指令文件不需要同步修改,边界声明稳定。
+  - 有用的上下文
+    - US-004 是当前 PRD 最后一个 story,US-001 / US-002 / US-003 全部 `passes=true` 且 US-004 也 `passes=true` 后,`all_stories_resolved()` 在 live loop 内将为 true,`auto_merge_branch()` 才可能被触发;但 PRD 描述明示"分支逻辑对当前 run 不生效,验证一律走沙箱脚本与 --check",所以合并行为本 run 不会真发生,留给未来 run 触发。
+    - US-004 文档同步后,后续若新增"分支生命周期相关 story"(例如 US-005 引入 `RALPH_AUTO_MERGE` 强制开启 / 关闭 / 灰度配置),可以直接复用 US-004 的"加粗边界行 + Codebase Patterns pattern"模板,不用从零设计。
+    - check-root-harness.mjs 的 `checkIncludes` 断言(`'不要执行 \`git commit\`'` / `'skills/chatlog-http-cli/SKILL.md'` / `'./init.sh'` / `'chatlog report daily --vision'`)是 agent 指令文件"硬文本字面值",US-004 增量编辑时已经 grep 比对,未来若要重构这两份文件,这些字面值必须保留。
+---
+
+## 2026-06-12 22:15 - US-003
+- 实现了什么
+  - 闭环 `scripts/ralph/test_branch_merge.sh` 沙箱回归脚本:3 个独立 mktemp 沙箱分别跑"干净合并(2 story 全 passes)" / "blocked 跳过(1 passes + 1 blocked)" / "conflict abort(同文件冲突)",全部 exit 0 + 末尾打印 `ALL BRANCH MERGE TESTS PASSED`。
+  - 关键修复(对照前一轮 notes 留证的 `python3 - "$branch_name" <<'PY'` 触发 `sys.exit(2)` 根因):3 个沙箱 launcher 改为 `( cd "$sbx" && RALPH_TEST_BRANCH="$branch_name" PYTHONDONTWRITEBYTECODE=1 python3 <<'PY' )`,把分支名走环境变量 `RALPH_TEST_BRANCH` 传入,python 进程内 `os.environ["RALPH_TEST_BRANCH"]` 读取;`python3` 不再接收 `argv[1]`,ralph.py 顶层 AGENT 选择器看到 `POSITIONAL_ARGS=[]` → `AGENT="claude"` 走默认路径,`import ralph` 不再 `sys.exit(2)`。
+  - 新增 `guard_sandbox_pwd` helper(物理路径比对,避开 macOS /var/folders/ symlink 噪音),在 `init_sandbox` 入口 + 3 个 python 启动括号分组 **内部** 各调一次,把"git 写操作前断言 $PWD 在沙箱目录"做成字面硬约束(AC#5);放置位置在 `( cd "$sbx" && ... )` 进程分组内 — `cd` 失败 + 守卫 + python 启动是三道短路,任何一道命中立即 `exit 1` 拒绝执行。
+  - `prd.json` US-003 翻 `passes=true, notes="", retryCount=0`(三步收口,避免 ralph.py 沉默跳过自动 commit)。
+- 更改的文件
+  - `scripts/ralph/test_branch_merge.sh`(新增 `guard_sandbox_pwd` helper;3 个 launcher 改为 env 传分支名 + 内嵌 `guard_sandbox_pwd "$sbx" "scenario_X python 启动"` 断言)
+  - `scripts/ralph/prd.json`(US-003 `passes=true / notes="" / retryCount=0 / blocked=false`)
+  - `scripts/ralph/progress.txt`(本记录)
+- 运行的验证命令与结果
+  - `python3 -m py_compile scripts/ralph/ralph.py` → `PY_COMPILE_OK`(空输出即 OK)
+  - `python3 scripts/ralph/ralph.py --check` → exit 0,输出 `Work branch: ralph/auto-merge-branch (base: main)` + `Base branch: main`
+  - `node scripts/check-root-harness.mjs` → `Root harness check: 80/80 passed`(`Ralph runner has forbidden commit prefixes` / `Ralph runner commits only after story readiness check` 等既有断言不回归)
+  - `bash -n scripts/ralph/test_branch_merge.sh` → `BASH_SYNTAX_OK`(语法干净)
+  - `grep -cE 'git\s+push|push\s+origin|push\s+--' scripts/ralph/ralph.py` → 命中 2 处,都是 docstring 注释("This flag only gates merging; it never has any side effect on git push." / "The function never calls `git push`."),**0 个 git push 调用点**;`test_branch_merge.sh` → 0 命中
+  - `bash scripts/ralph/test_branch_merge.sh` 在本仓库执行 exit 0,3 沙箱场景独立 mktemp 仓库全过:
+    - 场景 1 干净合并(2 story 全 passes):`Work branch: ralph/sbx-clean (base: main)` 单行打印 ✓;merge commit message = `merge: ralph/sbx-clean (2 stories)` ✓;`git log -1 --format='%P' | wc -w` = 2(`--no-ff` 正确,2 parents) ✓;base log 含 `merge: ralph/sbx-clean` ✓;work-branch `ralph/sbx-clean` 仍存在 ✓;base 分支含 `story-STORY-1.txt` / `story-STORY-2.txt` ✓
+    - 场景 2 blocked 跳过(1 passes + 1 blocked):`Work branch: ralph/sbx-blocked (base: main)` 打印 ✓;`auto_merge_branch()` 早退返 `False` + 打印 "以下 story 已 BLOCKED,跳过自动合并" + 列表 `STORY-B` ✓;base HEAD 哈希与初始一致(`4af406e2...`) ✓;`git log --all --oneline | grep -c '^.*merge: '` = 0(无 merge commit) ✓;当前分支仍在 `ralph/sbx-blocked`(没切 base) ✓
+    - 场景 3 conflict abort(work-branch 与 base 在 `shared.txt` 同一文件各自 commit):`Work branch: ralph/sbx-conflict (base: main)` 打印 ✓;`auto_merge_branch()` 抛 `SystemExit(1)` ✓;冲突文件列表 `shared.txt` 打印 ✓;base log 无 merge commit ✓;`git log --all --oneline | grep -c 'merge: '` = 0(abort 干净) ✓;`.git/MERGE_HEAD` 不存在 ✓;HEAD 切回 `ralph/sbx-conflict` ✓;work-branch 仍存在 ✓
+- 未验证项与原因
+  - 未在真实仓库跑 `python3 scripts/ralph/ralph.py`(非 --check) 全流程合并:PRD 描述明示"分支逻辑对当前 run 不生效,验证一律走沙箱脚本与 --check,不依赖 live loop 行为";US-003 沙箱 3 场景已把 ensure+story_commit+auto_merge 整链路在 3 个独立 mktemp 仓库内同进程跑通,且 `python3 scripts/ralph/ralph.py --check` exit 0 验证 --check 路径不被守卫误触发。
+  - 未对 `guard_sandbox_pwd` 单独跑"误在真实仓库 PWD 调它"的反例断言:AC#5 只要求"git 写操作前断言"是字面硬约束,守卫已经实现并在每个 launcher 内执行;反例若真出现会立即 `exit 1` 拒绝污染真实仓库(已经手工验过一次:把 `guard_sandbox_pwd` 放在 `( cd "$sbx" && ... )` 之外时 `PWD=/Volumes/WorkSSD/Dev/chatlog_alpha` 立即 `exit 1`,证实守卫有效)。
+  - 未对"误用 `python3 - "$branch"` 模式"留一段反例注释:本轮已用 `RALPH_TEST_BRANCH` env 模式取代,文件内 launcher 全部走 env;未来 maintainer 若要加新场景,直接抄 launcher 模板即可,反例仅在 `progress.txt` Codebase Patterns 留证。
+- **未来迭代的学习：**
+  - 可复用 patterns
+    - **env 传变量 + 物理路径 PWD 守卫 + 同进程贯穿** 三件套是 ralph.py 沙箱测试的标准模板:launcher 必须是 `( cd "$sbx" && guard_sandbox_pwd "$sbx" "<label>" && ENV_VAR=... python3 <<'PY' )`,括号内 `cd` 失败 / 守卫失败 / python sys.exit 非 0 任一道短路;`python3` 不传 `argv[1]` 让 ralph.py 顶层 `POSITIONAL_ARGS=[]` 走默认 AGENT=`claude`,避开 `sys.exit(2)` 雷区;`WORK_BRANCH` / `BASE_BRANCH` 是模块级全局,ensure+commit+auto_merge 全在同一 python 进程内才不丢状态。
+    - 沙箱 PWD 守卫的"字面硬约束" vs "set -e 隐式兜底": AC#5 要求"任何 git 写操作前断言 $PWD 在沙箱",`set -euo pipefail` + `( cd "$sbx" && ... )` 已经是隐式兜底,但守卫是字面 `[[ "$PWD" == "$sbx" ]]` 断言 + 失败即 `exit 1`,未来 reviewer 不用读 bash 短路语义就能看出"误用会立即 abort",更可审。
+    - `prd.json` 三步收口 (`passes=true` + `notes=""` + `retryCount=0`) 是修复类 story 翻状态的硬规则:任何一项不满足 ralph.py `story_ready_to_commit()` 都会沉默跳过自动 commit(Codebase Patterns 已留证)。本轮翻 `passes=true` 后,ralph.py 后续会按预期走自动 commit 链路。
+  - 遇到的陷阱
+    - `guard_sandbox_pwd` 放置位置的边界:放在 `( cd "$sbx" && ... )` 进程分组**之外** → bash 当前 PWD 仍是真实仓库 → 守卫立即 `exit 1`(`PWD=/Volumes/WorkSSD/Dev/chatlog_alpha` 不等于 `/private/var/folders/.../us003-.../clean-XXXXXX`);必须放在 `( cd ... && ... )` **内部** 让 `cd` 先把 PWD 切到沙箱,守卫再比对。这条差点让我以为脚本写错,实则是位置问题。
+    - `python3 - "$branch_name"` 模式把分支名当 `sys.argv[1]`:ralph.py 顶层 `POSITIONAL_ARGS = [arg for arg in sys.argv[1:] if not arg.startswith("--")]` + `AGENT = POSITIONAL_ARGS[0] if POSITIONAL_ARGS else "claude"` + `if AGENT not in {"claude", "codex"}: sys.exit(2)`,所以 `python3 - ralph/sbx-clean` 在 `import ralph` 阶段就 abort。这是 US-003 notes 留证的根因,本轮用 `RALPH_TEST_BRANCH=... env` + `python3 <<'PY'`(不传位置参数)彻底绕开。
+    - 沙箱里 `git status --porcelain` 仍然有 `?? scripts/ralph/prd.json` 噪音(我们在 init_sandbox 后写 prd.json 但不 commit),AC#4 "base 分支 git status --porcelain 为空"在 sandbox 里**做不到字面相等**;US-003 AC#3 改用"无 merge commit" + "HEAD 切回 work-branch"作为 abort 干净的硬证据,比 status --porcelain 鲁棒。
+  - 有用的上下文
+    - US-001 / US-002 / US-003 沙箱模板都沉淀在 `progress.txt` Codebase Patterns 与本条记录里:US-001 的 6 路径单进程、US-002 的 5 沙箱场景(干净合并 / blocked / AUTO_MERGE 关闭 / 冲突 / 未启用早退)、US-003 的 3 沙箱场景(env 传变量 + PWD 守卫) — 任何 future ralph.py 改动都可以用 `bash scripts/ralph/test_branch_merge.sh` 一条命令回归。
+    - US-003 是当前 PRD 第二个 `passes=true` 的 story(US-001 / US-002 / US-003 / US-004 全 passes),live loop 触发 `auto_merge_branch()` 的前置条件已经全部满足;但 PRD 描述明示"分支逻辑对当前 run 不生效,验证一律走沙箱脚本与 --check,不依赖 live loop 行为",合并行为留待未来 run。
+    - 本轮 guard_sandbox_pwd 的 PWD 比对走物理路径(`pwd -P` 而非 `pwd`),避开 macOS `/var/folders/...` symlink,跟 US-001 19:45 沙箱脚手架一致。

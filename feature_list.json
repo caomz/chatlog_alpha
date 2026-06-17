@@ -1,5 +1,5 @@
 {
-  "active_feature_id": "graph-knowledge-digest-2026-06-10",
+  "active_feature_id": "db-runtime-graph-truth-harness-2026-06-12",
   "features": [
     {
       "id": "graph-knowledge-digest-2026-06-10",
@@ -711,6 +711,94 @@
         "global-agents-rules-refresh-2026-06-05"
       ],
       "side_task": true
+    },
+    {
+      "id": "ralph-auto-merge-branch-2026-06-12",
+      "name": "Ralph Auto Merge Branch",
+      "title": "Ralph branch lifecycle: work branch per run, auto-merge on full pass",
+      "description": "ralph.py reads prd.json branchName to create/switch a work branch at startup so story commits land on the branch; when all stories pass (zero blocked) it auto-merges --no-ff back into the base branch. Blocked stories skip the merge; conflicts abort safely keeping the work branch; never pushes. RALPH_AUTO_MERGE env toggle (default on). Source PRD: tasks/prd-ralph-auto-merge-branch.md; Ralph PRD: scripts/ralph/prd.json (branch ralph/auto-merge-branch, 4 stories).",
+      "scope": [
+        "ensure_work_branch() startup branch create/switch with bootstrap-placeholder skip",
+        "auto_merge_branch() final --no-ff merge with blocked-skip and conflict-abort paths",
+        "Sandbox regression script scripts/ralph/test_branch_merge.sh (success/blocked/conflict scenarios in mktemp repo)",
+        "Docs sync: scripts/ralph/CLAUDE.md + VALIDATOR.md merge boundary; no root AGENTS.md changes"
+      ],
+      "done_criteria": [
+        "All 4 stories in scripts/ralph/prd.json pass with evidence",
+        "python3 -m py_compile scripts/ralph/ralph.py and python3 scripts/ralph/ralph.py --check pass",
+        "bash scripts/ralph/test_branch_merge.sh exits 0 with ALL BRANCH MERGE TESTS PASSED",
+        "node scripts/check-root-harness.mjs stays 80/80; no git push anywhere in ralph.py"
+      ],
+      "evidence": [
+        "All 4 stories passes=true in archived prd.json (archive/2026-06-12-auto-merge-branch/)",
+        "ralph.py ensure_work_branch + auto_merge_branch implemented; bash scripts/ralph/test_branch_merge.sh -> ALL BRANCH MERGE TESTS PASSED (3 scenarios)",
+        "python3 scripts/ralph/ralph.py --check exit 0 with Work branch/Base branch lines; no git push in ralph.py",
+        "node scripts/check-root-harness.mjs 80/80"
+      ],
+      "dependencies": [
+        "graph-knowledge-digest-2026-06-10"
+      ],
+      "next_step": "Done. ralph.py branch lifecycle live; archived to archive/2026-06-12-auto-merge-branch/.",
+      "status": "done"
+    },
+    {
+      "id": "db-runtime-graph-truth-harness-2026-06-12",
+      "name": "DB Runtime Graph Truth Harness",
+      "title": "Recover WeChat DB query chain, harden temporal graph truth, write back harness methodology",
+      "description": "Restore the WeChat DB query chain from 'looks available' to 'core DBs queryable' (session/contact/message_0 readable via /api/v1/db/tables), make the backend reject unreadable decrypt artifacts before they pollute wcdb_cache, separate listed-vs-queryable status in the DB list, harden temporal graph health truth (progress_pct=100 is not a done state), and write the troubleshooting truth chain back into skills/chatlog-http-cli. Source PRD: tasks/prd-db-runtime-graph-truth-harness.md; Ralph PRD: scripts/ralph/prd.json (branch ralph/db-runtime-graph-truth-harness, 10 stories; US-004/005/010 blocked pending user authorization for destructive runtime recovery).",
+      "scope": [
+        "Read-only DB/graph diagnostic baseline (US-001)",
+        "Backend rejects unreadable decrypt artifacts via isReadableSQLite before os.Rename (US-002)",
+        "DB list distinguishes listed vs queryable + frontend explicit error (US-003)",
+        "BLOCKED: safe key rescan + bad-cache cleanup + service restart, user-authorized only (US-004)",
+        "BLOCKED: frontend DB panel recovery closed loop (US-005, depends US-004)",
+        "Temporal graph health truth chain: status + readonly SQLite bucket + digest (US-006)",
+        "Graph digest non-summary verification without disturbing queue (US-007)",
+        "Write runtime truth methodology back into skills/chatlog-http-cli (US-008)",
+        "Root state + done recording (US-009)",
+        "BLOCKED: end-to-end recovery acceptance (US-010, depends US-004)"
+      ],
+      "done_criteria": [
+        "All non-blocked stories (US-001/002/003/006/007/008/009) pass with command-level evidence",
+        "go test ./internal/wechatdb/... ./internal/chatlog/temporalgraph and go build ./... pass",
+        "node scripts/check-root-harness.mjs stays 80/80; node skills/chatlog-http-cli/scripts/check-harness-skill.mjs passes",
+        "US-004/005/010 remain blocked until user same-turn authorizes destructive runtime recovery; all evidence verifies path/mtime/size/count/status/bucket only, never prints chat body or real key"
+      ],
+      "evidence": [
+        {
+          "command": "scripts/ralph/prd.json US-001 passes=true (2026-06-16): curl /health ok; /api/v1/db lists 12 groups / 18 DBs; /api/v1/db/tables on session/contact/message_0 returns HTTP 500 with stat no such file or directory (handler path bug, db_storage/<file> missing group/ subdir); 17/17 ~/.chatlog/wcdb_cache/*.db sqlite_master rc=26 file is not a database; sample header = SQLite format 3 size 10153984",
+          "result": "PASS: read-only diagnostic baseline; no DB/cache/key files touched; no model call; no service restart; evidence in scripts/ralph/progress.txt 2026-06-16 18:30 section."
+        },
+        {
+          "command": "scripts/ralph/prd.json US-002 passes=true (2026-06-16): isReadableSQLite gate added before os.Rename(tmpPath, outPath) in internal/wechatdb/wcdbapi/client.go ensureDecrypted; 3 focused tests in client_test.go (TestIsReadableSQLiteRejectsBadCache, TestEnsureDecryptedRejectsUnreadableCacheAndClearsCacheEntry, TestIsReadableSQLiteAcceptsValidSQLite)",
+          "result": "PASS: go test ./internal/wechatdb/wcdbapi 3/3 PASS in 1.665s; go build ./... exit 0; ./init.sh quick gate PASS; actionable error 'all_keys.json may be stale or invalid; rescan WeChat keys and clear wcdb cache after backup (src=...)' never embeds key content."
+        },
+        {
+          "command": "scripts/ralph/prd.json US-003 passes=true (2026-06-16): internal/wechatdb/datasource/dbentry/dbentry.go new DBEntry shared type; DataSource interface GetDBsWithStatus; wcdb classifyDB returns reason token (file_not_found / stat_error / core_db_unreadable) with len<=32 and no path leakage; HTTP /api/v1/db returns {dbs, unavailable, core_dbs_unavailable, unavailable_reason}; frontend loadDBList parses new shape with explicit danger banner and no longer probes /api/v1/db/tables",
+          "result": "PASS: go test -count=1 ./internal/wechatdb/... all ok including US-002 tests; go build ./... exit 0; node -e Function() loadDBListString parses 5291 chars; backward compat: old 5030 binary returns bare map[group][]path; make build produces new bin/chatlog 34.7MB; ./init.sh quick gate PASS."
+        },
+        {
+          "command": "scripts/ralph/prd.json US-006 passes=true (2026-06-16): curl /api/v1/graph/status?format=json returns last_error=null, progress_pct=100, failed=531, failed_buckets {auth_error=141 config_error=249 json_decode_error=10 network_timeout=97 sensitive_output_1027=27 unclassified=7}; readonly SQLite mirror via Go ClassifyFailedError on failed rows returns same bucket counts; LOWER LIKE on 'file is not a database' OR 'db_not_database' returns 0",
+          "result": "PASS: HTTP+SQLite ground truth aligned 100%; file-is-not-a-database bucket strict=0; progress_pct=100 caveat written to progress.md; no graph/resume/rebuild/pause/config write; go build ./... exit 0."
+        },
+        {
+          "command": "scripts/ralph/prd.json US-007 passes=true (2026-06-16): cmd/chatlog/cmd_report.go --summary flag description literal '(consumes quota, default false)'; go run . report graph --days 7 exit 0 with summary_used=false; reports/graph-digest-2026-06-09_2026-06-16.md size 3709 mtime current run; grep -c '^## ' = 7 fixed H2 sections; HTTP failed=531 + SQLite done=21587 failed=531 unchanged before and after",
+          "result": "PASS: digest non-summary path zero model call; queue not disturbed; git status --porcelain no graph-digest-*.md entries; go build ./... exit 0."
+        },
+        {
+          "command": "scripts/ralph/prd.json US-008 passes=true (2026-06-16): skills/chatlog-http-cli/references/db-truth-chain.md + graph-truth-chain.md new files (5-step verification command set, 3-bucket error classification, 10-bucket HA graph classifier, progress_pct=100 caveat, Known False Greens table 8 rows); SKILL.md Verification Gate precheck-boundary blockquote; feedback-audit.md Known False Greens + cross-reference",
+          "result": "PASS: node skills/chatlog-http-cli/scripts/check-harness-skill.mjs 29/29 (baseline preserved); node scripts/check-root-harness.mjs 80/80; grep -rn -E 'wxid_[a-z0-9]{8,}|sk-[a-zA-Z0-9]{16,}|[a-f0-9]{32,}' skills/chatlog-http-cli/ 0 hits; ./init.sh quick gate PASS."
+        },
+        {
+          "command": "scripts/ralph/prd.json US-009 passes=true (2026-06-16): feature_list.json + progress.md + session-handoff.md reflect 7/10 passes + 3 blocked; jq empty feature_list.json; node scripts/check-root-harness.mjs 80/80; no reports/ .cache/ logs/ outputs/ committed; no git commit/push/reset/rebase/merge performed",
+          "result": "PASS: this record; no git write operations performed; no destructive runtime action."
+        }
+      ],
+      "dependencies": [
+        "ralph-auto-merge-branch-2026-06-12"
+      ],
+      "next_step": "7/10 stories pass autonomously (US-001/002/003/006/007/008/009). US-004/005/010 remain blocked=true in scripts/ralph/prd.json pending user same-turn authorization for destructive runtime recovery (force WeChat key rescan + bad wcdb_cache cleanup + service restart). US-010 end-to-end acceptance requires US-004 completion. Ralph autonomous loop waits for user authorization or manual handoff.",
+      "status": "in_progress"
     }
   ]
 }

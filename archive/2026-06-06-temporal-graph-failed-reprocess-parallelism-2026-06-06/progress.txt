@@ -1,0 +1,17 @@
+# Ralph Progress
+
+## Codebase Patterns
+- `chatlog_alpha` is a Go local-tool product for Chatlog CLI/TUI/HTTP, WeChat local database access, semantic search, temporal graph processing, and daily reports.
+- Start every Ralph iteration by reading root `AGENTS.md`, `skills/chatlog-http-cli/SKILL.md`, `feature_list.json`, root `progress.md`, root `session-handoff.md`, `scripts/ralph/prd.json`, and this file.
+- Use `./init.sh` as the default quick gate; use focused `go test ./internal/...` for Go logic; use `./init.sh --full` only for broad repo changes.
+- Do not run `chatlog report daily --vision` or `chatlog report daily --summary` unless the PRD story and user authorization explicitly require model/vision calls.
+- Verify private chat-derived workflows through paths, timestamps, counts, HTTP status, structured fields, or error buckets; do not print private message or report contents.
+- Developer agents do not commit directly. `scripts/ralph/ralph.py` commits only after Validator success and excludes startup-dirty paths plus private/cache output directories.
+
+## 2026-06-05 06:47 - US-000
+- Bootstrapped Ralph placeholder state for `chatlog_alpha`.
+- No product code was changed by this placeholder story.
+- Validation target: `python3 scripts/ralph/ralph.py --check`.
+- **未来迭代的学习：**
+  - Replace `scripts/ralph/prd.json` with a real PRD-derived story list before running implementation iterations.
+---

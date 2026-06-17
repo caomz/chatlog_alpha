@@ -412,7 +412,7 @@ func renderHTML(r report, nodes []imageNode, assets map[string]imageAsset) strin
 	metric(&b, "已回复", fmt.Sprint(replied), "按日报规则识别")
 	metric(&b, "图片节点", fmt.Sprintf("%d/%d", resolved, len(nodes)), fmt.Sprintf("未嵌入 %d", failed))
 	metric(&b, "群聊解析", fmt.Sprint(len(r.GroupAnalyses)), "AI summary")
-	metric(&b, "私聊更新", fmt.Sprint(len(r.PrivateUpdates)), "今日私聊会话")
+	metric(&b, "私聊更新", fmt.Sprint(len(r.PrivateUpdates)), "当日私聊会话")
 	write(&b, `</section>`)
 
 	writeTodos(&b, r.Todos)

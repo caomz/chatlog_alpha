@@ -1,0 +1,22 @@
+{
+  "project": "chatlog_alpha",
+  "branchName": "ralph/bootstrap-ai-coding-harness",
+  "description": "Bootstrap placeholder for the chatlog_alpha Ralph automation harness. Replace this file with a real PRD-derived story list before running implementation iterations.",
+  "userStories": [
+    {
+      "id": "US-000",
+      "title": "Bootstrap Ralph automation harness",
+      "description": "As an AI coding operator, I need a safe placeholder PRD so Ralph will not run accidental product work before a real PRD is provided.",
+      "acceptanceCriteria": [
+        "scripts/ralph/prd.json parses as valid JSON",
+        "scripts/ralph/progress.txt exists and documents chatlog_alpha codebase patterns",
+        "python3 scripts/ralph/ralph.py --check passes"
+      ],
+      "priority": 999,
+      "passes": true,
+      "notes": "",
+      "retryCount": 0,
+      "blocked": false
+    }
+  ]
+}

@@ -1,0 +1,85 @@
+{
+  "project": "chatlog_alpha",
+  "branchName": "ralph/auto-merge-branch",
+  "description": "Ralph 分支生命周期: ralph.py 启动时按 prd.json.branchName 创建/切换工作分支，story 提交落在工作分支；全部 story 通过(无 blocked)后自动 --no-ff 合并回启动时的 base 分支；blocked 跳过合并、冲突安全 abort、绝不 push。来源 PRD: tasks/prd-ralph-auto-merge-branch.md。注意: 本 PRD 修改 ralph.py 自身，分支逻辑对当前 run 不生效，验证一律走沙箱脚本与 --check，不依赖 live loop 行为。",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "ralph.py 启动时按 branchName 创建/切换工作分支",
+      "description": "作为 Ralph 运维者，我想让每次 run 的提交落在 prd.json 声明的工作分支上，以便按 run 审计和整体回退。",
+      "acceptanceCriteria": [
+        "scripts/ralph/ralph.py 新增 ensure_work_branch() 函数: 读取 prd.json 的 branchName；当 branchName 为空、不以 ralph/ 开头、或等于 ralph/bootstrap-placeholder 时打印跳过原因并返回 None(保持现有单分支行为)",
+        "main() 在进入迭代循环前调用 ensure_work_branch(): 当前分支已是 branchName 则复用；本地分支已存在则 git checkout；不存在则 git checkout -b 从当前 HEAD 创建；三条路径都打印 'Work branch: <branch> (base: <base>)'",
+        "base 分支取启动时 git rev-parse --abbrev-ref HEAD 的结果，保存到模块级变量供合并阶段使用",
+        "--check 模式只读输出 Work branch 与 Base branch 两行，不执行任何分支切换",
+        "沙箱验证: 在 mktemp -d 的一次性 git 仓库内复制 scripts/ralph/ralph.py 与 dashboard.py 到沙箱 scripts/ralph/ 下(保证 PROJECT_ROOT 解析到沙箱)，写入最小 prd.json，python3 -c 'import ralph; ...' 断言两条路径: 分支不存在时创建并切换(git rev-parse --abbrev-ref HEAD 等于 branchName)、分支已存在时复用不报错；任何 git 写操作前断言 $PWD 位于沙箱目录",
+        "python3 -m py_compile scripts/ralph/ralph.py 通过",
+        "python3 scripts/ralph/ralph.py --check 在本仓库 exit 0 且输出包含 Work branch",
+        "node scripts/check-root-harness.mjs 通过(80/80)"
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": "",
+      "retryCount": 0,
+      "blocked": false
+    },
+    {
+      "id": "US-002",
+      "title": "全部 story 通过后自动合并工作分支回 base 分支",
+      "description": "作为 Ralph 运维者，我想在 run 成功结束时自动把工作分支合并回 base 分支，省去手动合并，同时在 blocked/冲突时绝不产生半成品合并。",
+      "acceptanceCriteria": [
+        "scripts/ralph/ralph.py 新增 auto_merge_branch() 函数: 仅当所有 story passes=true 且 0 个 blocked 时执行合并；存在 blocked story 时打印 blocked 的 story ID 列表并跳过合并",
+        "合并实现: git checkout <base> 后 git merge --no-ff <work-branch> -m 'merge: <branchName> (<N> stories)'；成功后保留工作分支不删除，打印合并 commit hash 与手动删除分支的提示命令",
+        "冲突路径: merge 返回非 0 时执行 git merge --abort，切回工作分支，打印冲突文件列表(git diff --name-only 或 merge 输出)，该路径以非 0 进程退出码结束",
+        "RALPH_AUTO_MERGE 环境变量控制(默认开启，0/false/no 关闭)，关闭时打印提示且不合并；代码中不出现任何 git push 调用",
+        "main() 中 all_stories_resolved() 为 true 的收尾分支调用 auto_merge_branch()；ensure_work_branch 返回 None(未启用分支管理)时跳过合并",
+        "沙箱验证(同 US-001 沙箱模式): 干净合并路径断言 base 分支 git log --oneline -1 含 'merge:' 且工作分支仍存在；blocked 跳过路径断言 base 分支 commit 数不变",
+        "python3 -m py_compile scripts/ralph/ralph.py 通过",
+        "node scripts/check-root-harness.mjs 通过(80/80，含 'Ralph runner has forbidden commit prefixes' 等既有断言不回归)"
+      ],
+      "priority": 2,
+      "passes": true,
+      "notes": "",
+      "retryCount": 0,
+      "blocked": false
+    },
+    {
+      "id": "US-003",
+      "title": "端到端沙箱回归脚本 test_branch_merge.sh (闭环验证)",
+      "description": "作为 Ralph 运维者，我要一条命令就能回归整个分支生命周期(创建→story 提交→合并/跳过/冲突)，防止未来改 ralph.py 时静默破坏合并安全性。",
+      "acceptanceCriteria": [
+        "新增 scripts/ralph/test_branch_merge.sh(bash, set -euo pipefail, trap 清理 mktemp 目录): 在一次性 git 仓库内复制 ralph.py/dashboard.py 并写入含 2 个 story 的最小 prd.json",
+        "场景 1 成功闭环: ensure_work_branch 创建工作分支 → 模拟 2 次 story commit → 全部 passes=true → auto_merge_branch → 断言 base 分支 log 含 merge commit、story 文件在 base 分支可见、工作分支仍存在",
+        "场景 2 blocked 跳过: 其中 1 个 story blocked=true → auto_merge_branch 后断言 base 分支 commit 数与合并前一致(无 merge commit)",
+        "场景 3 冲突 abort: 工作分支创建后在 base 分支对同一文件提交冲突修改 → 合并失败 → 断言 abort 后 base 分支 git status --porcelain 为空且工作分支完好",
+        "脚本任何 git 写操作前断言当前目录位于 mktemp 沙箱内，绝不操作真实仓库；任一断言失败 exit 非 0，全过打印 ALL BRANCH MERGE TESTS PASSED",
+        "bash scripts/ralph/test_branch_merge.sh 在本仓库执行 exit 0 且输出 ALL BRANCH MERGE TESTS PASSED",
+        "python3 -m py_compile scripts/ralph/ralph.py 通过",
+        "node scripts/check-root-harness.mjs 通过(80/80)"
+      ],
+      "priority": 3,
+      "passes": true,
+      "notes": "",
+      "retryCount": 0,
+      "blocked": false
+    },
+    {
+      "id": "US-004",
+      "title": "文档与安全边界同步",
+      "description": "作为后续 agent，我需要文档准确反映'合并只由 ralph.py 执行'的新边界，避免 developer/validator agent 误以为可以自己 merge。",
+      "acceptanceCriteria": [
+        "scripts/ralph/CLAUDE.md 安全边界更新: developer agent 仍然禁止执行任何 merge；补充一行说明分支创建与最终合并仅由 scripts/ralph/ralph.py 在全部 story 通过后自动执行",
+        "scripts/ralph/VALIDATOR.md 增加同样的边界说明: validator 不执行 merge，不切换分支",
+        "scripts/ralph/progress.txt 顶部 Codebase Patterns 新增 1 条分支生命周期 pattern(ensure_work_branch/auto_merge_branch/RALPH_AUTO_MERGE 的行为要点)",
+        "不修改根 AGENTS.md(启动前已 dirty，属用户文件，不纳入本 story)",
+        "python3 scripts/ralph/ralph.py --check exit 0",
+        "node scripts/check-root-harness.mjs 通过(80/80，'Ralph developer does not commit directly' 等文档断言不回归)"
+      ],
+      "priority": 4,
+      "passes": true,
+      "notes": "",
+      "retryCount": 0,
+      "blocked": false
+    }
+  ]
+}

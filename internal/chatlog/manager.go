@@ -853,7 +853,13 @@ func (m *Manager) CommandHTTPServer(configPath string, cmdConf map[string]any) e
 		go dat2img.ScanAndSetXorKey(dataDir)
 	}
 
-	log.Info().Msgf("server config: %+v", m.sc)
+	log.Info().
+		Str("platform", m.sc.GetPlatform()).
+		Int("version", m.sc.GetVersion()).
+		Str("http_addr", m.sc.GetHTTPAddr()).
+		Bool("has_data_dir", strings.TrimSpace(m.sc.GetDataDir()) != "").
+		Bool("has_work_dir", strings.TrimSpace(m.sc.GetWorkDir()) != "").
+		Msg("server config loaded")
 
 	m.wechat = wechat.NewService(m.sc)
 

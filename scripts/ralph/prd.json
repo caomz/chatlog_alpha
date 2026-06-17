@@ -1,0 +1,23 @@
+{
+  "project": "chatlog_alpha",
+  "branchName": "ralph/bootstrap-placeholder",
+  "description": "Bootstrap placeholder — 当前没有活跃的 PRD 派生任务。branchName 设为 ralph/bootstrap-placeholder，使 scripts/ralph/ralph.py 的 ensure_work_branch() 跳过工作分支创建，保持单分支(main)行为。需要新工作时用 /ralph 把真实 PRD(tasks/prd-*.md)转成 userStories 后再启动 Ralph 自主循环。上一轮 db-runtime-graph-truth-harness PRD 已归档到 archive/2026-06-17-db-runtime-graph-truth-harness-discarded/：其工作分支已删除、代码成果(US-002/003/007/008)随分支丢弃，US-004/005/010 始终 blocked(破坏性运行态操作待用户授权)，DB 仍未真正恢复可查询。",
+  "userStories": [
+    {
+      "id": "US-000",
+      "title": "Bootstrap placeholder — 等待真实 PRD",
+      "description": "占位 story，不可执行。Ralph developer/validator 见此 story 应立即停止并要求用户用 /ralph 提供真实 PRD 派生的 story 列表，不要把 placeholder 当作可实施任务。",
+      "acceptanceCriteria": [
+        "这是 bootstrap placeholder，不构成可执行的实现任务",
+        "Ralph developer/validator 检测到 branchName=ralph/bootstrap-placeholder 或本占位 story 时立即停止，不实现、不提交、不切换分支",
+        "ensure_work_branch() 因 branchName=ralph/bootstrap-placeholder 跳过工作分支创建，仓库保持单分支(main)行为",
+        "需要新工作时用 /ralph 重新生成 userStories 并把 branchName 改为真实 ralph/<feature> 名"
+      ],
+      "priority": 1,
+      "passes": false,
+      "notes": "PLACEHOLDER: 上一轮 db-runtime-graph-truth-harness PRD 已归档到 archive/2026-06-17-db-runtime-graph-truth-harness-discarded/(prd.json + progress.txt 快照)。该 PRD 工作分支已删除、代码丢弃、DB 未真正恢复。blocked=true 确保即使误启动 Ralph 也不会自动执行本占位项。",
+      "retryCount": 0,
+      "blocked": true
+    }
+  ]
+}

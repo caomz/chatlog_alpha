@@ -1,8 +1,93 @@
 # Progress
 
-Last Updated: 2026-06-12
+Last Updated: 2026-06-16
 
-## Current State
+## US-009 Root state 与完成态记录 (2026-06-16 18:55)
+
+- **Current State**: active feature `db-runtime-graph-truth-harness-2026-06-12` 已 7/10 stories 通过(US-001/002/003/006/007/008/009),US-004/005/010 仍 `blocked=true`(待用户 same-turn 授权强制重扫 WeChat key + 清理坏 wcdb cache + 重启服务等破坏性运行态操作)。`scripts/ralph/prd.json` 中 10 个 story 状态:7 个 `passes=true notes="" retryCount=0`,3 个 `passes=false blocked=true`(US-004/005/010)。`feature_list.json` 中 `db-runtime-graph-truth-harness-2026-06-12` `status: planned → in_progress`,evidence 数组填入 7 个 passed story 的命令级证据。
+- **What changed**:
+  - `feature_list.json` `db-runtime-graph-truth-harness-2026-06-12` 段:
+    - `evidence` 从 `[]` → 7 个 story 的命令级 evidence 数组(US-001 只读诊断 / US-002 isReadableSQLite 闸门 / US-003 DB 状态区分 / US-006 graph 真值链 / US-007 digest 不扰队列 / US-008 skill 写回 / US-009 本次 state 记录),每条含 `command` + `result` 字段,evidence 文本明确不含 wxid/真实 API key/真实 data key。
+    - `next_step` 替换为精确描述(7/10 通过 + 3 blocked 待用户授权)。
+    - `status` 从 `planned` → `in_progress`(因为 3 个 blocked story 还要等用户授权;`done` 在 US-004 解 blocked 且 US-005/US-010 全部 passes=true 后才能标)。
+  - `progress.md` 本段新增 US-009 收口段(本节)。
+  - `session-handoff.md` "Current Objective" 段下文追加 US-009 段 + "Ralpha Automation Handoff" 段补 US-009 收口信息。
+- **Verification Evidence**:
+  - `jq empty feature_list.json` → PASS, JSON 合法。
+  - `node scripts/check-root-harness.mjs` → **80/80 PASS** (与 US-008 提交时 baseline 一致,US-009 未引入新 harness 项)。
+  - `jq '.userStories | length' scripts/ralph/prd.json` → `10` (US-001..US-010)。
+  - `jq '.userStories[] | select(.id=="US-009") | {id, passes, notes, blocked, retryCount}' scripts/ralph/prd.json` → `{passes: true, notes: "", blocked: false, retryCount: 0}` 三步收口满足 Codebase Pattern 15/27 "修复类 story 必须 `passes=true` + `notes=""` + `retryCount=0`"。
+  - `git status --porcelain | grep -E '^(\?\?|.*) (reports|reports\.backup|.cache|logs|outputs|\.env)'` → 全部为 `?? reports`(symlink,预存在,不入库) + `?? reports.backup-20260606_124656/`(预存在 dirty,与本 story 无关),无新增。
+  - `grep -rE 'wxid_[a-z0-9]{8,}|sk-[a-zA-Z0-9]{16,}|[a-f0-9]{32,}' feature_list.json` → 0 命中,evidence 不含真实聊天 ID/真实 API key/真实 data key。
+- **Not Verified**:
+  - **未跑 git commit**: 本 story 严格不动 git(per AC#6 "本 story 不执行 git commit/push/reset/rebase/merge")。Ralph 自动 commit 留给 `scripts/ralph/ralph.py` 在 Validator 成功后执行;若要在此会话完成 feature 收口并入仓,需用户明确授权或由 ralph.py 自动接管。
+  - **未跑 `./init.sh --full` / `./init.sh --runtime`**: US-009 是 state files 收口,无 Go 代码改动,quick gate + root harness 已足够覆盖。
+  - **US-004/005/010 验证未跑**: 仍 blocked 待用户 same-turn 授权;progress.md / session-handoff.md / prd.json 中均明确标 `blocked=true` 并写明原因(破坏性运行态操作 + 依赖 US-004)。
+  - **未把 `?? reports` symlink 加入 `.gitignore`**: 仓库惯例保留 symlink 行,US-007 已记录"`?? reports` 是 symlink 行不是产物污染";US-009 不改变此边界。
+- **Blockers-Risks**:
+  - **Risk**: 启动前已有 dirty 文件(`M AGENTS.md / M internal/chatlog/manager.go / M scripts/check-root-harness.mjs` 等)属于前序 story 与运行时残留,US-009 不动它们,留给后续合并时统一处理。
+  - **Risk**: feature_list.json 中 `status` 是 `in_progress` 而非 `done`,因为 US-004/005/010 仍 blocked。任何"完成"判定都要等 US-010 端到端验收通过 + 用户授权后才成立。
+  - **Blocker**: US-004 解除 blocked 的前提(per PRD + 当前 PRD notes): 用户 same-turn 明确授权 + 仅人工或本交互会话执行 + 须先备份 all_keys.json + 单步删 cache(一次一个) + 每步复验。Ralph 自主循环不得自动执行。
+- **Next**:
+  1. 下一个 Ralph 可自主执行项:**无**(7/10 done,3/10 blocked)。Ralph 循环应输出 `<promise>COMPLETE</promise>` 或等待用户授权 US-004。
+  2. 用户手动接管:US-004 解除 blocked → 备份 all_keys.json → 单步删坏 cache → 重启服务 → US-005 前端面板闭环 → US-010 端到端验收。完整诊断命令见 session-handoff.md "Next-session diagnostic commands" 段。
+  3. 兜底验证命令(下次会话启动即跑):
+     - `jq empty feature_list.json && node scripts/check-root-harness.mjs` → 期望 80/80。
+     - `curl -sS --max-time 8 http://127.0.0.1:5030/health` → 期望 `{"status":"ok"}`(只读 precheck,不是 DB 可查询真值)。
+     - `curl -sS 'http://127.0.0.1:5030/api/v1/graph/status?format=json' | jq '{failed, failed_buckets, last_error, progress_pct}'` → 期望 failed=531 / progress_pct=100 不代表 done。
+
+## US-006 Temporal graph 健康状态真值链 (2026-06-16 18:55)
+
+- **HTTP 真值**: `curl -sS --max-time 12 'http://127.0.0.1:5030/api/v1/graph/status?format=json'` 返回 `enabled=true paused=false running=false history_queued=true enqueue_running=false workers=3 enqueue_workers=1 effective_workers=1 adaptive_level=stable`,`source_count=22118 entity_count=26895 relation_count=28141 event_count=18247 fact_count=27154 pending=0 processing=0 processed=21587 failed=531 progress_pct=100 last_updated_at=2026-06-14T09:01:35+08:00`,**`last_error=null`**,`failed_buckets={auth_error=141, before_request_timeout=0, config_error=249, empty_graph=0, json_decode_error=10, network_timeout=97, non_retryable_request=0, rate_limited=0, sensitive_input_1026=0, sensitive_output_1027=27, unclassified=7}`。
+- **SQLite 真值(等价证据)**:`sqlite3 -readonly` 直接 query `graph_source_records WHERE status='failed'` + Go-side mirror `ClassifyFailedError` 闭包重新分类(同 token 列表 + 同 orderedBuckets 顺序),结果与 HTTP `failed_buckets` **完全一致**: `total=531 config_error=249 network_timeout=97 before_request_timeout=0 rate_limited=0 auth_error=141 json_decode_error=10 empty_graph=0 sensitive_input_1026=0 sensitive_output_1027=27 non_retryable_request=0 unclassified=7`。
+- **`file is not a database` / `db_not_database` bucket = 0**:SQLite LOWER LIKE '%file is not a database%' OR '%db_not_database%' OR '%not a database%' on failed rows 命中 0 条,符合"图谱健康真值不应受 US-001~US-003 暴露的 DB 解密链污染"的设计目标。
+- **`progress_pct=100` 真值边界(AC#6)**: `progress_pct=100` 只代表 `pending=0`,**不代表** `failed=0` 也不代表图谱完全健康。当前 failed=531 ≠ 0,桶分布显示 5 类非空(config_error/auth_error/network_timeout/json_decode_error/sensitive_output_1027/unclassified),其中 `config_error=249` 是可恢复桶(recoverableGraphBuckets 收口为 config_error/network_timeout/before_request_timeout/rate_limited 4 类,占 249+97+0+0=346,占 failed 65%)。任何只看 progress_pct 判定图谱"完成"的脚本都是 false-green。
+- **写操作零触发**: 本 story 只读,未执行 `graph/resume` / `graph/rebuild` / `graph/pause` / `graph/config` 等写操作,未调用模型,未触碰 cache/key/服务文件。
+- **验证**: `go build ./...` rc=0 无输出 ✅;HTTP / SQLite 双路证据完全一致 ✅;`file is not a database` bucket 严格为 0 ✅。
+
+## US-003 DB 列表 listed/queryable 区分 (2026-06-16 17:45)
+
+- **后端**: 新增 `internal/wechatdb/datasource/dbentry/dbentry.go` 子包,定义 `DBEntry{Path,Group,Queryable,Reason}`(防 wcdb↔datasource 循环 import);`DataSource` interface 加 `GetDBsWithStatus() (map[string][]DBEntry, error)`,老 `GetDBs()` 保留薄包装,SearchAll / wechatdb.go / service.go 三处旧调用方零改动。wcdb `classifyDB()` 用 `os.Stat` 优先 + `ds.client.IsReadableSQLite`(新增 public wrapper 封装 unexported `isReadableSQLite`)+ `CanQueryDB` 三层检查,不可读时填 `file_not_found` / `stat_error` / `core_db_unreadable` 三个封闭枚举 token(每个 < 16 chars,绝不嵌 wxid/key/path)。HTTP `handleGetDBs` 改写返回 `{dbs: map[group][]path(嵌套,向后兼容), unavailable: [{group,file,reason}], core_dbs_unavailable: bool, unavailable_reason: string}`;核心组 `coreDBGroups={session,contact,message}` 任一不可读时 `core_dbs_unavailable=true`。
+- **前端**: `internal/chatlog/http/static/index.htm` `loadDBList()` 解析新 shape(优先 `data.dbs` + `data.unavailable` + `data.core_dbs_unavailable`,回退旧 map 形式),**不再并发 probe `/api/v1/db/tables`**(顺手收窄 US-001 path bug 触发面)。`core_dbs_unavailable=true` 时插入 `.alert-danger` 条幅,文案 "数据库当前不可用 / <reason 中文> / 请重扫 key 或检查 wcdb cache",替换原 "加载失败: ${e.message}"。不可查询 badge `title` 带 reason 便于悬停诊断。
+- **测试**: 新增 `internal/wechatdb/datasource/wcdb/datasource_test.go` 两个 focused test:`TestClassifyDBMissingFile` 锁 `file_not_found` + token 长度 < 32 + 不含 path;`TestClassifyDBStatError` 锁非 IsNotExist stat 错误时 `reason=stat_error`。两者用 nil-client 避开 cgo 依赖,跑 0.86s。
+- **Privacy**: reason token 封闭枚举,focused test 锁 `len(reason) <= 32 && !strings.Contains(reason, absPath)`,把"reason 不含 key"做成可执行 invariant 而非文档承诺。
+- **验证**: `go build ./...` exit 0;`go test -count=1 ./internal/wechatdb/...` 全部 ok(wcdb + wcdbapi 含 US-002 的 3 个测试);`node -e 'new Function(loadDBListString)'` 解析 OK(前端 JS 无语法错误);`curl -sS http://127.0.0.1:5030/api/v1/db`(旧 binary 5030)返回 `map[group][]file` 12 groups,旧客户端仍能解析(backward compat);`./init.sh` quick gate 通过;`make build` 新 binary `bin/chatlog` (34.7MB) 含 US-003 代码。
+- **未验证**: 新 binary 真实浏览器面板未跑 — `chatlog serve` 无 `--addr` flag,新 binary 与 5030 旧 binary 不能并存,启新 binary 必须先 kill 旧服务,属系统状态变更(Codebase Pattern 35),需用户启新 binary 后再 agent-browser 验。**新 binary 上线后**,unavailable 列表会暴露 session/contact/message_0 三条 `core_db_unreadable`(与 US-001 证据一致),前端 banner "数据库当前不可用" 自动出现 — 这是 US-004 解除 blocked 后的端到端真值信号。
+
+## US-001 只读诊断基线 (2026-06-16)
+
+- pwd: `/Volumes/WorkSSD/Dev/chatlog_alpha` (物理路径已 `cd "$(pwd)" && pwd -P` 验证)。
+- `curl -sS --max-time 8 http://127.0.0.1:5030/health` → `{"status":"ok"}` (rc=0, HTTP 200)。
+- `curl -sS --max-time 15 http://127.0.0.1:5030/api/v1/db` 列出 12 个分组、合计 18 个 DB 路径(bizchat/contact/emoticon/favorite/general/hardlink/head_image/media/message/session/sns/solitaire)。**DB 总数=18**(只记数量)。
+- `/api/v1/db/tables?group=...&file=...&format=json` 对核心 3 库统一返回 **HTTP 500**:
+  - session/session.db → `"stat .../db_storage/session.db: no such file or directory"`
+  - contact/contact.db → `"stat .../db_storage/contact.db: no such file or directory"`
+  - message/message_0.db → `"stat .../db_storage/message_0.db: no such file or directory"`
+  - **根因**:HTTP handler 拼 stat 路径时漏掉了 group 子目录(`db_storage/session.db` 而非 `db_storage/session/session.db`),与 `/api/v1/db` 返回的列路径不一致。**当前 US-001 阶段判定:核心 3 库 `queryable=false`、错误摘要 `stat: no such file or directory`**,不是 `file is not a database`,但同样属"列得出但查不动"假绿。
+- 源文件 stat(macOS `stat -f`):
+  - `db_storage/session/session.db` size=286720 mtime=`2026-06-15 21:17:22`
+  - `db_storage/session/session.db-wal` size=4194304 mtime=`2026-06-15 21:17:22`
+  - `db_storage/contact/contact.db` size=16158720 mtime=`2026-06-15 21:01:51`
+  - `db_storage/message/message_0.db` size=10153984 mtime=`2026-06-15 21:17:22`
+- `all_keys.json` 路径=`/Users/mingtian/Library/Containers/com.tencent.xinWeChat/Data/Documents/app_data/xwechat_files/wxid_qonry7vlh3vt22_d68e/all_keys.json`,size=1963 mtime=`2026-05-31 07:57:19`(存在但 mtime 老于 6-15 的 db)。
+- `~/.chatlog/wcdb_cache/*.db` count=17,oldest mtime=`2026-06-16 16:53:50`,newest=`2026-06-16 17:03:19`(11 分钟窗内全部刷新)。`sqlite3 -readonly` 探测全部 17 个 `sqlite_master` 失败:17/17 返回 `Error: in prepare, file is not a database (26)`。样例 `170fb82914dc74888c50bb22f0798c60.db`:前 16 字节 = `SQLite format 3\0`,size=10153984,sqlite_master 报 'file is not a database'。**坏 cache 实锤**,与 Codebase Pattern 命中"header 是 'SQLite format 3' 但 sqlite_master 报 'file is not a database'"。
+- 库 / 图谱并发检查:`curl /api/v1/graph/status?format=json` 成功,running=false paused=false,processed=21587 failed=531 pending=0,failed_buckets: `auth_error=141 config_error=249 json_decode_error=10 network_timeout=97 sensitive_output_1027=27 unclassified=7`,`last_error=null`,`progress_pct=100`。**注:`progress_pct=100` 只表示 pending=0,failed 仍有 531,健康真值在 failed_buckets 桶分布上**,符合 US-006 待办。
+- 隐私边界:全程只验证 path/mtime/size/HTTP status/error 摘要/failed_buckets 计数,**未打印** any_keys.json 内容、真实聊天内容、wcdb_cache 内容。
+- US-001 收口(只读):已记录上述事实,**未触动** any DB / cache / key 文件,**未调用**模型,**未重启**服务,符合 AC#7 只读诊断约束。
+
+## Current State (历史)
+
+- Active feature: `db-runtime-graph-truth-harness-2026-06-12` (status: planned). New PRD converted via /ralph from `tasks/prd-db-runtime-graph-truth-harness.md`: 恢复 WeChat DB 查询链路(核心库 session/contact/message_0 可 /api/v1/db/tables 查询)、后端在 os.Rename 前用 isReadableSQLite 拒绝不可读解密产物、DB 列表区分 listed/queryable、强化 graph 健康真值(progress_pct=100 非完成态)、把排障真值链写回 skills/chatlog-http-cli。`scripts/ralph/prd.json` branch `ralph/db-runtime-graph-truth-harness`，10 stories，repair 验证通过。
+  - **US-004/005/010 标 blocked**（用户决策，2026-06-12）: US-004 是破坏性运行态操作(强制重扫 WeChat key / 清坏 wcdb cache / 重启服务)，PRD Open Questions 未决，需用户 same-turn 授权后手动/本会话执行，Ralph 自主循环+MiniMax 弱模型不得自动执行；US-005(前端 DB 恢复闭环)、US-010(端到端验收)依赖 US-004。
+  - **Ralph 可自主执行 7 个**: US-001 只读诊断、US-002 后端拒坏 cache、US-003 DB 状态区分、US-006 graph 真值链、US-007 digest 不扰队列、US-008 skill 写回、US-009 state 记录。
+  - 真值三分法已记入 `scripts/ralph/progress.txt` Codebase Patterns: 可列出≠可查询；`isReadableSQLite` 读 `sqlite_master` 是唯一真值；坏 cache(header 对但 sqlite_master 报 'file is not a database')必须在写 outPath 前被拒。
+  - 前置归档: 上个 PRD `ralph/auto-merge-branch`(4/4 完成)→ `archive/2026-06-12-auto-merge-branch/`；feature `ralph-auto-merge-branch-2026-06-12` 标 done。
+- Next: run Ralph loop or manual iteration starting at US-001; US-004 需用户授权才能解除 blocked。
+- ——以下为 2026-06-12 早些时候状态——
+
+- Active feature: `ralph-auto-merge-branch-2026-06-12` (status: in-progress). New PRD converted via /ralph skill from user requirement "最后自动合并代码提交分支": ralph.py 启动时按 prd.json branchName 创建/切换工作分支，全部 story 通过(无 blocked)后自动 --no-ff 合并回 base 分支；blocked 跳过、冲突 abort、绝不 push、RALPH_AUTO_MERGE 可关。Source PRD `tasks/prd-ralph-auto-merge-branch.md`; `scripts/ralph/prd.json` 4 stories (ensure_work_branch → auto_merge_branch → sandbox 回归脚本闭环 → 文档边界同步)。**2026-06-12 20:05 状态**: US-001 ✅ passes=true (2026-06-12 17:20 evidence)；US-002 ✅ passes=true (2026-06-12 20:05 evidence: 4 条沙箱路径 clean merge / blocked skip / RALPH_AUTO_MERGE=0 / conflict abort / bootstrap placeholder 全过, `python3 -m py_compile` + `--check` exit 0 + harness 80/80)；US-003 仍 passes=false, notes 留证 `test_branch_merge.sh` 第 1 次跑 exit 1 (sys.argv 位置参数被 ralph.py 模块顶层读为 AGENT 名触发 sys.exit(2), 修复方向已记在 notes); US-004 待跑 (CLAUDE.md/VALIDATOR.md/progress.txt 文档同步)。关键设计约束: 本 PRD 改 ralph.py 自身, 验证全走 mktemp 沙箱 git 仓库 + --check, 绝不在真实仓库做分支写操作; 不修改已 dirty 的根 AGENTS.md; US-002 验证脚本一次性放 `/tmp/verify_us002_sandbox.sh` 不入仓, US-003 闭环脚本 `scripts/ralph/test_branch_merge.sh` 已存在 (startup-dirty 状态, US-003 story 收口时复用)。
+- Next: implement **US-003** (test_branch_merge.sh 闭环) 修复 notes 中 `python3 - "<branch>"` 触发 sys.exit(2) 的根因, 验证 `ALL BRANCH MERGE TESTS PASSED` 输出。US-004 等 US-003 完成后接。
+- ——以下为 2026-06-12 早些时候（graph-knowledge-digest 收尾）状态——
 
 - Active feature: `graph-knowledge-digest-2026-06-10` (status: **done**). PRD `scripts/ralph/prd.json` 6/6 stories `passes=true` (US-001..US-004 implemented 2026-06-11 in-session; US-005 implemented 2026-06-12; US-006 closed loop executed externally 2026-06-11 21:23 and independently re-verified 2026-06-12 16:44).
 - What changed (uncommitted — git log still ends at HA-005):

@@ -1,10 +1,38 @@
 # Session Handoff
 
-Last Updated: 2026-06-12
+Last Updated: 2026-06-16
 
 ## Current Objective
 
-- Goal: **COMPLETE** — PRD `scripts/ralph/prd.json` (graph-knowledge-digest) 6/6 stories `passes=true`. Feature `graph-knowledge-digest-2026-06-10` marked `done` in `feature_list.json` with evidence; details in `progress.md` (2026-06-12 section) and `scripts/ralph/progress.txt`.
+- Goal: execute the active PRD `scripts/ralph/prd.json` — branch `ralph/db-runtime-graph-truth-harness`, 10 stories. **7/10 完成 passes=true**(US-001/002/003/006/007/008/009);**3/10 blocked=true** 待用户 same-turn 授权(US-004 强制重扫 WeChat key + 清坏 wcdb cache + 重启服务 / US-005 前端 DB 恢复闭环 / US-010 端到端验收,均依赖 US-004)。**0/10 可自主执行剩余**;Ralph 自主循环等待用户授权 US-004 或由用户手动接管。Feature: `db-runtime-graph-truth-harness-2026-06-12` in `feature_list.json` (status: **in_progress**)。Source PRD: `tasks/prd-db-runtime-graph-truth-harness.md`。
+- **已完成的代码改动(2026-06-16)**:
+  - US-001: 只读诊断(无代码改动,evidence 已写入 progress.md)。
+  - US-002: `internal/wechatdb/wcdbapi/client.go` `ensureDecrypted` 在 `os.Rename(tmpPath, outPath)` 之前加 `isReadableSQLite(tmpPath)` 闸门,不可读时删 tmpPath 不更新 c.cache,错误含 actionable hint + 绝不嵌入 key。
+  - US-003: 新增 `internal/wechatdb/datasource/dbentry/dbentry.go`(共享 `DBEntry` 类型);`DataSource.GetDBsWithStatus()` 接口 + wcdb `classifyDB` 三层检查(os.Stat + `Client.IsReadableSQLite` + `CanQueryDB`),reason token 封闭枚举(`file_not_found` / `stat_error` / `core_db_unreadable`);HTTP `/api/v1/db` 返回 `{dbs, unavailable, core_dbs_unavailable, unavailable_reason}`;前端 `loadDBList` 解析新 shape + 显式 banner + 不再并发 probe `/api/v1/db/tables`。
+  - US-006/007/008: graph 真值链 + digest non-summary 不扰队列 + skill 写回 truth chain(references/db-truth-chain.md, graph-truth-chain.md, feedback-audit.md 更新 Known False Greens)。
+  - US-009: root state 收口(`feature_list.json` evidence + status=in_progress,`progress.md` US-009 段,本 handoff 段刷新)。
+- **5030 服务状态**: 仍跑**旧 binary**(`make build` 后 `bin/chatlog` 是新的,但 5030 进程未重启);旧 binary 的 `/api/v1/db` 仍返回 `map[group][]path` 旧 shape,前端 fallback 兼容路径仍正常显示列表(无 banner,因为没有 `core_dbs_unavailable` 字段)。**新 binary 需用户手动启服务后生效**(Codebase Pattern 35: 服务二进制更新后路由 404,需重启服务)。
+- **Blocked stories(需用户 same-turn 授权)**:
+  - US-004: 备份 `all_keys.json`(时间戳后缀) + 单步删坏 wcdb cache(一次一个) + 强制重扫 WeChat key + 重启 chatlog-alpha 服务 — 破坏性运行态操作,PRD Open Questions 未决。
+  - US-005: 依赖 US-004 完成;前端 DB 面板 `core_dbs_unavailable` banner 消失,核心 3 库 tables 加载成功。
+  - US-010: 依赖 US-004 完成;端到端验收(可查询核心库 + graph failed bucket 0 + digest 不扰队列 + 全部 harness check 通过)。
+  - 解除 blocked 前提: 用户 same-turn 明确授权 + 仅人工/本会话执行 + 先备份 all_keys.json + 单步删 cache + 每步复验。Ralph 自主循环不得自动执行破坏性运行态操作。
+- **Key constraints**: 只验证 path/mtime/size/count/status/bucket,绝不打印聊天正文/真实 API key/真实 data key;'可列出'≠'可查询'(`isReadableSQLite` 读 `sqlite_master` 是唯一真值);`progress_pct=100` 只代表 `pending=0` 不代表 `failed=0`;不盲目 requeue graph failed rows;不批量删除文件。
+- **Next-session diagnostic commands(read-only)**:
+  - `pwd -P` → 期望 `/Volumes/WorkSSD/Dev/chatlog_alpha`
+  - `curl -sS --max-time 8 http://127.0.0.1:5030/health` → 期望 `{"status":"ok"}`(precheck,不是 DB 完成态)
+  - `curl -sS --max-time 15 http://127.0.0.1:5030/api/v1/db` → 12 groups / 18 DB paths(旧 binary);新 binary + 真实 wcdb cache 时返回新 shape 含 unavailable 列表
+  - `curl -sS --max-time 8 'http://127.0.0.1:5030/api/v1/graph/status?format=json' | jq '{failed, failed_buckets, last_error, progress_pct}'` → 期望 `failed=531 / last_error=null / progress_pct=100`(progress_pct 不代表完成,真值在 failed_buckets 分布)
+  - `jq empty feature_list.json && node scripts/check-root-harness.mjs` → 期望 80/80 PASS
+  - `node skills/chatlog-http-cli/scripts/check-harness-skill.mjs` → 期望 29/29 PASS
+
+## Previous Objective (ralph/auto-merge-branch, 2026-06-12, COMPLETE)
+
+- Goal: **COMPLETE** — PRD `ralph/auto-merge-branch` 4/4 stories `passes=true`, archived to `archive/2026-06-12-auto-merge-branch/`. ralph.py 分支生命周期(ensure_work_branch/auto_merge_branch)已上线，沙箱三场景回归(`bash scripts/ralph/test_branch_merge.sh` → ALL BRANCH MERGE TESTS PASSED)通过；`ralph.py --check` exit 0；ralph.py 无 git push。Feature `ralph-auto-merge-branch-2026-06-12` 标 done。注意 scripts/ralph/ 在 git 中是 untracked(仓库惯例)，代码改动留在工作区未提交。
+
+## Previous Objective (graph-knowledge-digest, 2026-06-12, COMPLETE)
+
+- Goal: **COMPLETE** — PRD (graph-knowledge-digest) 6/6 stories `passes=true`, archived to `archive/2026-06-12-graph-knowledge-digest/`, committed as 8c556de2 (HA leftovers fix) + fbaffcc2 (digest feature). Feature `graph-knowledge-digest-2026-06-10` marked `done` in `feature_list.json` with evidence; details in `progress.md` (2026-06-12 section) and `scripts/ralph/progress.txt`.
 - Next Session path:
   1. Nothing mandatory. The digest chain (CLI `chatlog report graph` → POST /api/v1/graph/digest → `reports/graph-digest-<start>_<end>.md`) is live-verified on 127.0.0.1:5030 (2026-06-12 16:44, failed count unchanged at 267).
   2. If user asks to commit: scope to digest files only — `internal/chatlog/temporalgraph/digest*.go`, `internal/chatlog/http/graph.go`, `internal/chatlog/http/route.go`, `cmd/chatlog/cmd_report.go`, `docs/graph-digest.md`, `scripts/ralph/prd.json`, `scripts/ralph/progress.txt`, root state files. Exclude `reports/`, `openai_prmpt.md`, `reports.backup-*`, and pre-existing dirty files not part of this PRD.

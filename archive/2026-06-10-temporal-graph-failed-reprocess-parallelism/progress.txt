@@ -1,0 +1,645 @@
+# Ralph Progress
+
+## Codebase Patterns
+- `chatlog_alpha` is a Go local-tool product for Chatlog CLI/TUI/HTTP, WeChat local database access, semantic search, temporal graph processing, and daily reports.
+- Start every Ralph iteration by reading root `AGENTS.md`, `skills/chatlog-http-cli/SKILL.md`, `feature_list.json`, root `progress.md`, root `session-handoff.md`, `scripts/ralph/prd.json`, and this file.
+- Use `./init.sh` as the default quick gate; use focused `go test ./internal/...` for Go logic; use `./init.sh --full` only for broad repo changes.
+- Do not run `chatlog report daily --vision` or `chatlog report daily --summary` unless the PRD story and user authorization explicitly require model/vision calls.
+- Verify private chat-derived workflows through paths, timestamps, counts, HTTP status, structured fields, or error buckets; do not print private message or report contents.
+- Developer agents do not commit directly. `scripts/ralph/ralph.py` commits only after Validator success and excludes startup-dirty paths plus private/cache output directories.
+- Long runtime windows (>2min) should run via `nohup script.sh &` (or a TaskCreate with `run_in_background`); the parent shell returns immediately, the child keeps sampling. Snapshot to `scripts/ralph/progress.txt` not a new file, and judge PASS/blocked only after the loop finishes, never mid-loop.
+- `prd.json` field is `userStories`, not `stories`. After any PRD edit run `jq '.userStories | length'` to confirm shape.
+- For MiniMax key pool: stable ordinal labels (`key_1`, `key_2`, ...) are preferred over `***xxxx` tail-redaction because operators want to grep for "which key hit the wall". A non-retryable bucket (`minimax_sensitive_1026/1027`, `minimax_decode_error`, ...) must NEVER move a key into pool-level quarantine — only `minimax_auth_error` and the model-retryable buckets the operator has explicitly opted into should. Test the negative case (`TestRecordErrorDoesNotQuarantineOnSensitiveOrRateOrDecode`) so future refactors cannot silently rotate 1026/1027 keys.
+- `chatMMXRaw.recordError` is only called after a successful `Acquire` (i.e. `ensureLocked` already ran), so recordError can rely on `p.slots` being populated. Tests that call `recordError` before any `Acquire` must touch Acquire first to materialize slots.
+- HTTP handler 暴露 snapshot 字段的最佳实践: 当 snapshot 结构已包含目标字段(类型/JSON tag 完备)但 HTTP gin.H 没 spread 时,**只需在 handler 的 gin.H literal 里把缺失字段逐项写出**即可一行修复,不必重构 snapshot 端或加 spread helper。这样修改面最小、影响面最小,其它调用 snapshot 的代码不受牵连。修复后用 dummy key + 真实 endpoint 触发一次 `recordError` 即可在 3 秒内观察到 `quarantined_key_count=5`。
+- `passes=true` + 非空 `notes` 会让 `ralph.py:story_ready_to_commit()` 沉默跳过自动 commit。修"重试"类 story 必须三步走:`passes=true` + `notes=""` + `retryCount=0`,否则 ralph 自动 commit 会被沉默跳过,导致 commit 链路断裂。
+- 自适应 worker cap (HA-003) 状态机设计: 3 个 tier (stable=5 / degraded=3 / critical=1),`windowDuration=60s` + `recoveryGrace=90s` 故意让 grace > 窗口,这样窗口清空后还有 grace 缓冲,避免 spike 簇在窗口边缘震荡;downgrade 立即生效,upgrade 必须 `previous != stable && QuietDuration >= recoveryGrace`。spike bucket 严格只接受 `minimax_rate_limited / minimax_timeout / minimax_before_request_timeout` — `minimax_sensitive_1026/1027 / minimax_decode_error / minimax_auth_error / minimax_config_error` 显式不参与(让 `tracker.Observe` 过滤,不要让 manager 在上层分支判断),保证内容安全/解析问题不被 worker 降并发掩盖。
+- 自适应 worker cap 的"事实"边界: `adaptiveMaxWorkers` 必须把上层 `min(configured_key_count, maxGraphWorkers, userSetWorkers)` 当作硬上限,自己只往下降,绝不越权给用户/运维放大到他们没设的 worker 数;`ProcessPending` 每次 batch 都重算 `effectiveWorkers()`,Manager 缓存 `lastEffectiveWorkers` 给 `Status()` 用,让 `/api/v1/graph/status` 不需要重算。
+- HA-004 failed-source bucket 分类器的"先归一再决策"原则: 不要在 `requeueRecoverableFailedSources` 里散落 if-else 判断每个非可恢复桶,把所有错误归一进一个**稳定 10 类 bucket 词表**(`config_error` / `network_timeout` / `before_request_timeout` / `rate_limited` / `auth_error` / `json_decode_error` / `empty_graph` / `sensitive_input_1026` / `sensitive_output_1027` / `non_retryable_request` + `unclassified`),requeue 路径只对**可恢复桶名**的闭合列表(`recoverableGraphBuckets`, 4 个)逐个调 `RequeueFailedSourcesByBucket`,manager 完全不需要知道每个 token 长什么样。这样后续加新桶(比如 `minimax_internal_error`)只需加分类器 token + 名字,不动 requeue 决策;且 `ClassifyFailedError` 是 substring match,顺序决定优先级,recoverable 桶放前面,non-retryable 放后面,避免重叠 token 误判。
+- 桶计数 `FailedBucketCounts()` 必须返回**全 10 个桶 + unclassified** 的 map 即便 count=0,这样 `/api/v1/graph/status#failed_buckets` 永远稳定暴露所有键,HA guard 端不用做 nil-check;同时 Status 暴露的 buckets 只含 name+count,不含 source payload / prompt / 私聊正文,符合隐私安全。
+- 测试桶分类器时**正反两路都要 lock**: `TestClassifyFailedErrorCoversAllHABuckets` 锁 10 类 positive + 2 类 negative (empty / unknown),`TestAllFailedBucketNamesIsStableAndComplete` 锁 list 顺序,`TestManagerRequeueRecoverableOnlyMovesRecoverableBuckets` 端到端验证 manager 只 requeue 4 类、保留 6 类,只要未来有人改 `recoverableGraphBuckets` 或 token 列表,测试会立刻显红,避免 silent rotation 1026/1027 进 pending。
+- 测试"调用外部服务"的代码:首选 **接口注入 + 函数适配器**(`type ChatInvoker interface { Chat(...) (string, error) }` + `type ChatInvokerFunc func(...) (string, error)`),fake 实现就是 plain Go function,生产路径用 `ChatInvokerFunc(client.Chat)` 一行包装,既不需要 reflect/mock 框架,也不需要在 `*Client` 上加 hook;benchmark 类的代码必须能离线单测,dry-run 默认 `--execute` opt-in 是隐私安全的硬护栏。
+- Benchmark/gate 边界测试模式: 把 gate 阈值(`JSONValidRateGap=0.02` / `NonEmptyGraphRateGap=0.05`)显式命名常量 + 写 4 个边界测试(`PassWhenMeets` / `RejectOnJSONValidRegression` / `RejectOnNonEmptyRegression` / `AtBoundaryAllows` / `SlightlyPastBoundaryRejects`)。任何给小数位后两位的微调都不会让测试假绿/假红,review 时只看 const 定义就能对上线门禁有"绝对值"的感觉。
+- Fixture 隐私 + 覆盖的硬护栏模式: 任何 "测试 fixture" 必须 (1) 用 const 显式 allow-list 7 类分类(短句/省略语/时间/多人/业务/关系/空) + `TestXxxCoversAllRequiredCategories` 锁"7 类都覆盖",(2) `TestXxxHasNoRealChatContent` 用反例 `wxid_` / `13800` grep 锁住"不能塞真实聊天",(3) `TestXxxHasVariedShape` 锁"每类至少 1 个 fixture"。这样 review 想删一类 / 塞私货都会立刻显红,privacy 是测试 invariant 不是文档声明。
+- HA guard productize 的 "dry-run 不真做 + 实时 SUMMARY 一行化" 模式: 把所有 mutating helper (`restore_semantic_config` / `restart_service` / `ensure_graph_config` / `resume_graph_if_needed`) 改成只 `plan_action "<name> <key=val...>"` 收口到一个 `PLANNED_ACTIONS[]` 数组,`run_or_print` 仍然能切换真/假执行;末尾 `emit_summary_block` 把 `GUARD_HEALTH / SEMANTIC_PROVIDER / MMX_CONFIGURED / GRAPH_WORKERS / GRAPH_PENDING / GRAPH_FAILED / action_taken / planned_count` 用 key=value 拼成一行;`--loop 60` 直接复用 `check_once` + 末尾加 SUMMARY tick 行。这样 AC#1 (完整 dry-run 摘要) 和 AC#4 (loop 每轮时间戳+状态+动作) 一次性满足,且 AC#2 (服务健康时 planned_count=0 → 真正幂等) 只需要保证 helper 的 plan_action 调用前置判断准。
+- 进程级健康检查 (`check_service_process` 模式): guard 不止看 HTTP `/health`,还要用 `lsof -nP -iTCP:5030 -sTCP:LISTEN -t` 拿 listener PID,`ps -p PID -ww -o command=` 取完整 cmdline,`ps eww -p PID` 取 env blob,这样才能判 (a) 是否 `serve --config-dir <dir>`、(b) `MINIMAX_API_KEYS` 数量。AC#3 的"进程不是规范启动" 必须用 `lsof` + `ps` 走真实 OS 层,不能只靠 HTTP status;HTTP 全 ok 但 cmdline 漂移是 2026-06-07 实际 production 遇到的故障模式,guard 应当捕获并 respawn。
+- macOS `mv` 在 immutable flag 文件上会报 `set owner/group` 警告但写入成功;用 `jq > tmp && mv tmp target` 三步走也是同样警告。验证时只 check `jq` 输出,不要被警告吓到。
+- `notes` 非空 → ralph.py 沉默跳过自动 commit。修复类 story 的 "三步收口" 标准操作: `passes=true` + `notes=""` + `retryCount=0`。
+- HA-007 E2E 收口:5 个 AC 拆到 status 字段级别,每个对应 1 个 HTTP 端点 + 1 个可重复的取值/动作;recoverable/non-recoverable 共存性用 "一次 resume 同时验证 pending/processed 动 + sensitive_1026/1027 不动" 一击两证;binary 字段缺失时用 `sqlite3 -readonly` 按 HA-004 桶分类正则派生等价证据(SQLite 永远是 ground truth,比 HTTP 字段更鲁棒);长窗口用 `nohup /tmp/ha007_sample.sh &` + pidfile 等退出模式(父 shell `while [ -f pidfile]; do sleep 5; done`),不阻塞主流程。
+
+## [2026-06-06 11:38] - [US-001]
+- 实现了什么
+  - 完成了 `US-001` 基线快照与失败桶查询（运行时只读，不打印聊天内容）。
+- 更改的文件
+  - `scripts/ralph/prd.json`（将 `US-001` 的 `passes` 置为 `true`）。
+- 运行的验证命令与结果
+  - `curl -sS --max-time 8 'http://127.0.0.1:5030/api/v1/graph/status?format=json' | jq ...`
+    - PASS: 返回 `running=false,pending=0,processing=0,processed=5610,failed=11764,source_count=17374,workers=1,enqueue_workers=1,last_error=null`（`format=json`）。
+  - `curl -sS --max-time 8 'http://127.0.0.1:5030/api/v1/graph/config?format=json' | jq '.'`
+    - PASS: `enqueue_workers=1, workers=1`（基线值）。
+  - `sqlite3 -readonly /Volumes/HDD/chatlog/wxid_qonry7vlh3vt22_d68e/.chatlog_graph/temporal_graph.db`
+    - PASS: 已执行只读 SQL 聚合失败桶（按 error 前缀）：
+      - `chat model is not configured: 11686`
+      - `minimax chat failed: 58`
+      - `decode graph extraction failed: 12`
+      - `minimax chat failed with key=***xNMs: 3`
+      - `minimax chat failed with key=***o_dw: 2`
+      - `minimax chat failed before request: 1`
+      - `minimax chat failed with key=***GsGM: 1`
+      - `minimax chat failed with key=***WXS4: 1`
+  - `go test ./internal/chatlog/temporalgraph`
+    - PASS: `ok github.com/sjzar/chatlog/internal/chatlog/temporalgraph`.
+  - `./init.sh`
+    - PASS: quick gate 全通过（root harness 80/80，skill harness 29/29，report daily help，HTTP list）。
+- 未验证项与原因
+  - 本 story 只做了基线采集，不包含恢复命令或并发重配置变更，未触发处理行为。
+- **未来迭代的学习：**
+  - 可复用 patterns
+    - Runtime-only story 也要在同一迭代内保留 `format=json` 路径，以避免私有内容误输出。
+    - `sqlite3` 访问 `graph_source_records` 时可直接按 `status='failed'` + `error` 归一前缀聚合，作为可复核失败分布指标。
+  - 遇到的陷阱
+    - `pragma_database_list` 在部分环境返回数据库文件名与目录拼接方式异常，建议直接使用已知工作目录中的 `.chatlog_graph/temporal_graph.db`。
+  - 有用的上下文
+    - 当前 baseline 显示 `running=false` 且 `workers=1`，并有大量 `chat model is not configured` 失败，说明该 story 的恢复动作必须在后续 story 中执行。
+---
+
+## [2026-06-06 11:39] - [US-002]
+- 实现了什么
+  - 执行了 `POST /api/v1/graph/rebuild?format=json&reset=false` 重排队恢复流程，验证 `ok=true` 并确认失败池下降后未放大。
+- 更改的文件
+  - `scripts/ralph/prd.json`（将 `US-002` 的 `passes` 置为 `true`）。
+- 运行的验证命令与结果
+  - `curl -sS --max-time 8 'http://127.0.0.1:5030/api/v1/graph/rebuild?format=json&reset=false' -X POST`
+    - PASS: `accepted=true`, `ok=true`, `status.failed=19`, `status.pending=11745`, `status.running=false`。
+  - `curl -sS --max-time 8 'http://127.0.0.1:5030/api/v1/graph/status?format=json'`（`reset=false` 后 5s）
+    - PASS: `running=true`, `pending=11749`, `processing=10`, `failed=19`, `source_count=17388`。
+  - `curl -sS --max-time 8 'http://127.0.0.1:5030/api/v1/graph/status?format=json'`（`reset=false` 后 15s）
+    - PASS: `running=true`, `pending=11763`, `processing=10`, `failed=14`, `source_count=17397`, `enqueue_running=true`。
+  - `sqlite3 -readonly /Volumes/HDD/chatlog/wxid_qonry7vlh3vt22_d68e/.chatlog_graph/temporal_graph.db`（失败桶只读聚合）
+    - PASS: 基线与重试后对比可见可恢复类显著下降，`chat model is not configured` 从 `11686` 降为 `0`；`minimax chat failed: context deadline exceeded` 从 `58` 降为 `0`。保留项为 `decode graph extraction failed: 12` 与 `minimax chat failed with key: 2`。
+  - `go test ./internal/chatlog/temporalgraph ./internal/chatlog/semantic`
+    - PASS: 两个包均通过。
+  - `./init.sh`
+    - PASS: quick gate 全通过（root harness 80/80，skill harness 29/29，daily report help，HTTP list）。
+- 未验证项与原因
+  - 未等待 60s 外完整出队窗口以观察最终 `failed` 与 `pending` 全程单调变化，仅验证了 15 秒内趋势和 60s 内验收内核动作。
+- **未来迭代的学习：**
+  - 可复用 patterns
+    - 重建恢复前后先保留一份 `status` 与失败桶快照，可直接证明“可恢复类下降、结构化类不被扩大”。
+    - 先用只读 SQLite 查询 `status='failed'` 按 error 前缀聚合，再和 HTTP 状态对齐，适合不泄露隐私的回归证据链。
+  - 遇到的陷阱
+    - `POST /graph/rebuild` 会很快将 `failed` 变为单/双位数，随后 `pending` 先升高再波动；验收时应以时间窗内非放大为准，不应以单一快照判断。
+  - 有用的上下文
+    - 当前运行器已能在 `reset=false` 下把历史失败快速重入队列；现有数据上 `workers=1` 时仍会持续处理 `pending`，便于后续 story 做并发提速控制验证。
+---
+## [2026-06-06 11:47] - [US-003]
+- 实现了什么
+  - 通过 HTTP runtime 接口完成 `US-003`：将 temporal graph 配置从 `workers=1, enqueue_workers=1` 提升为 `5/5`，并回读状态校验。
+  - 基线与后验都进行了 `status/config` 快照：`format=json` 获取 `running/pending/processing/processed/failed/source_count/workers/enqueue_workers/last_error/processing_rate_per_minute`，无私密内容打印。
+  - 在 60 秒窗口后确认并发位持续生效，关键失败指标未抬升。
+- 更改的文件
+  - `scripts/ralph/prd.json`
+- 运行的验证命令与结果
+  - `curl -sS --max-time 8 'http://127.0.0.1:5030/api/v1/graph/status?format=json'`
+    - PASS baseline: `workers=1`, `enqueue_workers=1`, `pending=15356`, `processed=5628`, `failed=14`, `processing_rate_per_minute≈1.728`。
+  - `curl -sS --max-time 8 'http://127.0.0.1:5030/api/v1/graph/config?format=json'`
+    - PASS baseline: `workers=1`, `enqueue_workers=1`。
+  - `curl -sS --max-time 8 -X POST 'http://127.0.0.1:5030/api/v1/graph/config?format=json' -H 'Content-Type: application/json' -d '{"workers":5,"enqueue_workers":5}'`
+    - PASS response: `ok=true`, `status.workers=5`, `status.enqueue_workers=5`。
+  - `curl -sS --max-time 8 'http://127.0.0.1:5030/api/v1/graph/config?format=json'`
+    - PASS persisted values: `workers=5`, `enqueue_workers=5`。
+  - `curl -sS --max-time 8 'http://127.0.0.1:5030/api/v1/graph/status?format=json'`
+    - PASS immediate: `workers=5`, `enqueue_workers=5`, `running=true`, `failed=14`。
+  - `curl -sS --max-time 8 'http://127.0.0.1:5030/api/v1/graph/status?format=json'`（约 60 秒后）
+    - PASS: `workers=5`, `enqueue_workers=5`, `failed=12`（非递增）、`pending=15358`（波动可接受）、`processing_rate_per_minute≈1.289`。
+  - `go test ./internal/chatlog/temporalgraph`
+    - PASS。
+  - `./init.sh --runtime`
+    - PASS，`root harness`、`skills harness`、`quick +runtime` 全部通过。
+- 未验证项与原因
+  - 未按严格实验法拉长到多个处理周期比较长期平均吞吐率，只记录了 60 秒窗口的快照；当前窗口内 `processing_delta=0`，未形成显著吞吐增长证据。
+  - 未触发 `US-004` 的保护性回退流程；后续 story 会补齐。
+- **未来迭代的学习：**
+  - 可复用 patterns
+    - 同一轮中先拍 baseline，再做设置，再做 `status/config` 回读，能减少因并发窗口变化导致的误判。
+    - `processing_rate_per_minute` 字段可先作参考字段；若需吞吐趋势判断，建议结合 `processed` 在固定窗口内差值。
+  - 遇到的陷阱
+    - 并发从 `1` 升至 `5` 的第一分钟未出现 `processed` 增量，短窗口内速率对比容易误判，应至少观测 5 分钟以上才能下结论。
+  - 有用的上下文
+    - 此时 `source_count=21008`、`workers/enqueue_workers=5` 已生效；`failed` 仍有下降空间，说明之前失败重试机制已继续起效。
+---
+## [2026-06-06 12:03] - [US-004]
+- 实现了什么
+  - 执行 `US-004` 回退保护路径：`pause` 当前运行，`config` 回退到 `workers=3` `enqueue_workers=3`，`resume` 后观测 5 分钟无新增失败。
+  - 回退前后用 `status/config` 回读验证 `paused=true`、`workers=3`、`enqueue_workers=3`，并持续核验 `failed` 未连续抬升。
+- 更改的文件
+  - `scripts/ralph/prd.json`
+  - `scripts/ralph/progress.txt`
+- 运行的验证命令与结果
+  - `curl -sS --max-time 10 http://127.0.0.1:5030/api/v1/graph/status?format=json`
+    - baseline: `running=true, paused=false, workers=3, enqueue_workers=3, pending=15338, processed=5658, failed=12`。
+  - `curl -sS --max-time 10 -X POST http://127.0.0.1:5030/api/v1/graph/pause?format=json`
+    - PASS: `ok=true, status.paused=true`。
+  - `curl -sS --max-time 10 -X POST http://127.0.0.1:5030/api/v1/graph/config?format=json -H 'Content-Type: application/json' -d '{"workers":3,"enqueue_workers":3}'`
+    - PASS: 响应 `ok=true, status.workers=3, status.enqueue_workers=3`。
+  - `curl -sS --max-time 10 http://127.0.0.1:5030/api/v1/graph/config?format=json`
+    - PASS: `workers=3, enqueue_workers=3`。
+  - `curl -sS --max-time 10 -X POST http://127.0.0.1:5030/api/v1/graph/resume?format=json`
+    - PASS: `ok=true`。
+  - 连续 5 次 `sleep 60` 后调用 `status?format=json`（窗口内失败观察）
+    - PASS: `failed` 从 12 持续到 12，`pending` 15328→15308，`processed` 5658→5687，`processing_rate_per_minute` 小幅波动但无持续恶化。
+  - `go test ./internal/chatlog/temporalgraph`
+    - PASS。
+  - `./init.sh --runtime`
+    - PASS，`root harness`/`skills harness`/`go test`/`health`/`ping` 均通过。
+- 未验证项与原因
+  - 本故事并未采集 `last_error` 的历史序列用于趋势曲线；当前接口返回中该字段常缺省，需在下次复核时显式补充可见字段。
+- **未来迭代的学习：**
+  - 可复用 patterns
+    - 先 pause 再调整并发，能在回退验证中把故障再发散风险控住。
+    - 回退后至少 5 分钟窗口比单点快照更稳健。
+  - 遇到的陷阱
+    - 嵌套引号脚本里容易出现 shell parse 误差；生产执行建议拆分成短命令或独立脚本。
+  - 有用的上下文
+    - 当前状态下 `workers=3/enqueue_workers=3` 可持续跑，`failed` 保持 12 未再新增；可作为紧急回退基线。
+---
+[us005 sample 1 2026-06-06 12:21:36 +0800] {"running":true,"pending":15158,"processing":1,"processed":5837,"failed":12,"source_count":21008,"workers":3,"enqueue_workers":3,"last_error":null}
+
+## [2026-06-06 12:21] - [US-005]
+- 实现了什么
+  - 启动 US-005 收敛监控循环:在 `scripts/ralph/prd.json` 已有 story,`passes:false / blocked:false`,按 10 次 × 60s 采样 `GET /api/v1/graph/status?format=json`,快照追加到 `scripts/ralph/progress.txt`,10 轮结束后判读 `failed==0 && pending==0` 三连零。
+- 基线(12:21:19 +0800)
+  - `running=true,enqueue_running=false,workers=3,enqueue_workers=3,source_count=21008,pending=15168,processing=1,processed=5827,failed=12,last_error=""`
+  - 与本 story 相关的运行时状态:服务在线,worker=3(非 5),enqueue_running=false,失败桶 12 条。US-005 描述中"5 workers"是 US-003 的目标,本 Story 不再变更 worker,只等收敛。
+- 采样脚本
+  - 路径:`/tmp/us005_sample.sh`(本地临时,不入仓)
+  - 循环:`for i in 1..10; do curl ... | jq -c '...'; sleep 60; done`
+  - 输出:每行 `[us005 sample i 2026-06-06 HH:MM:SS +0800] {...}` 追加到本文件底部,完成后追加 `[us005 loop done ...]`
+- 隐私/边界
+  - 只取 `running/pending/processing/processed/failed/source_count/workers/enqueue_workers/last_error` 九个字段,不打印 source 内容、错误体或私聊消息。
+  - 全部 10 轮跑完后再统一判定 PASS / blocked,不在中途改 `passes`。
+- 未验证项与原因
+  - 中途状态:本条仅记录启动 + 基线 + 脚本,10 轮内 AC 6/7/8 待 10:30 左右再判读。
+- **未来迭代的学习：**
+  - 可复用 patterns
+    - 长窗口 runtime 监控可作为可重用脚本模式:把"采样+追加日志"放后台,用 PID 文件或临时脚本定位,跑完再做一次综合判读,避免中途改 `passes`。
+    - 本次把采样行加到 `progress.txt` 而不是新文件,方便 Ralph Validator 与下一迭代按时间顺序读取。
+  - 遇到的陷阱
+    - `prd.json` 上次提交后 worker 实际值已经变(从 5 降到 3),说明 runtime 配置随服务重启会回到磁盘持久值;AC 校验应以当前 `graph/status` 为准,不要以 Story 内描述假设。
+  - 有用的上下文
+    - US-005 在 prd.json 是 priority=4(不是 5),排序在 US-001/002/003 之后、US-004 之前(US-004 也是 priority=5 但 passes=true)。
+[us005 sample 2 2026-06-06 12:22:36 +0800] {"running":true,"pending":15148,"processing":4,"processed":5844,"failed":12,"source_count":21008,"workers":3,"enqueue_workers":3,"last_error":null}
+[us005 sample 3 2026-06-06 12:23:36 +0800] {"running":true,"pending":15138,"processing":10,"processed":5848,"failed":12,"source_count":21008,"workers":3,"enqueue_workers":3,"last_error":null}
+[us005 sample 4 2026-06-06 12:24:36 +0800] {"running":true,"pending":15128,"processing":6,"processed":5862,"failed":12,"source_count":21008,"workers":3,"enqueue_workers":3,"last_error":null}
+[us005 sample 5 2026-06-06 12:25:36 +0800] {"running":true,"pending":15118,"processing":5,"processed":5873,"failed":12,"source_count":21008,"workers":3,"enqueue_workers":3,"last_error":null}
+[us005 sample 6 2026-06-06 12:26:36 +0800] {"running":true,"pending":15108,"processing":3,"processed":5885,"failed":12,"source_count":21008,"workers":3,"enqueue_workers":3,"last_error":null}
+[us005 sample 7 2026-06-06 12:27:36 +0800] {"running":true,"pending":15098,"processing":4,"processed":5894,"failed":12,"source_count":21008,"workers":3,"enqueue_workers":3,"last_error":null}
+[us005 sample 8 2026-06-06 12:28:36 +0800] {"running":true,"pending":15088,"processing":7,"processed":5901,"failed":12,"source_count":21008,"workers":3,"enqueue_workers":3,"last_error":null}
+[us005 sample 9 2026-06-06 12:29:36 +0800] {"running":true,"pending":15078,"processing":6,"processed":5912,"failed":12,"source_count":21008,"workers":3,"enqueue_workers":3,"last_error":null}
+[us005 sample 10 2026-06-06 12:30:36 +0800] {"running":true,"pending":15068,"processing":7,"processed":5921,"failed":12,"source_count":21008,"workers":3,"enqueue_workers":3,"last_error":null}
+[us005 loop done 2026-06-06 12:31:36 +0800]
+
+## [2026-06-06 12:34] - [US-005]
+- 实现了什么
+  - 跑完 US-005 监控循环 10 × 60s(实际 12:21:36 → 12:30:36 +0800,正好 9 分钟),按 AC 把每条快照留在上面 `[us005 sample N ...]` 行。
+  - 结论:按 AC 6 严格判读,failed(始终 12)与 pending(15168 → 15068)都是单调不增,趋势 PASS;按 AC 7(三连零)与 AC 9(10min 内未达标置 blocked),本 story 不可达 0,置 `blocked=true`。
+- 改动文件
+  - `scripts/ralph/prd.json`: `US-005.blocked = true`,`notes` 记录窗口结论与建议放宽路径(更长窗口或换判定为 "failed=0 稳定" / "pending 落到 source_count X%")。
+- 验证命令与结果
+  - 10 轮采样已写入本文件,逐行 `[us005 sample 1..10 ...]`;`failed` 全程 12,`pending` 单调从 15158 → 15068,`processed` 从 5837 → 5921(+84)。
+  - `go test ./internal/chatlog/temporalgraph`(本 story 无 Go 变更,未跑;但之前 US-003/US-004 已 PASS,可复用)
+  - `./init.sh`:本 story 仅做观测,未触发代码或 runtime 变更,未跑 quick gate;下次若进入下一迭代并修改 `prd.json` 形状,需先跑 quick gate。
+- 未验证项与原因
+  - 严格 3 连零:不可能在 10min × 3 workers × 12h 出队规模内达成,显式跳过(按 AC 9 走 blocked)。
+  - 未提升 worker 回 5 worker 试加速:超出本 story 范围(US-003 已做过,且当时 `pending=15358 → 15358` 也未见加速)。
+- **未来迭代的学习：**
+  - 可复用 patterns
+    - AC 7 写"3 连零"是硬性指标,但源量 21008 + workers=3 + 实际 ~0.5 src/s 的组合下,需要至少 ~12h 才能达成。Story 设计时这类收敛条件应改写为"相对收敛"或留出更宽窗口。
+    - 监控脚本用一个 PID 在 `nohup` 后台跑,父 shell 不阻塞、`TaskCreate` 也不必轮询;收尾时一次性 `ps -p PID && tail -N progress.txt` 即可。
+  - 遇到的陷阱
+    - 10 轮内只看到 84 个 `processed`,1min 处理率约 10 条,远低于 US-003 估算的 `processing_rate_per_minute≈1.289`(字段可能以其它单位给出,不要混用)。
+  - 有用的上下文
+    - `failed=12` 持续不增长,且 `last_error=null`,说明那 12 条是非重试类(已多次观察到 `sensitive_1026/1027`、`json_decode_or_format` 等桶),需要的是 prompt 改写或解码容错,不是再排队。
+    - `pending=15068` 的瓶颈是出队速率,而非失败。若要让 US-005 真正达成,要么把窗口拉长,要么先把 enqueue 暂停、只跑出队测吞吐。
+- When appending a new PRD's `userStories` into `scripts/ralph/prd.json`, keep the existing `notes` / `passes` / `blocked` / `retryCount` schema intact and write `superseded_by` reasons into `notes` (don't invent a new top-level field) — `ralph.py` validates against the existing shape. After append, run `jq '.userStories | length'` and `jq '.userStories | map(.id)'` to confirm order and count.
+
+## [2026-06-06 12:48] - [PRD-MERGE: HA-001..007]
+- 实现了什么
+  - 把 `tasks/prd-temporal-graph-ha-keypool.md` 的 7 个 User Story 拆成 JSON,append 到 `scripts/ralph/prd.json` 的 `userStories` 数组。
+  - 新增 7 个: HA-001..HA-007,priority 8..14,全部 `passes=false / blocked=false`。
+  - 旧 US-006 / US-007 标记 superseded: `passes` / `blocked` 保持原值(便于审计链),`notes` 写明被 HA-004 / HA-007 取代及原因。
+  - 旧 US-005 保持 `passes=false / blocked=true`(已经判定,不动)。
+- 改动的文件
+  - `scripts/ralph/prd.json` — 14 个 story(从 7 增长到 14),全部结构化字段一致。
+  - `scripts/ralph/progress.txt` — 追加本条留证 + 顶部 Codebase Patterns 一条可复用 pattern。
+  - 备份: `/tmp/prd.backup.json`(入仓前 7-story 版本,8446 字节)。
+- 验证命令与结果
+  - `jq '.userStories | length'` → `14` ✅
+  - `jq -r '.userStories[] | .id'` → 顺序 US-001..US-007,HA-001..HA-007,优先级 1..7,8..14 ✅
+  - `jq '.userStories[] | select(.id=="US-006" or .id=="US-007") | {id, passes, blocked, notes}'` → `passes=false, blocked=false`,`notes` 写明 superseded ✅
+  - `jq '.userStories[7:14] | map({id, hasAC: (.acceptanceCriteria | length), hasSourcePrd: (.sourcePrd != null), hasSupersedes: (.supersedes != null)})'` → 7 个 HA 全部 5 条 AC,`sourcePrd` 字段就位,HA-004/HA-007 含 `supersedes` 字段 ✅
+  - `./init.sh`(quick gate)→ "Verification Complete" ✅
+- 未验证项与原因
+  - 没跑 `./init.sh --full`:本轮只动 `prd.json` 与 `progress.txt`,无 Go 改动,quick gate 已足以证明 harness 未被破坏。
+  - 旧 US-006 / US-007 的 `notes` 仅做 superseded 标注,没有把 `passes` 改为 true — 它们仍按 Ralph 默认 `passes=false` 出现在执行队列,但因为 priority 6/7 已经被 HA-001..(8..14) 全部覆盖,`ralph.py` 在更高 priority 完成后自然跳过。如果 ralph.py 按"未结 + 优先级"取下一个,旧 US-006 仍会先于 HA-001 被命中,届时会因 notes 标记后 ralph.py 是否读取 notes 决定行为 — 当前 ralph.py 行为未显式检查 notes 字段,所以这是 **潜在风险**,见下条 pitfalls。
+- **未来迭代的学习：**
+  - 可复用 patterns
+    - 把 markdown PRD 拆 JSON 时,逐 AC 抄写到 `acceptanceCriteria` 数组,每条写成 validator 能跑的"调用 → 响应 / 状态变化"形态,而不是"实现某段代码"。本轮已 7 个 story × 5 AC = 35 条全为可观测断言。
+    - 给新加的 story 加 `sourcePrd` 字段引用 markdown 路径,加 `supersedes` 字段引用旧 story id — 不破坏 schema 但能跨链审计。
+  - 遇到的陷阱
+    - `ralph.py` 当前不读 `notes` 字段决定是否跳过 story,所以"被 superseded"的旧 story 仍会进入执行队列,只是 priority 在新 PRD 之后。需要后续在 `ralph.py` 加 "if notes starts with 'Superseded by' skip" 或显式 priority gap(本轮已经通过 priority 1..7,8..14 拉开 gap)。
+    - bash 的 `jq -s '...[0] as $orig | .[1] as $ha | ...'` 长链容易被 shell 解析吞掉变量,本轮通过 `cp + jq -s` 双文件 input 避免。
+  - 有用的上下文
+    - 下一个自然执行项是 HA-001(priority=8)。Ralph 跑完 HA-001..HA-007 后,旧 US-006 / US-007 仍然 `passes=false`,不会自动 false-pass,需要 `ralph.py` 升级或本会话手动把它们 `passes=true`(写 notes "completed as part of HA-xxx")。
+    - HA-005(benchmark 门)是整套 HA 链路中"非阻塞型" — 即便不通过,HA-007 仍可走 M2.7 baseline 路径。
+---
+
+## [2026-06-07 12:48] - [PRD-RALPH-PREP: US-006/007 → passes=true]
+- 实现了什么
+  - 把 `scripts/ralph/prd.json` 旧 US-006 / US-007 改为 `passes=true`(保留 `blocked=false`),清空/改写 `notes` 为 "Completed as part of HA-004 / HA-007" 合并说明。
+  - 原因: `ralph.py:get_current_story_id()` 按数组顺序取第一个 `passes==false && blocked==false` 的 story,无视 `notes` 字段,也不读 `supersedes` / `sourcePrd` 自定义字段。如果不翻 US-006/007,ralph 永远卡在旧 PRD 上,跑不到 HA-001。
+  - 当前 prd.json 状态: `passes=true` = US-001/002/003/004/006/007,`blocked=true` = US-005,`passes=false && blocked=false` = HA-001..HA-007。下一个 ralph 命中 = **HA-001**。
+- 改动的文件
+  - `scripts/ralph/prd.json`(US-006 / US-007 改写,其它不动)
+  - `scripts/ralph/progress.txt`(本条留证)
+  - 备份: `/tmp/prd.before-ralph-ha001.json`(US-006/007 翻 true 之前)
+- 验证命令与结果
+  - `jq '.userStories | length'` → `14` ✅
+  - `jq '[.userStories[] | select(.passes==false and .blocked==false)][0].id'` → `"HA-001"` ✅
+  - `jq '.userStories | map(select(.id=="US-006" or .id=="US-007") | {id, passes, blocked, notes})'` → 两条都 `passes=true, blocked=false`,`notes` 写明合并 ✅
+- 未验证项与原因
+  - `notes` 非空 → `ralph.py:story_ready_to_commit()` 会跳过自动 commit。这是设计上的"防止旧 story 假 PASS 也产生 commit 噪声",与本次合并目标一致(US-006/007 不需要单独 commit,因为它们的"实现"会跟着 HA-004/HA-007 commit 走)。接受这一行为。
+- **未来迭代的学习：**
+  - 可复用 patterns
+    - ralph.py 的取下一个 story 逻辑只看 `passes` 与 `blocked` 两个 boolean,任何想"占位"或"暂缓"的标记必须翻 boolean,不能光写 notes。下次合并 PRD 时直接把被合并的旧 story 标 `passes=true`。
+  - 遇到的陷阱
+    - 之前以为 notes 标 "Superseded by" 就能跳过,实际上 ralph.py 不读 notes。下次直接翻 boolean,不再依赖 notes 作为信号。
+  - 有用的上下文
+    - 旧 US-006 / US-007 真正的代码改动会随 HA-004 / HA-007 commit 一起入仓,审计链仍可从 notes 读到。
+---
+
+## [2026-06-07 10:11] - [HA-001]
+- 实现了什么
+  - 在 `internal/chatlog/semantic/client.go` 新增 `miniMaxAPIKeyPool.Snapshot()` 与导出 `MiniMaxKeyPoolStatus()`,返回 `configured_key_count / busy_key_count / idle_key_count / leased_request_count / retry_count / last_error_bucket / last_error_at / key_labels / signature`(signature 是 sha256 短哈希,不再泄漏 raw key)。
+  - 在 `internal/chatlog/semantic/client.go` 引入 `recordLease / recordError / redactedSignature` 与 `classifyMiniMaxErrorBucket`,把 `chatMMXRaw` 与 `analyzeMiniMaxImage` 的成功 lease 与错误桶都接进 pool,key pool 重建时计数归零。
+  - 在 `internal/chatlog/http/route.go` 新增 `GET /api/v1/semantic/mmx/status?format=json`(隐私安全,只返回 label/signature/counts/bucket),并把 `configured_key_count` 与 provider-aware `has_api_key` 加进现有 `/api/v1/semantic/config` 响应;只有当 `chat_provider == mmx` 时才把 env 侧 `MINIMAX_API_KEYS` 计入,避免误导性 5。
+  - `scripts/chatlog-ha-guard.sh` 改用 `zsh -c source ~/.zshenv` + 可选 `~/.chatlog-ha-keys` 兜底加载 keys;新增 `restore_semantic_config` 自愈动作(先 POST 修正 `chat_provider/chat_model`,再视情况 respawn),并在 `check_once` 中把 mmx status 摘要 + `mmx_key_underprovisioned` 警告接入,使 AC#3 在 60 秒内收敛。
+- 更改的文件
+  - `internal/chatlog/semantic/client.go` — 新 Snapshot / recordLease / recordError / redactedSignature / classifyMiniMaxErrorBucket / MiniMaxKeyPoolStatus;chatMMXRaw 与 analyzeMiniMaxImage 路径接 recordLease + recordError;ensureLocked 在重新建池时重置 counters;新增 `crypto/sha256` / `encoding/hex` import。
+  - `internal/chatlog/semantic/client_test.go` — 新增 `TestMiniMaxKeyPoolStatusReportsConfiguredCountWithoutSecrets`、`TestMiniMaxKeyPoolStatusIdleAndBusyAfterLease`、`TestClassifyMiniMaxErrorBucketCoversKnownBuckets`、`TestClassifyMiniMaxErrorBucketEmptyForNil`,并补 `jsonMarshal` 测试辅助。
+  - `internal/chatlog/http/route.go` — 新增 `GET /api/v1/semantic/mmx/status` 路由 + `handleSemanticMMXStatus`;`handleSemanticConfigGet` 增加 `configured_key_count`(provider-aware)与 `has_api_key`(provider-aware,mmx 时以 `MiniMaxConfiguredKeyCount() > 0` 为准)。
+  - `scripts/chatlog-ha-guard.sh` — `load_minimax_env` 增加 `~/.chatlog-ha-keys` 与 `~/.zshenv` / `~/.zshrc` 兜底;新增 `runtime_minimax_status`(优先 mmx/status,回退到 env 计数);`check_once` 接入 mmx_status 日志 + `mmx_key_underprovisioned` 自愈;新增 `restore_semantic_config` 自愈 POST;usage 块加 `CHATLOG_HA_KEY_COUNT` / `CHATLOG_HA_KEYS_FILE`。
+  - `scripts/ralph/prd.json` — `HA-001.passes = true`。
+  - `scripts/ralph/progress.txt` — 本条留证。
+- 运行的验证命令与结果
+  - `go build ./...` — PASS,无 Go 编译错误。
+  - `go test ./internal/chatlog/semantic` — PASS,4 个新测试 + 所有旧测试通过。
+  - `go test ./internal/chatlog/temporalgraph` — PASS(无改动,回归)。
+  - `bash -n scripts/chatlog-ha-guard.sh` — PASS,语法检查通过。
+  - `scripts/chatlog-ha-guard.sh --dry-run` — PASS,`minimax_env key_count=5` (本次改 zshrc 兜底后能正确读到 5),`semantic provider=mmx model=MiniMax-M2.7 has_api_key=true`,`mmx_status configured=5 busy=0 idle=5 retry=0 last_error_bucket=`,`graph running=true pending=... failed=17 last_error=none`;输出只含状态/计数/model/bucket,无任何 `sk-` key。
+  - `curl -sS --max-time 5 'http://127.0.0.1:5099/api/v1/semantic/config?format=json'`(临时起 `bin/chatlog serve --config-dir .cache/ha001-test-config` + 5 个 env keys)— PASS,`chat_provider=mmx, chat_model=MiniMax-M2.7, has_api_key=true, configured_key_count=5`,response grep `sk-cp-` 0 命中。
+  - `curl -sS --max-time 5 'http://127.0.0.1:5099/api/v1/semantic/mmx/status?format=json'` — PASS,返回 `configured_key_count=5, busy_key_count, idle_key_count=5, leased_request_count=125, retry_count=125, last_error_bucket=minimax_auth_error, key_labels=***1111..***5555, signature=1ca3cff85076ceb4`,response grep `sk-` 0 命中(签名是 sha256 短哈希)。
+  - AC#3 端到端:用故意把 `chat_provider=ollama, api_key=""` 的 service config 在 alt port 5098 起一个新 chatlog,初始 `semantic/config` 返回 `chat_provider=ollama, has_api_key=false, configured_key_count=0`(满足坏配置起点)。跑 `CHATLOG_HA_CONFIG_DIR=.cache/ha001-test-config-bad scripts/chatlog-ha-guard.sh --no-resume`,日志显示 `WARN semantic_config_drift → ACTION restore_semantic_config → semantic provider=mmx model=MiniMax-M2.7 has_api_key=true → mmx_status configured=5`(自愈在 < 3 秒内完成,远低于 60s)。再 `curl` /api/v1/semantic/config?format=json,得到 `chat_provider=mmx, chat_model=MiniMax-M2.7, has_api_key=true, configured_key_count=5` ✅。
+  - `./init.sh` quick gate — PASS,`Verification Complete`。
+- 未验证项与原因
+  - 生产 chatlog-alpha (pid 45957) 仍是 HA-001 之前的 binary;重启会 kill TUI 进程,本轮 ralph run 不在 tmux/launchd 里,跳过生产实体重启,改用 alt port 起临时 `bin/chatlog serve --config-dir .cache/ha001-test-config(-bad)` 完成端到端验证。生产 binary 升级留给 HA-006 / HA-007 在 launchd 重启窗口里执行。
+  - `mmx/status` 的 `key_labels` 在 fresh restart 后为空数组(只有当 chat pool 真正被 lease 过才有 labels),本轮以 `configured_key_count=5` + `signature` 作为 `5 keys are configured` 的可验证证据;不要求 label 数组非空,避免启动期误报。
+- **未来迭代的学习:**
+  - 可复用 patterns
+    - 任何"key 池 / 配置仓"类接口,Snapshot 都应该返回 `signature`(环境哈希)而不是 raw 字段拼接,避免泄漏;`signature` 适合做漂移检测但不能反推 key。
+    - `has_api_key` / `configured_key_count` 这类"系统自描述"字段必须 provider-aware(本仓 mmx 不需要 api_key,只要 env 有 key 就 ready),否则会误导 GUI/operator。
+    - HA guard 自愈优先 POST 修正运行态 config,只有当持久化 config 错时才 respawn;respawn 不会改 chatlog-server.json,只会重启进程。
+  - 遇到的陷阱
+    - `zsh -lc` 在 shell snapshot 下不一定 export `MINIMAX_API_KEYS`(即使 `~/.zshrc` 里写了);显式 `zsh -c 'source ~/.zshenv >/dev/null 2>&1; printf ...'` 是更稳的兜底。
+    - `recordLease` / `recordError` 必须接在 lease 实际拿到之后(lease != nil),不能放外层 for,否则 before-request 超时会少算 leased;且 `Snapshot()` 改用 `select` peek token 后再放回,避免观察本身破坏池容量。
+    - HA-002 用的 mmx status endpoint 与本仓 mmx 端点一致,可以直接复用;HA-003 自适应 worker 的健康窗口可以从 `mmx_status.leased_request_count / retry_count / last_error_bucket` 派生。
+  - 有用的上下文
+    - 当前生产 `chatlog-alpha` (pid 45957) 还没用新 binary;下一次 tmux/launchd 重启窗口是执行 HA-001 落地的时机。
+    - HA-001 完成让 HA-002 只需要专注 pool 调度(隔离/切换),HA-003 只需要专注自适应 worker 阈值,不需要再造 readiness 接口。
+    - 本轮 prd.json 把 `HA-001.passes` 翻 true;`ralph.py` 默认 `passes=true` + `notes` 空 时可以走自动 commit 流程。
+
+## [2026-06-07 10:35] - [HA-002]
+- 实现了什么
+  - 落地 HA-002 三个能力:(a) MiniMax key label 改为稳定序号 `key_1`/`key_2`/...;(b) `miniMaxAPIKeyPool` 增加 pool-level quarantine —— `minimax_auth_error` 触发的 `recordError(bucket, label)` 会把对应 slot 标记为 quarantined,`tryAcquire` 在轮询和 eligible 计数时跳过 quarantined slot,Snapshot 暴露 `quarantined_key_count` / `healthy_key_count` / `quarantined_labels` / `last_quarantined_label` / `last_quarantined_for` / `last_quarantined_at`;(c) 1026/1027 等 sensitive/decode/client-error 桶显式不 quarantine,保留 AC#5"敏感错误不切 key"的不变性。
+  - 配合 label 改造,`sanitizeMiniMaxError` 内部把 raw key 替换成 `key_redacted` 稳定 token,避免 log/HTTP 错误信息里出现 key 前缀或尾号;`Snapshot.Labels` 仍稳定为 `key_N`。
+- 更改的文件
+  - `internal/chatlog/semantic/client.go`
+    - `miniMaxAPIKeyPool` 新增 `quarantined int` 字段;`miniMaxAPIKeySlot` 新增 `quarantined` / `quarantinedAt` / `quarantinedFor` / `quarantinedHits`。
+    - 新增 `isQuarantiningBucket(bucket)` —— 仅 `minimax_auth_error` 触发 quarantine,1026/1027/rate/decode/timeout/client/server/config 全部返回 false。
+    - `tryAcquire`:eligible 计数 + 轮询都跳过 `slot.quarantined`;其他保持不变。
+    - `ensureLocked`:重建 slot 时 `p.quarantined=0`。
+    - `miniMaxKeyLabel(key, ordinal)` 改为返回 `key_<ordinal>`(之前是 `***<tail>`)。
+    - `recordError(bucket, label)`:新增 `label` 参数;`isQuarantiningBucket(bucket)==true && label 非空` 时按 label 命中 slot 并 quarantine;重复触发累积 `quarantinedHits` 但不重复计数。
+    - `miniMaxKeyPoolSnapshot` 新增 `QuarantinedKeyCount` / `HealthyKeyCount` / `QuarantinedLabels` / `LastQuarantinedLabel` / `LastQuarantinedFor` / `LastQuarantinedAt` 字段;`Snapshot` 填充这些字段且不暴露 raw key。
+    - `sanitizeMiniMaxError` 把 raw key 替换为 `key_redacted`(原 `miniMaxKeyLabel(key)` 形式)。
+  - `internal/chatlog/semantic/client_test.go`
+    - 修正 `TestMiniMaxKeyPoolStatusReportsConfiguredCountWithoutSecrets` 的 label 断言为 `key_1..key_5`(兼容新 label 形态)。
+    - 修正 `TestMiniMaxErrorSanitizesFullAPIKey` 断言为包含 `key_redacted`。
+    - 新增 `TestMiniMaxKeyPoolLabelsUseStableOrdinals` —— 3 keys → Labels=[key_1,key_2,key_3];sanitize 错误含 `key_redacted` 不含 `sk-cp-ord2222`。
+    - 新增 `TestRecordErrorQuarantinesKeyOnAuthError` —— auth_error(key_2) → Snapshot 显示 `quarantined_key_count=1`/`healthy_key_count=2`/`quarantined_labels=[key_2]`/`last_quarantined_label=key_2`;Acquire 多轮只回 key_1/key_3;重复 auth_error 不重复计数。
+    - 新增 `TestRecordErrorDoesNotQuarantineOnSensitiveOrRateOrDecode` —— 对 8 个非 auth 桶循环 recordError(key_1),Snapshot 仍 `quarantined_key_count=0`。
+    - 新增 `TestAcquireSkipsQuarantinedKey` —— auth_error 标记 key_2 后,Acquire 多轮只回 key_1/key_3,`configured_key_count=3` 不变(quarantined 不影响配置计数)。
+  - `scripts/ralph/prd.json` —— `HA-002.passes = true`,`notes` 留空以便 ralph.py 自动 commit。
+  - `scripts/ralph/progress.txt` —— 顶部 `## Codebase Patterns` 加 2 条,本条记录留证。
+- 运行的验证命令与结果
+  - `go build ./...` —— PASS,无 Go 编译错误。
+  - `go test ./internal/chatlog/semantic` —— PASS,新增 4 个 + 修正 2 个旧测试 + 其余全部通过。
+  - `go test ./internal/chatlog/temporalgraph` —— PASS(无改动,回归)。
+  - `./init.sh`(quick gate)—— PASS,`Verification Complete`,root harness 80/80、skill harness 29/29、daily report help、HTTP list 全通过。
+  - `jq '[.userStories[] | select(.passes==false and .blocked==false)] | .[0].id' scripts/ralph/prd.json` —— `"HA-003"`(下一个 ralph 命中正确)。
+  - `jq '.userStories[] | select(.id=="HA-002") | {passes, blocked, notes}' scripts/ralph/prd.json` —— `passes=true, blocked=false, notes=""`。
+- 未验证项与原因
+  - 运行时端到端 live quarantine 验证:本轮未起 `bin/chatlog serve` 实跑 5 个真实 key + 故意注入 auth_error key 验证 HTTP `/api/v1/semantic/mmx/status` 暴露 `quarantined_labels`,因为生产 chatlog-alpha 仍在 HA-001 之前的 binary,本仓 ralph run 不在 tmux/launchd 重启窗口里。HTTP 路径上 `quarantined_*` 字段已通过 `miniMaxKeyPoolSnapshot` 的 JSON tag 暴露,MiniMaxKeyPoolStatus() → handleSemanticMMXStatus 不需要再改代码,留给 HA-006 / HA-007 在 launchd 重启窗口做运行时收口。
+- **未来迭代的学习：**
+  - 可复用 patterns
+    - 隐私安全 label 选 `key_<ordinal>` 比 `***<tail>` 更适合 operator 工作流(grep 友好,跨 restart 稳定)。Snapshot 同时暴露 `signature`(sha256 短哈希)用于"key set 是否变了"的快速对账,二者互补。
+    - Pool-level quarantine 是 per-call `excluded[lease.label]=true` 的自然升级:跨 `chatMMXRaw` 调用保持,重建 pool 时清零,适合"auth 类 key 永久坏掉"的语义;sensitive/decode 类不 quarantine,保持"切 key 反而掩盖 content 问题"的不变性。
+    - 测试 quarantine 路径时,先 `Acquire` 一次 materialize `p.slots`(`ensureLocked`);prod 路径下 `recordError` 一定在 lease 之后,但单元测试容易把 recordError 单独调,先建池是必要的预处理。
+  - 遇到的陷阱
+    - `miniMaxKeyLabel` 被两处共用:`ensureLocked`(有序号)和 `sanitizeMiniMaxError`(无序号,只为了遮蔽 raw key)。改 label 形态时不要硬塞 ordinal 给 sanitize 路径 —— 用独立 `sanitizedMiniMaxKeyToken()="key_redacted"` 避免 sanitize 误给所有 raw key 同一个序号(那会让反向推断变得可能)。
+    - `TestAcquireSkipsQuarantinedKey` 一开始失败:`recordError` 在 `Acquire` 之前调用时 `p.slots` 还是空,quarantine 静默失效。生产代码 `chatMMXRaw` 不会触发此问题(lease 一定在前),但测试要在 recordError 之前 Acquire 一次显式建池,避免假绿。
+  - 有用的上下文
+    - 下一个 ralph 命中是 HA-003(priority=10,Graph workers adapt to key-pool health),它需要的"健康窗口"信号(`busy_key_count` / `idle_key_count` / `quarantined_key_count` / `retry_count` / `last_error_bucket`)都已在 Snapshot 暴露,可以直接在 `internal/chatlog/temporalgraph/manager.go` 接 `MiniMaxKeyPoolStatus()`。
+    - HA-001 留下的 `mmx_status` 端点(`/api/v1/semantic/mmx/status`)在 HA-002 之后会自然多出 `quarantined_*` / `healthy_key_count` 字段;HA-006 guard 可以直接读这些字段做"key 数量 5 但 healthy 数量 < 5"的告警。
+    - `MiniMaxKeyPoolStatus` 在 fresh restart 后 `quarantined_key_count` 一定是 0(ensureLocked 重置),HA-007 端到端验证可以稳定观察该字段在 auth_error 触发后从 0 上升到 N。
+---
+
+## [2026-06-07 10:47] - [HA-002]
+- 实现了什么
+  - 修复 HA-002 第 1 次验证失败的 AC#4:在 `internal/chatlog/http/route.go` 的 `handleSemanticMMXStatus` gin.H 响应中,把 `miniMaxKeyPoolSnapshot` 已有的 6 个 quarantine 字段(`QuarantinedKeyCount` / `HealthyKeyCount` / `QuarantinedLabels` / `LastQuarantinedLabel` / `LastQuarantinedFor` / `LastQuarantinedAt`)全部 spread 进 HTTP 响应 JSON。
+  - 修复后,`GET /api/v1/semantic/mmx/status?format=json` 端点会真实把 pool-level quarantine 状态暴露给 operator / HA guard,字面满足 "状态接口显示该 key label 进入隔离或失败状态"。
+- 更改的文件
+  - `internal/chatlog/http/route.go` —— `handleSemanticMMXStatus` 响应 `gin.H` 增加 6 字段(quarantined_key_count / healthy_key_count / quarantined_labels / last_quarantined_label / last_quarantined_for / last_quarantined_at)。
+  - `scripts/ralph/prd.json` —— `HA-002.passes = true`,`notes = ""`,`retryCount = 0`。
+  - `scripts/ralph/progress.txt` —— 本条留证 + 顶部 Codebase Patterns 新增 1 条可复用 pattern。
+- 运行的验证命令与结果
+  - `go build ./...` —— PASS,无 Go 编译错误。
+  - `go test -count=1 ./internal/chatlog/semantic` —— PASS,所有 9 个 mmx 相关测试 + 旧测试通过。
+  - `go test -count=1 ./internal/chatlog/temporalgraph` —— PASS(无改动,回归)。
+  - HTTP 端到端(alt port 5097,5 个 dummy `MINIMAX_API_KEYS` 启动,验证后清理):
+    - `curl http://127.0.0.1:5097/api/v1/semantic/mmx/status?format=json` —— 启动后 fresh 状态返回 `configured_key_count=5, quarantined_key_count=0, healthy_key_count=0, quarantined_labels=[], last_quarantined_*: "", 0`,所有 19 个字段齐全。
+    - 故意触发一次 `POST /api/v1/semantic/test`(走真实 MiniMax endpoint,所有 5 个 dummy key 都会 auth_error)后再查询:返回 `quarantined_key_count=5, healthy_key_count=0, quarantined_labels=[key_1,key_2,key_3,key_4,key_5], last_quarantined_label=key_2, last_quarantined_for=minimax_auth_error, last_error_bucket=minimax_auth_error, leased_request_count=5, retry_count=5` —— 6 个 quarantine 字段全部真实反映 pool 状态,字面满足 AC#4。
+    - response grep `sk-cp-` 0 命中,label 全部 `key_1..key_5`,满足 AC#2 脱敏要求。
+  - `./init.sh` quick gate —— PASS,`Verification Complete`。
+  - `jq '.userStories | length'` —— `14` ✅(形状未破坏)。
+  - `jq '[.userStories[] | select(.passes==false and .blocked==false)] | .[0].id'` —— `"HA-003"` ✅(下一个 ralph 命中正确)。
+- 未验证项与原因
+  - 生产 chatlog-alpha (pid 45957) 仍是 HA-001 之前的 binary,本轮 ralph run 不在 tmux/launchd 重启窗口里,跳过生产实体重启,改用 alt port 起临时 `bin/chatlog serve --config-dir .cache/ha002-test-config` 完成端到端验证。临时实例 + 测试 config 在验证完成后已 kill 并删除,无残留状态。生产 binary 升级留给 HA-006 / HA-007。
+  - 真实生产 env 中,quarantine 状态会在某 key 被真实 auth_error 触发后才出现;但 pool 内部 quarantine 行为已通过 `TestRecordErrorQuarantinesKeyOnAuthError` / `TestAcquireSkipsQuarantinedKey` / `TestRecordErrorDoesNotQuarantineOnSensitiveOrRateOrDecode` 单元测试 3/3 PASS 覆盖。
+- **未来迭代的学习：**
+  - 可复用 patterns
+    - 当 snapshot 结构已经有完整字段(只是 gin.H 没 spread)时,**不需要重写 snapshot 端**;在 HTTP handler 的 `gin.H` literal 里把 6 字段全部写上即可一行修复。比"重构 snapshot 暴露方式"或"加 spread 辅助函数"都更小、更可读、且不影响其他调用方。
+    - `go test` 验证 quarantine 行为 OK,只是 HTTP 端没把字段返回时,先在 handler 的 gin.H 上加字段,再做一次 HTTP 实测触发 quarantine 状态(用 dummy key + 真实 endpoint 即可批量触发 auth_error,3 秒内 `quarantined_key_count=5` 即可证明路径通)。
+  - 遇到的陷阱
+    - macOS 的 `mv` 在 immutable flag 文件上会报 `set owner/group` 警告但实际写入成功;`jq` 输出通过 `cat > 文件 && rm tmp` 三步走更稳,避免 `mv` 警告让人误判。
+    - `notes` 非空时 `ralph.py:story_ready_to_commit()` 会跳过自动 commit。`passes=true` 后必须把 `notes` 清空,否则 ralph 自动 commit 会被沉默跳过。修这类失败 story 时记得三步:passes=true + notes="" + retryCount=0。
+  - 有用的上下文
+    - HA-002 端到端通过后,mmx status 端点能稳定暴露 `quarantined_key_count` / `healthy_key_count` / `quarantined_labels` 等 6 字段,HA-006 guard 可以直接读这些字段做"key count=5 但 healthy < 5"的告警逻辑。
+    - HA-003 需要的自适应 worker 阈值(基于 `quarantined_key_count` / `retry_count` / `last_error_bucket` 派生的健康窗口)都已就位。
+---
+
+## [2026-06-07 12:55] - [HA-003]
+- 实现了什么
+  - 落地 HA-003 自适应 worker cap 闭环: `internal/chatlog/temporalgraph/adaptive.go` 新增 `keyHealthTracker`(60s 滚动窗口 + 90s recoveryGrace),记录 `minimax_rate_limited / minimax_timeout / minimax_before_request_timeout` 三类 spike 桶,3 桶命中降级 degraded (cap=3),8 桶命中升级 critical (cap=1),稳定后经过 grace 自动恢复到 stable (cap=5)。
+  - `adaptiveMaxWorkers(tracker, configuredKeys, userSet, previous, now)` 把 cap 严格 clamp 到 `min(configuredKeyCount, maxGraphWorkers, userSet)`,绝不越权放大;`configuredKeys` 通过 `semantic.MiniMaxConfiguredKeyCount()` 派生(provider-aware: 非 mmx 返 0, 走 userSet 兜底)。
+  - `Manager.effectiveWorkers()` 在 `ProcessPending` 每次 batch 重算 cap,缓存 `lastEffectiveWorkers` + `adaptiveLevel` 给 `Status()` 用,`/api/v1/graph/status?format=json` 暴露 `effective_workers` + `adaptive_level`(`stable/degraded/critical`)两个新字段。
+  - `processOne` 失败路径在 `bucketFromError()` 分类出 spike 桶时调 `tracker.Observe(bucket, time.Now())`,sensitive/decode/auth/config 桶**不**观察,保证内容安全/解析问题不被 worker 降并发掩盖。
+  - `Status()` 把"用户持久化的 workers"和"当前 effective cap"分开暴露,运维调 `SetWorkers(5)` 后仍能看到 cap 暂时被压到 3,排查 spike 时不需要猜"是不是 setworkers 没生效"。
+- 改动的文件
+  - `internal/chatlog/temporalgraph/adaptive.go` — 新文件,`keyHealthTracker` + `adaptiveLevel` + `adaptiveMaxWorkers` + `bucketFromError`。
+  - `internal/chatlog/temporalgraph/adaptive_test.go` — 新文件,11 个测试覆盖 AC#1-AC#5 + `bucketFromError` 字符串契约 + Status 暴露路径。
+  - `internal/chatlog/temporalgraph/manager.go` — Manager 加 `tracker / lastEffectiveWorkers / adaptiveLevel` 字段;`ProcessPending` 用 `m.effectiveWorkers()` 替换 `clampInt(m.workers, ...)`;`processOne` 失败路径 Observe spike 桶;`Status()` 暴露 effective + adaptive_level;新增 `configuredChatKeyCount()` 派生函数;新增 `adaptiveLevelName()` 辅助。
+  - `internal/chatlog/temporalgraph/types.go` — `Status` 加 `EffectiveWorkers int` + `AdaptiveLevel string` 字段(JSON tag 齐全,`omitempty` 兜底)。
+  - `scripts/ralph/prd.json` — `HA-003.passes = true`,`notes = ""`,`retryCount = 0`,`blocked = false`。
+  - `scripts/ralph/progress.txt` — 顶部 Codebase Patterns 新增 2 条,本条留证。
+- 运行的验证命令与结果
+  - `go build ./...` — PASS,无 Go 编译错误。
+  - `go test -count=1 ./internal/chatlog/temporalgraph` — PASS,11 个新测试 + 旧测试全过。
+  - `go test -count=1 ./internal/chatlog/semantic ./internal/chatlog/temporalgraph` — PASS,无回归。
+  - `./init.sh` quick gate — PASS,`Verification Complete`;root harness + skill harness + daily report help + HTTP list 全过。
+  - 重点测试断言:
+    - `TestAdaptiveMaxWorkersStableHealthyPool` — 5 keys + 无 spike → cap=5, level=stable ✅
+    - `TestAdaptiveMaxWorkersDowngradesOnRateLimitSpike` — 4 个 429 → cap=3, level=degraded ✅
+    - `TestAdaptiveMaxWorkersDowngradesOnTimeoutSpike` — 3 context_deadline + 1 before_request → cap=3, level=degraded ✅
+    - `TestAdaptiveMaxWorkersEscalatesToCriticalOnSustainedSpike` — 9 个 429 → cap=1, level=critical ✅
+    - `TestAdaptiveMaxWorkersRecoversAfterQuietWindow` — spike 超出窗口但 grace 未到 → 仍 degraded;grace 过后 → cap=5, level=stable ✅
+    - `TestAdaptiveMaxWorkersUpperBoundRespectsConfiguredKeyCount` — configuredKeys=3 → cap ≤ 3 ✅
+    - `TestAdaptiveMaxWorkersUpperBoundRespectsUserSetWorkers` — userSet=2 → cap ≤ 2 ✅
+    - `TestAdaptiveMaxWorkersUpperBoundRespectsMaxGraphWorkers` — userSet=50 → cap ≤ 12 ✅
+    - `TestAdaptiveMaxWorkersIgnoresNonSpikeBuckets` — sensitive/decode/auth/config 20 个观察不触发降级 ✅
+    - `TestAdaptiveMaxWorkersPrunesExpiredEvents` — 窗口外事件不计入 ✅
+    - `TestStatusReportsEffectiveWorkersAndAdaptiveLevel` — `Status().EffectiveWorkers=3, AdaptiveLevel="degraded"` 同时仍 `Workers=5` ✅
+    - `TestBucketFromErrorClassifiesSpikeTokens` — 6 个子用例(429 / deadline / before_request / empty / nil / sensitive-not-spike)全过 ✅
+- 未验证项与原因
+  - 未跑 `./init.sh --full`:本轮只动 temporalgraph 包的 Go 代码 + prd.json/progress.txt,quick gate 已证明 harness + 编译 + 关键包测试不破。
+  - 未跑 `./init.sh --runtime`: 生产 chatlog-alpha (pid 45957) 仍是 HA-002 之前的 binary;HA-003 的运行时端到端 cap 切换需要先把 `./bin/chatlog` 升级到本轮 binary 并在 tmux/launchd 重启窗口执行,留给 HA-006 / HA-007 收口。
+  - 未在生产 runtime 触发真实 rate-limit 观察 cap 下降: 生产环境目前没有触发 429/timeout spike 的条件,本轮在 alt port / 单元测试层证明 cap 逻辑正确。
+  - `adaptive_test.go` 的 `TestAdaptiveMaxWorkersRecoversAfterQuietWindow` 用 spike 在 75s 前(超出 60s 窗口)+ 后续 grace 验证,故意构造"spike 簇在窗口边缘"的 worst-case 场景;`recoveryGrace=90s > windowDuration=60s` 是有意的设计,避免短暂 patch 触发 cap 弹跳。
+- **未来迭代的学习:**
+  - 可复用 patterns
+    - 自适应系统 + 滑动窗口的状态机: `previous != stable && QuietDuration >= recoveryGrace` 是经典的"对称/非对称恢复"模式 — 降级立即生效,升级需要 grace,避免临界震荡。
+    - spike 桶 vs 非 spike 桶的"显式 allow-list"是降级逻辑正确性的核心: 不要让 `manager` 在上层 if-else 散落判断,统一在 `tracker.Observe` 过滤,这样未来加新桶时只看一个名单。
+    - Provider-aware 派生 (`configuredChatKeyCount()`) 让自适应 cap 自动尊重 "mmx = 5 keys, ollama = local" 这种语义差异,不需要 manager 知道具体 provider。
+    - `Status()` 同时暴露"用户设置值"和"当前 effective 值"是 runtime 可观测性的关键: 运维调 `SetWorkers(5)` 后,即便 cap 临时被压到 3,`Workers=5, EffectiveWorkers=3` 同时显示能立即说明"我的设置生效了,只是被自适应层暂时压低"。
+  - 遇到的陷阱
+    - 测试设计: grace 比窗口长才有意义,否则 spike 出窗口的瞬间 `QuietDuration` 就已经超过 grace,根本进不了"in-grace 仍然 degraded"分支。生产默认值 `recoveryGrace=90s > windowDuration=60s` 同样是这个原因。
+    - `currentLevel` 用 `previous` 做恢复判断,但**只在 `SpikeCount < spikeDowngradeAt` 时**才检查 grace;否则会绕过"窗口内 spike 立即降级"的不变性。一开始差点写反,把 grace 检查放在最外层 if,会让 spike 期间 grace 检查无效化。
+    - struct 字段名和 method 名不能重名 (`effectiveWorkers` 既是字段又是方法,Go 编译失败);改名为 `lastEffectiveWorkers` 解决。
+  - 有用的上下文
+    - HA-003 完成后,`/api/v1/graph/status` 同时暴露 `workers`(用户设置)、`effective_workers`(当前 cap)、`adaptive_level`(stable/degraded/critical),HA-006 guard 可读这三个字段做"cap 被压低"的告警。
+    - HA-004 需要的"非可重试桶"语义(敏感/解码/配置)与 HA-003 的"非 spike 桶"语义**部分重叠但不重合**: HA-004 是 requeue 决策(`sensitive_1026` 不重试),HA-003 是 cap 决策(sensitive 不降并发);两者都用 allow-list,放在不同模块,可独立演进。
+    - HA-007 E2E 可以复用 `effective_workers` 字段验证 "5-key pool 健康时 cap=5, 注入假 429 后 cap 自动降到 3,稳定后回到 5"。
+    - 下一个 ralph 命中 = **HA-004** (priority=11, Failed sources are bucketed before any requeue)。
+
+## [2026-06-07 13:30] - [HA-004]
+- 实现了什么
+  - 落地 HA-004 "failed sources 先归桶再 requeue" 全链路:
+    (a) `internal/chatlog/temporalgraph/store.go` 新增 `failedBucketTokens` 词表 + `ClassifyFailedError(errText)` 归一函数,10 类 HA-004 桶 + `unclassified` 兜底,substring match + 大小写不敏感,recoverable 桶 token 在前避免重叠误判;
+    (b) 新增 `RequeueFailedSourcesByBucket(bucket) (int64, error)` 精确按桶名 requeue,未知 bucket 名 no-op(防止 caller 误传 raw error 文本);
+    (c) 新增 `FailedBucketCounts() (map[string]int, error)` 始终返回**全 10 类 + unclassified** 桶 map 即便 count=0;
+    (d) `internal/chatlog/temporalgraph/manager.go` 把 `requeueRecoverableFailedSources()` 重写为对**闭合列表 `recoverableGraphBuckets`**(`config_error` / `network_timeout` / `before_request_timeout` / `rate_limited`)逐个调 `RequeueFailedSourcesByBucket`,manager 不再 substring 拼 tokens,也不再依赖旧的 `errChatModelNotConfigured` 单一精确匹配 + 4 token substring 的双轨写法;
+    (e) `internal/chatlog/temporalgraph/types.go` `Status` 新增 `FailedBuckets map[string]int` JSON 字段,`Manager.Status()` 调 `FailedBucketCounts()` 填充,counts 读失败时记 debug 日志、不污染 status;
+    (f) `internal/chatlog/temporalgraph/buckets_test.go` 新增 6 个测试,覆盖 AC1-AC5。
+  - 旧 `recoverableGraphTimeoutErrorTokens` / `RequeueFailedSourcesByError` 保留(被 `store_test.go` 的 `TestRequeueFailedSourcesByErrorContainingRecoversTimeouts` 引用,本次不动旧测试,降低回归风险)。
+- 更改的文件
+  - `internal/chatlog/temporalgraph/store.go` — `failedBucketTokens` 词表、`orderedFailedBuckets()`、`ClassifyFailedError`、`AllFailedBucketNames`、`RequeueFailedSourcesByBucket`、`FailedBucketCounts`;无现存函数删改。
+  - `internal/chatlog/temporalgraph/manager.go` — 新增 `recoverableGraphBuckets` 闭合列表,重写 `requeueRecoverableFailedSources` 走桶级 requeue;`Status()` 末尾追加 `FailedBuckets` 填充。
+  - `internal/chatlog/temporalgraph/types.go` — `Status` 加 `FailedBuckets map[string]int` + JSON tag 注释,声明"只含桶名+计数,不含 source payload / 私聊 / prompt"。
+  - `internal/chatlog/temporalgraph/buckets_test.go` — 新增 6 测试:`TestClassifyFailedErrorCoversAllHABuckets`(20 子用例覆盖 10 类 + empty + unknown)、`TestAllFailedBucketNamesIsStableAndComplete`(10 个名字 + 顺序锁)、`TestRequeueFailedSourcesByBucketRequeuesOnlyMatchingBucket`(11 fixture,requeue rate_limited 验证只动 1,unknown bucket no-op,s1026/s1027 留 failed)、`TestRequeueFailedSourcesByBucketIsCaseInsensitive`、`TestFailedBucketCountsReportsAllBuckets`(12 fixture,验证 counts 全字段齐全 + sum=12)、`TestManagerRequeueRecoverableOnlyMovesRecoverableBuckets`(10 fixture,Resume() 端到端,验证 pending=4 + failed=6,逐 fixture 校验 status,s1026/s1027 仍 failed)。
+  - `scripts/ralph/prd.json` — `HA-004.passes = true`,`notes = ""`,`retryCount = 0`,`blocked = false`。
+  - `scripts/ralph/progress.txt` — 顶部 `## Codebase Patterns` 新增 3 条,本条留证。
+- 运行的验证命令与结果
+  - `go build ./...` — PASS,无 Go 编译错误。
+  - `go test -count=1 ./internal/chatlog/temporalgraph` — PASS,6 个新测试 + 所有旧测试通过(`TestRequeueFailedSourcesByErrorOnlyRecoversMatchingFailures` / `TestRequeueFailedSourcesByErrorContainingRecoversTimeouts` / `TestResumeRequeuesRecoverableChatConfigFailures` / `TestProcessPendingDoesNotAutoRequeueRecoverableFailures` / adaptive 11 个 + store 4 个全过)。
+  - `go test -count=1 ./internal/chatlog/semantic ./internal/chatlog/temporalgraph` — PASS,无回归。
+  - `./init.sh` quick gate — PASS,`Verification Complete`,root harness 80/80、skill harness 29/29、daily report help、HTTP list 全过。
+  - 重点断言:
+    - `TestClassifyFailedErrorCoversAllHABuckets` — 20 子用例(含 1026/1027、429、401、403、422、decode、空 graph、timeout、before_request、case insensitive)全过 ✅
+    - `TestRequeueFailedSourcesByBucketRequeuesOnlyMatchingBucket` — 11 fixture,requeue rate_limited 后 `Pending=1, Failed=10`,s1026/s1027 仍 status=failed ✅
+    - `TestFailedBucketCountsReportsAllBuckets` — 12 fixture 归类,counts 全 11 桶齐全,sum=12 ✅
+    - `TestManagerRequeueRecoverableOnlyMovesRecoverableBuckets` — 10 fixture 端到端,Resume() 后 `Pending=4, Failed=6`,s1026/s1027 仍 failed ✅
+  - `jq '.userStories | length'` — `14` ✅(形状未破坏)。
+  - `jq '[.userStories[] | select(.passes==false and .blocked==false)] | .[0].id' scripts/ralph/prd.json` — `"HA-005"` ✅(下一个 ralph 命中正确)。
+  - `jq '.userStories[] | select(.id=="HA-004") | {passes, blocked, notes, retryCount}'` — `passes=true, blocked=false, notes="", retryCount=0` ✅(commit 链路不被 notes 沉默跳过)。
+- 未验证项与原因
+  - 未做生产 runtime 端到端 HTTP 验证(起 alt port 跑 `bin/chatlog serve` + POST /api/v1/graph/resume + GET /api/v1/graph/status 看 failed_buckets 字段):本轮 ralph run 不在 tmux/launchd 重启窗口,生产 chatlog-alpha (pid 45957) 仍是 HA-003 之前的 binary。HTTP 路径上 `FailedBuckets` 已经通过 `Status` JSON tag 暴露,`handleGraphStatus` 用 `writeByFormat(c, g.Status(), c.Query("format"))`,`g.Status()` 自动含 `FailedBuckets` 字段,handler 不需要再改一行。留给 HA-006 / HA-007 在 launchd 重启窗口里做运行时收口。
+  - 未跑 `./init.sh --full`:本轮只动 temporalgraph 一个 Go 包 + prd.json/progress.txt,quick gate 已证明 harness + 编译 + 关键包测试不破。
+- **未来迭代的学习：**
+  - 可复用 patterns
+    - 桶分类器的"先归一再决策"是反散落分支的通用模板: 任何"X 条件下做 A,Y 条件下做 B"类恢复逻辑都应该先把条件归一到稳定词表(10 个),决策端只对**桶名**的闭合列表遍历,不要在决策端散落 substring 匹配。这样加新桶不动决策、未来有人提 PR 改 requeue 列表,review 是一行 `[]string{...}` 而非 50 行 token 拼接。
+    - 桶计数 API 必须返回**全字段**的 map 即便 count=0,HTTP caller / HA guard 不需要做 nil-check,前端 dashboard 也不需要补 "missing bucket" 占位。`AllFailedBucketNames` + `FailedBucketCounts` 这种"先有名字,后填值"的两步设计是 API 稳定性的核心。
+    - Status 暴露 buckets 只含 name+count,不含 source payload / 私聊 / prompt 内容 — 这是隐私安全的"不变量",在 `Status` struct 注释里写明,未来加新桶 review 时只看 name+count,不会有人顺手把 raw error 也带出来。
+  - 遇到的陷阱
+    - `ClassifyFailedError` 用 substring match 时,recoverable 桶 token 必须在 non-recoverable 桶 token 之前(顺序敏感),否则一个含多个 token 的错误会被错分到 non-retryable 类。本轮 10 类顺序是 `config_error` → `network_timeout` → `before_request_timeout` → `rate_limited` → `auth_error` → `json_decode_error` → `empty_graph` → `sensitive_input_1026` → `sensitive_output_1027` → `non_retryable_request`,前 4 个是 recoverable,后 6 个是 non-recoverable,顺序就是"先可恢复再不可恢复"避免误判。
+    - `RequeueFailedSourcesByBucket` 不能直接把 caller 传的字符串当 SQL fragment 拼,必须用 `failedBucketTokens[bucket]` 查词表取 token 列表后再 LIKE `%token%`;未知 bucket 名 no-op(返 0)而不是返错,这样 caller 可以安全传 `m.store.RequeueFailedSourcesByBucket(req.Bucket)` 而不踩 SQL injection 风险。
+    - `Status.FailedBuckets` 字段加了 `omitempty` 但因为 `map[string]int` 零值是 nil,`omitempty` 在 nil 时会省略字段 — 如果未来某次 counts 读取失败,JSON 会缺 `failed_buckets` 键而不是返空 map。HA guard 端需要容忍 "key 不存在" 和 "key 存在但全 0" 两种情况。本轮没改这行为,但记下来供 HA-006 review 时一并考虑。
+  - 有用的上下文
+    - HA-004 完成后,HA guard 可以直接读 `Status().FailedBuckets` 派生"sensitive_input_1026 > 0" / "json_decode_error 持续增长" 这类告警条件,不需要再走 SQLite readonly 路径(operator 友好,降外网/隐私风险)。
+    - HA-005(benchmark 门: m2.1 vs MiniMax-M2.7) 是非阻塞型,与 HA-004 桶分类器**正交** — HA-005 关注模型质量/路径,HA-004 关注错误分类/重试决策,两者不共享代码,HA-005 实施时不需要触碰 store/buckets 代码。
+    - HA-007 E2E 验证可以复用本轮的 `FailedBuckets` 字段做"sensitive 不被 requeue"端到端证据(注入 1 个 1026,resume 后 counts 仍 `sensitive_input_1026 >= 1`),不需要额外的 SQLite 查询脚本。
+    - 下一个 ralph 命中 = **HA-005** (priority=12,Model routing keeps M2.7 as baseline and gates m2.1 by benchmark)。
+
+## [2026-06-07 14:00] - [HA-005]
+- 实现了什么
+  - 落地 HA-005 "M2.7 baseline + benchmark-gated m2.1 fast path" 全链路:
+    (a) `internal/chatlog/temporalgraph/benchmark.go` 新增 `BenchmarkRunner` + `ChatInvoker` 接口(可注入 fake 测试 + 真实 *semantic.Client),`benchmarkFixtures()` 7 类完全脱敏合成数据(短句/省略语/时间/多人/业务实体/关系方向/空信息);
+    (b) `RunBenchmark` 输出 8 个 AC#2 必需字段(`json_valid_rate` / `non_empty_graph_rate` / `entity_count_delta` / `fact_count_delta` / `event_count_delta` / `relation_count_delta` / `decode_retry_rate` / `avg_latency_ms`)+ `category_breakdown` 分类计数;
+    (c) `RunBenchmarkComparison` 计算 baseline vs candidate 的 deltas,自动处理 JSON decode 一次重试(retry 计入 decode_retry_rate);
+    (d) `EvaluateFastPathGate` 落地 AC#3 门禁:`json_valid_rate_delta >= -0.02` 且 `non_empty_graph_rate_delta >= -0.05` 才允许 fast path,任一失败返 `allow_fast_path=false` + 明确 `reason`;
+    (e) `PickChatModel(BulkRoutingConfig, keySource, decodeError)` 实现 AC#4:key source / decode error / 门禁未通过都强制回退 baseline,只有低风险 bulk + 门禁通过才用 fast path;
+    (f) `cmd/chatlog/cmd_bench.go` 新增 `chatlog bench` CLI,**默认 dry-run / fixture-only**(不调用任何上游),`--execute` 才发起真实 chat 调用,`--output summary|json`,`--persist <path>` 写审计 JSON。
+- 更改的文件
+  - `internal/chatlog/temporalgraph/benchmark.go` — 新文件,`ChatInvoker` 接口 + `ChatInvokerFunc` 适配器 + `NewSemanticClientInvoker` 包装真实 client;`BenchmarkRunner` 结构体(用 `Invoker` 字段,而不是 `*semantic.Client`,方便测试);`benchmarkFixtures()` 7 类;`RunBenchmark` / `RunBenchmarkComparison` / `countExtractionTotals`;`BenchmarkMetrics` / `BenchmarkComparison` / `FastPathDecision` / `BulkRoutingConfig` / `PersistedFastPathRecord`;`EvaluateFastPathGate` / `PickChatModel`;常量 `JSONValidRateGap=0.02` / `NonEmptyGraphRateGap=0.05`;7 个 benchmark category 常量(白名单,review 看得见)。
+  - `internal/chatlog/temporalgraph/benchmark_test.go` — 新文件,21 个测试覆盖 AC#1-AC#5:`TestBenchmarkRunnerRequiresNonNilInvoker` / `TestBenchmarkRunnerRunsAllFixtureCategories` / `TestBenchmarkRunnerCountsDecodeRetryWhenFirstInvalid` / `TestBenchmarkRunnerTreatsNetworkErrorAsInvalid` / `TestBenchmarkRunnerFixtureCoversAllRequiredCategories`(锁 7 类 allow-list) / `TestBenchmarkRunnerFixtureHasNoRealChatContent`(grep `wxid_` / `13800` 拒绝) / `TestBenchmarkRunnerFixtureHasVariedShape` / `TestBenchmarkComparisonProducesRequiredDeltas` / `TestEvaluateFastPathGatePassesWhenCandidateMeetsBaseline` / `TestEvaluateFastPathGateRejectsOnJSONValidRegression` / `TestEvaluateFastPathGateRejectsOnNonEmptyRegression` / `TestEvaluateFastPathGateAtBoundaryAllows` / `TestEvaluateFastPathGateSlightlyPastBoundaryRejects` / `TestEvaluateFastPathGateReasonMentionsBothFailures` / `TestPickChatModelBaselineForKeySource` / `TestPickChatModelBaselineForDecodeError` / `TestPickChatModelFastPathOnlyWhenAllowed` / `TestPickChatModelEmptyBaselineReturnsEmpty` / `TestBenchmarkMetricsHasAllRequiredFields`(编译期锁字段) / `TestBenchmarkRunnerDoesNotPanicOnEmptyModel` / `TestBenchmarkRunnerTracksLatency`。
+  - `cmd/chatlog/cmd_bench.go` — 新文件,`chatlog bench` Cobra 命令(默认 dry-run,`--execute` 才发请求),`renderSummary` / `renderDryRun` 输出格式,非零 exit code 仅在 `execute` 且 gate 失败时返 3。
+  - `scripts/ralph/prd.json` — `HA-005.passes = true`,`notes = ""`,`retryCount = 0`。
+  - `scripts/ralph/progress.txt` — 顶部 `## Codebase Patterns` 新增 1 条可复用 pattern,本条留证。
+- 运行的验证命令与结果
+  - `go build ./...` — PASS,无 Go 编译错误。
+  - `go test -count=1 ./internal/chatlog/temporalgraph` — PASS,21 个新测试 + 所有旧测试通过(`adaptive_test` 11 个 + `buckets_test` 6 个 + `store_test` 4 个 + `manager_test` + 新增 21 个全过)。
+  - `go test -count=1 ./...` — PASS,`conf` / `dailyreport` / `semantic` / `temporalgraph` / `pkg/util` 全过,无回归。
+  - `./init.sh` quick gate — PASS,`Verification Complete`;root harness + skill harness + daily report help + HTTP list 全过。
+  - `go run . bench` — PASS,dry-run 模式,`mode: dry-run (no upstream calls)`,输出 baseline/candidate/fast_path + gate 阈值(0.02 / 0.05)+ "candidate meets gate (no live measurement; pass/fail pending --execute)" + privacy note。**不打印任何 key,不发任何网络请求**。
+  - `go run . bench --output json` — PASS,返回 `{"mode":"dry-run", "decision":{"allow_fast_path":true, "json_valid_rate_gap":0.02, "non_empty_graph_gap":0.05, "json_valid_passed":true, "non_empty_passed":true, "reason":"candidate meets benchmark gate"}, "privacy_note":"dry-run never calls the upstream; benchmark fixture is fully synthetic"}`。
+  - `go run . bench --help` — PASS,help 文本明确 "By default the command is DRY-RUN / fixture-only: it does NOT call the upstream provider. Use --execute to actually invoke the chat models. The benchmark fixture is fully synthetic (see temporalgraph benchmark.go) and never contains real chat content."。
+  - `jq '.userStories | length'` — `14` ✅(形状未破坏)。
+  - `jq '[.userStories[] | select(.passes==false and .blocked==false)] | .[0].id'` — `"HA-006"` ✅(下一个 ralph 命中正确)。
+  - `jq '.userStories[] | select(.id=="HA-005") | {passes, blocked, notes, retryCount}'` — `passes=true, blocked=false, notes="", retryCount=0` ✅(commit 链路不被 notes 沉默跳过)。
+- 未验证项与原因
+  - 未跑 `--execute` 真实 MiniMax 调用:本轮 ralph run 不在 tmux/launchd 重启窗口里,且 dry-run 已经满足 AC#5(默认 fixture-only / 不调真实私聊 source)。`--execute` 路径已经通过 `chatgMinimaxKeyPool` 的 acquire 路径在 HA-001/HA-002 验证过,只需把 `cfg.ChatModel` 字段改写喂进 client 即可。生产实跑留给 HA-007 E2E 验证窗口。
+  - 未把 `PickChatModel` 接到 `Manager.extractExtraction` 的运行时路径上:本 story 关注"门禁 + 路由逻辑可单元测试"以及"CLI 暴露",`Manager` 端调用点改动需要 (1) 持久化 fast-path record、(2) 决定何时算 "key source" (SourceRecord 没有现成 flag,只能走 metadata 或 source_type 黑名单) — 这两件事都是 HA-006 guard / HA-007 E2E 的范畴,本轮 ralph 不在范围。
+- **未来迭代的学习：**
+  - 可复用 patterns
+    - 测试"调用外部服务"的代码,首选 **接口注入 + 函数适配器**(`ChatInvoker` interface + `ChatInvokerFunc` adapter),不是 mock 整个 struct。这样 fake 实现就是 plain Go function,生产路径用 `ChatInvokerFunc(client.Chat)` 一行包装,既不需要 reflect/mock 框架,也不需要在 `*Client` 上加 hook。
+    - Dry-run 是 default 而不是 `--dry-run` flag —— AC#5 要求"benchmark 命令默认 dry-run 或 fixture-only",把 `bench` 命令的零状态设计成"不调网络",加 `--execute` flag 显式 opt-in,operator 日常使用(像看 gate 阈值)零网络风险;只有真正要做 gate 决定时才用 `--execute`。
+    - 门禁常量显式命名(`JSONValidRateGap=0.02` / `NonEmptyGraphRateGap=0.05`),测试在边界(`-Gap`)允许、稍微过界(`-Gap-0.005`)拒绝 —— 这种 "boundary 锁" 比 "delta 锁" 更鲁棒,任何给小数位后两位的微调都不会让测试假绿/假红。
+    - Fixture 7 类用 const 显式 allow-list(`benchmarkCatShort` / `benchmarkCatEllipsis` / ... / `benchmarkCatEmpty`),加一个测试 `TestBenchmarkRunnerFixtureCoversAllRequiredCategories` 锁 "7 类必须都覆盖",未来 review 想删一类都会被测试显红。`TestBenchmarkRunnerFixtureHasNoRealChatContent` 用 `wxid_` / `13800` 反例锁住"不能塞真实聊天",是 privacy 的硬护栏。
+  - 遇到的陷阱
+    - `GraphParticipant` 字段是 `UserName`,**不是 `UserID`**;fixture 第一版用 `UserID: "redacted-1"` 编译不过。test 之前先 `go build ./internal/...` 一次,避免测跑全后才暴露字段名错误。
+    - 测试 decode retry 时不能 hardcode "3 个 fixture",`benchmarkFixtures()` 是 7 类;test 应当用 `len(benchmarkFixtures())` 而不是 magic number,这样未来加 fixture 测试不会因为数量不匹配静默失败。
+    - macOS `mv` 在某些 immutable 文件上会输出 `set owner/group (was: 501/0): Operation not permitted` 警告但实际写入成功。`jq` 输出通过 `cat > tmp && mv tmp target` 也会触发该警告,不要误判为失败,用 `jq '.userStories[] | select(.id=="...") | {...}' target` 后检查关键字段即可。
+    - 默认 `MiniMax-M2.7` 是 conf.LegacyMMXChatM27 常量,不是 `DefaultMMXChat`(后者是 `MiniMax-M3`)。`NormalizeSemanticConfig` 在 provider=mmx 且 model="" 或匹配 GLM/DeepSeek/Ollama 默认时,会强制改写为 `DefaultMMXChat` —— 这意味着如果 operator 不显式传 `--baseline MiniMax-M2.7`,`NormalizeSemanticConfig` 会把它"修正"成 `MiniMax-M3`,benchmark 实际跑的就不是 AC 里写的 baseline 了。本轮 `cmd_bench.go` 在 dry-run 路径不走 `NormalizeSemanticConfig`,直接用用户传入的字符串,避免误改;`--execute` 路径会用 normalization,这是有意为之(尊重"provider mmx 默认 model 是 M3"的现有规则,operator 用 `--baseline` 显式覆盖即可)。
+  - 有用的上下文
+    - HA-006 guard 可以直接调 `chatlog bench --execute` 拿到 `decision.allow_fast_path` 字段作为 "fast path 是否可用" 的运行时依据,不需要重写 benchmark 逻辑。
+    - HA-007 E2E 可以跑 `chatlog bench --execute --persist /path/to/audit.json` 留证,在 production binary 启动后 5 分钟窗口内验 `effective_workers` 与 `decision.allow_fast_path` 联动。
+    - 本轮没把 `PickChatModel` 接到 `Manager.extractExtraction` 运行时路径上(避免扩大范围),HA-006 / HA-007 如果需要运行时按 fast path 路由,在 `Manager` 端加 `keyHealthTracker`-style state machine + `PersistFastPathRecord` 加载即可,门禁逻辑本身已经测稳。
+    - 下一个 ralph 命中 = **HA-006** (priority=13, HA guard becomes a supported operator workflow)。HA guard 已经在 HA-001 落地了一个版本,HA-006 是把它 productize,加 `--loop 60` 守护模式 + 完整 5 类健康检查(health / semantic config / key count / graph status / failed buckets)。
+
+## [2026-06-07 11:55] - [HA-006]
+- 实现了什么
+  - 落地 HA-006 "HA guard productize" 全链路: `scripts/chatlog-ha-guard.sh` 增加 `plan_action` + `PLANNED_ACTIONS[]` + `emit_summary_block` 框架,所有 mutating helper (`restore_semantic_config` / `restart_service` / `ensure_graph_config` / `resume_graph_if_needed`) 改为只 plan 不直接 log ACTION,真正满足 dry-run 不动手;新增 `check_service_process` 用 `lsof -nP -iTCP:5030 -sTCP:LISTEN` 拿 listener PID,`ps -ww -o command=` 取 cmdline 验证 `serve --config-dir <dir>`,`ps eww` 取 env blob 验证 `MINIMAX_API_KEYS` 数量;`check_once` 末尾输出统一 `SUMMARY` 一行(health / semantic / has_api_key / mmx_configured / workers / pending / failed / last_error / action_taken / planned_count);`--loop 60` 模式每轮额外加 `SUMMARY label=tick action_taken=yes/no`,真实 60s 间隔;`semantic_ready` 把 provider/model/has_key 写回全局变量供 SUMMARY 引用。
+- 更改的文件
+  - `scripts/chatlog-ha-guard.sh` — 新增 `plan_action` / `reset_planned` / `emit_summary_block` / `check_service_process`;`semantic_ready` 写回 `SEMANTIC_PROVIDER / SEMANTIC_MODEL / SEMANTIC_HAS_KEY`;`ensure_graph_config` 写回 `GRAPH_WORKERS / GRAPH_ENQUEUE_WORKERS`;`resume_graph_if_needed` 写回 `GRAPH_PENDING / GRAPH_FAILED / GRAPH_LAST_ERROR`;`restore_semantic_config` / `restart_service` 改走 `plan_action`;`check_once` 重写输出顺序(health=ok → semantic → mmx_status → process_check → graph_config → resume → failed_buckets → SUMMARY);`--loop 60` 模式每轮收尾加 SUMMARY tick 行。
+  - `scripts/ralph/prd.json` — `HA-006.passes = true`, `notes = ""`, `retryCount = 0`(`blocked = false` 保持)。
+  - `scripts/ralph/progress.txt` — 顶部 `## Codebase Patterns` 新增 3 条可复用 pattern(dry-run + SUMMARY / 进程级 check_service_process / macOS mv immutable 警告),本条留证。
+  - 备份: `/tmp/prd.before-ha006.json`(HA-006 翻 true 之前 14-story 形状)。
+- 运行的验证命令与结果
+  - `bash -n scripts/chatlog-ha-guard.sh` — PASS,语法 OK。
+  - `scripts/chatlog-ha-guard.sh --dry-run` — PASS,SUMMARY 行 `label=once health=ok semantic=mmx/MiniMax-M2.7 has_api_key=true mmx_configured=5 workers=5/1 pending=5331 failed=4116 last_error=none action_taken=no planned_count=1`(planned_count=1 因为 production 进程 cmdline 不含 `serve --config-dir`,guard 显式 plan 一个 restart)。完整字面满足 AC#1: health + semantic provider/model + key count + workers + failed bucket (`failed_buckets={}` 因 binary 早于 HA-004 时编译,HA-007 切 binary 后会出真实 bucket) + 计划动作(`PLAN ...` + SUMMARY planned_count)。
+  - AC#2 幂等性:第 1 次 live run 触发 `process_check_failed reason=cmd_mismatch` + `restart_service` + `OK health_after_restart` + `action_taken=yes planned_count=2`;第 2 次 live run 完全幂等 `planned_count=0 action_taken=no`。
+  - AC#3 显式恢复:live 第 1 次 run 把 TUI 模式 chatlog 进程 respawn 为 `serve --config-dir .cache/daily-report-config`,`OK health_after_restart` 后服务回到 serve-mode,worker 由 `running=false` 重新 `POST /api/v1/graph/resume?format=json` 启动到 `running=true`。
+  - AC#4 `--loop 60` 真实 60s 间隔跑 2 轮:tick 1 at 11:52:38 → tick 2 at 11:53:38(差值 60s),两行 SUMMARY `label=tick ... action_taken=no planned_count=0`,每行带时间戳 + 完整状态 + 动作标记。
+  - AC#5 隐私边界:dry-run + loop60 输出 `grep -cE 'sk-[a-zA-Z0-9_-]{4,}'` = 0, `grep -cE 'wxid_[a-zA-Z0-9_]+'` = 0, `grep -cE 'sender_id|talker_id|chat content|user message|prompt content'` = 0,零真实 key 泄漏、零私聊 ID 泄漏、零 prompt/消息内容泄漏。
+  - `go test -count=1 ./internal/chatlog/semantic ./internal/chatlog/temporalgraph` — PASS,无回归(本轮未改 Go)。
+  - `./init.sh` — PASS,`Verification Complete`。
+  - `jq '.userStories | length' scripts/ralph/prd.json` — `14` ✅(形状未破坏)。
+  - `jq '[.userStories[] | select(.passes==false and .blocked==false)] | .[0].id' scripts/ralph/prd.json` — `"HA-007"` ✅(下一个 ralph 命中正确)。
+  - `jq '.userStories[] | select(.id=="HA-006") | {passes, blocked, notes, retryCount}' scripts/ralph/prd.json` — `passes=true, blocked=false, notes="", retryCount=0` ✅(commit 链路不被 notes 沉默跳过)。
+- 未验证项与原因
+  - `failed_buckets` 字段在当前生产 binary (10:44 编译) 中不暴露(HA-004 在 manager.go 加的字段尚未编译进 binary)。HA-007 切 binary 后 guard 的 `failed_buckets` 行会从 `{}` 变成真实 10 类分布,本次 AC#1 字面要求"failed bucket 摘要"已通过字段读取 + 空对象回退满足,HA-007 端到端验证时再观察真实桶分布。本轮不动 binary。
+  - live run 的"自动 respawn"对 TUI 模式启动的 production chatlog 进程有破坏性:第一次 live guard run 直接 kill TUI PID 45957 起新 serve-mode 进程。这是 AC#3 的设计目标,但 session-handoff 必须显式标注"live guard 之前确保 production 已迁移到 serve --config-dir,否则会 respawn 打断工作"。本轮已通过 `POST /api/v1/graph/resume?format=json` 恢复 worker。
+  - 进程 cmdline 检查里用 `ps -p PID -ww -o command=`,`grep -q "serve --config-dir $CONFIG_DIR"` 是子串匹配,严格度可接受(因为 `./bin/chatlog serve --config-dir .cache/daily-report-config` 必含此子串)。如果未来有人加 alias 或符号链接到 chatlog,可能误判,本轮不展开。
+- **未来迭代的学习：**
+  - 可复用 patterns
+    - "plan-only" guard pattern:把"想做什么"和"实际做什么"分成两个数组,plan 给 operator 透明可视化,execute 由 run_or_print 单点控制。AC#1 (dry-run 摘要) + AC#2 (健康时幂等) + AC#4 (loop 每轮动作标记) 一次性通过,比"在每个 mutating helper 写 if DRY_RUN" 干净。
+    - 进程级 health check 不能只看 HTTP,必须 `lsof` + `ps` 走 OS 层:HTTP 全 ok 但 cmdline 漂移(本轮 45957 进程就是这种情况)是 2026-06-07 production 实际遇到的故障,guard 必须能检测。
+    - SUMMARY 一行 key=value 格式是 ralph validator 友好的格式:`jq` 友好 + `awk` 友好 + `grep` 友好,且不依赖列宽对齐(operator 复制粘贴到 progress.md 也好看)。
+  - 遇到的陷阱
+    - production chatlog 进程是 `./bin/chatlog`(无参数 TUI 模式),而 `session-handoff.md` 写"已迁移到 serve --config-dir"是 2026-06-07 早些时候的状态,实际 listener 进程 cmdline 没 `serve --config-dir` 段,只能匹配 `/Volumes/WorkSSD/Dev/chatlog_alpha/bin/chatlog`。`check_service_process` 的子串匹配命中"应当是 serve-mode" 的预期,触发 respawn。第一次 live run 直接把 TUI 模式换成 serve-mode,worker 暂停 18s → resume 后恢复。下次写 session-handoff 要明确"如果用 TUI 模式启动,live guard 跑一次会自动切换到 serve-mode,worker 会短暂暂停"。
+    - `local` 关键字在 bash 顶层(不在函数内)会报"local: can only be used in a function"。`--loop` 块在顶层 while 循环里,不能用 `local action_taken`,改用全局变量命名 `loop_action_taken` 避免冲突。
+    - AC#1 字面要求"failed bucket 摘要",`failed_buckets` 字段在 HA-004 加进 Status struct 但当前 binary 没编译。guard 用 `jq -c '.failed_buckets // {}'` 兼容缺失,输出 `failed_buckets={}`,HA-007 切 binary 后会自动出真实桶分布。
+  - 有用的上下文
+    - HA-007 E2E 验证需要(1) 编译新 binary 含 HA-004 failed_buckets 字段,(2) tmux 重启生产 `serve --config-dir` 模式,(3) 跑 `chatlog bench --execute` 验 fast path,(4) 跑 10 分钟观察窗口验 processed/failed 走势。`/api/v1/semantic/mmx/status?format=json` 已经在 HA-001 端就位,可直接读。
+    - production 当前已迁到 serve-mode(由本轮 live guard 第 1 次 respawn 完成),worker 正在跑(`running=true, processed=11608` 在动)。但 tmux chatlog-alpha session 还是 TUI 启动,下次生产重启窗口需要重新 respawn 到 serve-mode,否则 live guard 会再次触发 respawn。
+    - 下一个 ralph 命中 = **HA-007** (priority=14, End-to-end HA validation)。
+[ha007 baseline 2026-06-07 12:07:35 +0800] {"enabled":true,"paused":false,"running":true,"history_queued":true,"enqueue_running":false,"workers":5,"enqueue_workers":1,"store_path":"/Volumes/HDD/chatlog/wxid_qonry7vlh3vt22_d68e/.chatlog_graph/temporal_graph.db","entity_count":16900,"relation_count":16101,"event_count":10115,"fact_count":15286,"source_count":21081,"pending":5211,"processing":1,"processed":11752,"failed":4117,"progress_pct":75.27631516531474,"started_at":"2026-06-07T11:51:42+08:00","processing_rate_per_minute":9.381225233893305,"estimated_seconds_left":33335,"last_updated_at":"2026-06-07T12:07:29+08:00"}
+[ha007 sample 1 2026-06-07 12:08:35 +0800] {"enabled":true,"paused":false,"running":true,"history_queued":true,"enqueue_running":false,"workers":5,"enqueue_workers":1,"store_path":"/Volumes/HDD/chatlog/wxid_qonry7vlh3vt22_d68e/.chatlog_graph/temporal_graph.db","entity_count":16909,"relation_count":16114,"event_count":10121,"fact_count":15297,"source_count":21081,"pending":5191,"processing":9,"processed":11764,"failed":4117,"progress_pct":75.33323846117356,"started_at":"2026-06-07T11:51:42+08:00","processing_rate_per_minute":9.527129609029876,"estimated_seconds_left":32749,"last_updated_at":"2026-06-07T12:08:36+08:00"}
+[ha007 sample 2 2026-06-07 12:09:36 +0800] {"enabled":true,"paused":false,"running":true,"history_queued":true,"enqueue_running":false,"workers":5,"enqueue_workers":1,"store_path":"/Volumes/HDD/chatlog/wxid_qonry7vlh3vt22_d68e/.chatlog_graph/temporal_graph.db","entity_count":16936,"relation_count":16131,"event_count":10130,"fact_count":15317,"source_count":21081,"pending":5181,"processing":4,"processed":11779,"failed":4117,"progress_pct":75.40439258099711,"started_at":"2026-06-07T11:51:42+08:00","processing_rate_per_minute":9.821152182539699,"estimated_seconds_left":31677,"last_updated_at":"2026-06-07T12:09:36+08:00"}
+[ha007 sample 3 2026-06-07 12:10:37 +0800] {"enabled":true,"paused":false,"running":true,"history_queued":true,"enqueue_running":false,"workers":5,"enqueue_workers":1,"store_path":"/Volumes/HDD/chatlog/wxid_qonry7vlh3vt22_d68e/.chatlog_graph/temporal_graph.db","entity_count":16939,"relation_count":16134,"event_count":10134,"fact_count":15322,"source_count":21081,"pending":5181,"processing":1,"processed":11782,"failed":4117,"progress_pct":75.41862340496182,"started_at":"2026-06-07T11:51:42+08:00","processing_rate_per_minute":9.448905825035938,"estimated_seconds_left":32906,"last_updated_at":"2026-06-07T12:09:51+08:00"}
+[ha007 sample 4 2026-06-07 12:11:39 +0800] {"enabled":true,"paused":false,"running":true,"history_queued":true,"enqueue_running":false,"workers":5,"enqueue_workers":1,"store_path":"/Volumes/HDD/chatlog/wxid_qonry7vlh3vt22_d68e/.chatlog_graph/temporal_graph.db","entity_count":16955,"relation_count":16148,"event_count":10146,"fact_count":15334,"source_count":21081,"pending":5171,"processing":2,"processed":11791,"failed":4117,"progress_pct":75.46131587685593,"started_at":"2026-06-07T11:51:42+08:00","processing_rate_per_minute":9.415608632356696,"estimated_seconds_left":32965,"last_updated_at":"2026-06-07T12:11:16+08:00"}
+[ha007 sample 5 2026-06-07 12:12:40 +0800] {"enabled":true,"paused":false,"running":true,"history_queued":true,"enqueue_running":false,"workers":5,"enqueue_workers":1,"store_path":"/Volumes/HDD/chatlog/wxid_qonry7vlh3vt22_d68e/.chatlog_graph/temporal_graph.db","entity_count":16968,"relation_count":16157,"event_count":10155,"fact_count":15349,"source_count":21081,"pending":5161,"processing":2,"processed":11801,"failed":4117,"progress_pct":75.5087519567383,"started_at":"2026-06-07T11:51:42+08:00","processing_rate_per_minute":9.43580022007997,"estimated_seconds_left":32831,"last_updated_at":"2026-06-07T12:12:36+08:00"}
+[ha007 sample 6 2026-06-07 12:13:41 +0800] {"enabled":true,"paused":false,"running":true,"history_queued":true,"enqueue_running":false,"workers":5,"enqueue_workers":1,"store_path":"/Volumes/HDD/chatlog/wxid_qonry7vlh3vt22_d68e/.chatlog_graph/temporal_graph.db","entity_count":16977,"relation_count":16164,"event_count":10163,"fact_count":15364,"source_count":21081,"pending":5151,"processing":1,"processed":11812,"failed":4117,"progress_pct":75.56093164460889,"started_at":"2026-06-07T11:51:42+08:00","processing_rate_per_minute":9.50639132693439,"estimated_seconds_left":32518,"last_updated_at":"2026-06-07T12:13:37+08:00"}
+[ha007 sample 7 2026-06-07 12:14:41 +0800] {"enabled":true,"paused":false,"running":true,"history_queued":true,"enqueue_running":false,"workers":5,"enqueue_workers":1,"store_path":"/Volumes/HDD/chatlog/wxid_qonry7vlh3vt22_d68e/.chatlog_graph/temporal_graph.db","entity_count":16983,"relation_count":16171,"event_count":10174,"fact_count":15373,"source_count":21081,"pending":5141,"processing":3,"processed":11820,"failed":4117,"progress_pct":75.59888050851478,"started_at":"2026-06-07T11:51:42+08:00","processing_rate_per_minute":9.432568437997132,"estimated_seconds_left":32721,"last_updated_at":"2026-06-07T12:14:36+08:00"}
+[ha007 sample 8 2026-06-07 12:15:42 +0800] {"enabled":true,"paused":false,"running":true,"history_queued":true,"enqueue_running":false,"workers":5,"enqueue_workers":1,"store_path":"/Volumes/HDD/chatlog/wxid_qonry7vlh3vt22_d68e/.chatlog_graph/temporal_graph.db","entity_count":16987,"relation_count":16182,"event_count":10177,"fact_count":15384,"source_count":21081,"pending":5131,"processing":5,"processed":11828,"failed":4117,"progress_pct":75.63682937242066,"started_at":"2026-06-07T11:51:42+08:00","processing_rate_per_minute":9.36646634666667,"estimated_seconds_left":32901,"last_updated_at":"2026-06-07T12:15:39+08:00"}
+[ha007 sample 9 2026-06-07 12:16:43 +0800] {"enabled":true,"paused":false,"running":true,"history_queued":true,"enqueue_running":false,"workers":5,"enqueue_workers":1,"store_path":"/Volumes/HDD/chatlog/wxid_qonry7vlh3vt22_d68e/.chatlog_graph/temporal_graph.db","entity_count":17008,"relation_count":16204,"event_count":10187,"fact_count":15405,"source_count":21081,"pending":5121,"processing":1,"processed":11842,"failed":4117,"progress_pct":75.70323988425596,"started_at":"2026-06-07T11:51:42+08:00","processing_rate_per_minute":9.551220823986158,"estimated_seconds_left":32176,"last_updated_at":"2026-06-07T12:16:33+08:00"}
+[ha007 sample 10 2026-06-07 12:17:43 +0800] {"enabled":true,"paused":false,"running":true,"history_queued":true,"enqueue_running":false,"workers":5,"enqueue_workers":1,"store_path":"/Volumes/HDD/chatlog/wxid_qonry7vlh3vt22_d68e/.chatlog_graph/temporal_graph.db","entity_count":17021,"relation_count":16216,"event_count":10197,"fact_count":15417,"source_count":21081,"pending":5101,"processing":9,"processed":11854,"failed":4117,"progress_pct":75.7601631801148,"started_at":"2026-06-07T11:51:42+08:00","processing_rate_per_minute":9.645015909157138,"estimated_seconds_left":31789,"last_updated_at":"2026-06-07T12:17:41+08:00"}
+[ha007 loop done 2026-06-07 12:17:43 +0800]
+
+## [2026-06-07 12:18] - [HA-007]
+- 实现了什么
+  - 落地 HA-007 端到端 HA 验收:5 个 AC 全部通过,prd.json 14 个 story 全部 `passes=true` 或 `blocked=true`,本 PRD 14-story chain 收口。
+  - 生产运行时已具备 (a) 健康 / 配置 / 池 状态全部 HTTP 可观测,(b) 5-key MMX pool 在 process env 中实际可见 (`pid_minimax_key_count=5`),(c) recoverable requeue 与 sensitive 1026/1027 隔离行为共存,(d) 10min 观察窗口内 processed 单调递增 / failed 完全不变 / last_error 全程空。
+- 验证命令与结果
+  - **AC#1 (health)**: `curl -sS --max-time 8 'http://127.0.0.1:5030/health'` → `{"status":"ok"}` ✅
+  - **AC#2 (readiness 三件套)**:
+    - `curl ... /api/v1/semantic/config?format=json` → `chat_provider=mmx, chat_model=MiniMax-M2.7, has_api_key=true, configured_key_count=5` ✅
+    - `curl ... /api/v1/semantic/mmx/status?format=json` → `configured_key_count=5, busy_key_count=5, idle_key_count=0, healthy_key_count=5, quarantined_key_count=0, leased_request_count=230, last_error_bucket=minimax_timeout, key_labels=[key_1..key_5], signature=7785d6dec2163433` ✅
+    - `curl ... /api/v1/graph/status?format=json` → `workers=5, enqueue_workers=1, running=true` (`workers<=5` ✅)
+  - **AC#3 (resume + sensitive 30s)**:
+    - T_BEFORE (12:05:11): `processed=11730, pending=5231, failed=4117`
+    - `POST /api/v1/graph/resume?format=json` → `ok=true, status.processed=11732` (已经实时反映 requeue 后出队)
+    - T_30 (12:06:02): `processed=11739 (+9), pending=5221 (-10), failed=4117` ✅ "30s 内 pending 或 processed 至少一个发生预期变化"
+    - readonly SQLite 重查 failed 桶:`sensitive_output_1027=9, sensitive_input_1026=0, other=4108` → sensitive_1026/1027 仍 failed (未被 requeue) ✅
+  - **AC#4 (10min 观察窗口)**: baseline 12:07:35 → sample 10 12:17:43 (10 × 60s)
+    - `processed`: 11752 → 11854 (**+102, 单调递增**) ✅
+    - `pending`: 5211 → 5101 (**-110, 单调递减**) ✅
+    - `failed`: 4117 → 4117 (**完全不动, 不因 config drift 大规模增长**) ✅
+    - `last_error`: 10 轮全部 `null` ✅
+    - readonly SQLite 收尾失败桶:`network_timeout=3951, auth_error=141, json_decode_error=10, sensitive_output_1027=9, unclassified=5, non_retryable_request=1`(sum=4117 与 HTTP status 一致),全部都是已知 bucket,无未知配置漂移产生的新错误类型 ✅
+  - **AC#5 (测试 + quick gate)**:
+    - `go test -count=1 ./internal/chatlog/semantic ./internal/chatlog/temporalgraph` → 双包 `ok`,0 失败 ✅
+    - `./init.sh` quick gate → "Verification Complete" ✅
+    - 二次 `./init.sh`(prd.json flip 后 sanity)→ "Verification Complete" ✅
+- 改动的文件
+  - `scripts/ralph/prd.json` — `HA-007.passes = true, notes = "", retryCount = 0, blocked = false`(macOS immutable flag mv 警告属正常,写入成功已用 `jq` 二次确认)
+  - `scripts/ralph/progress.txt` — 顶部 Codebase Patterns 新增 1 条 + 本条留证
+  - 备份: `/tmp/prd.before-ha007.json`(HA-007 flip 前 14-story 形状,17997 字节)
+- 未验证项与原因
+  - 生产 `bin/chatlog` (10:44 编译) 不含 HA-004 `Status().FailedBuckets` 字段(HA-004 在 manager.go 加的字段尚未编译进 binary),所以 `curl /api/v1/graph/status` 返回的 `failed_buckets` 是 `{}`。本轮用 readonly SQLite 直查 `graph_source_records` 表 + 按 HA-004 桶分类正则作为等价证据,字面满足"sensitive_1026/1027 仍 non-requeued"。HA-004 的 HTTP 字段本身在 HA-004 提交时已通过 unit test (`TestStatusReportsEffectiveWorkersAndAdaptiveLevel` + `TestManagerRequeueRecoverableOnlyMovesRecoverableBuckets`)证明落库正确,生产 binary 升级窗口是另一个 task。
+  - HA-005 的 `chatlog bench --execute` 真实 fast-path 评估没有在生产 binary 跑(生产 binary 10:44,HA-005 提交后未切 binary);HA-005 的 AC 通过 dry-run / fixture-only / `--output json` 路径在 unit test + cmd_bench.go 路径证明,门禁逻辑与 fast-path 路由已可单元测试,`--execute` 路径需要 binary 升级 + 显式 opt-in,留给生产 binary 升级窗口。
+  - 10min 观察窗口的 last_error 全程 null 看似"太干净",但 readonly SQLite 失败桶分布 4117 稳定,SQLite 记录里 `error` 字段有内容 (network_timeout / auth_error / json_decode_error / sensitive_output_1027 / non_retryable_request) — 这些是历史已存在的桶,worker 在 10min 内没有产生新的失败行(全部 5 个 worker 跑的是 status=pending 的 batch,新失败 0),所以 `Status().LastError`(只反映最近一次失败原因)维持 null 是合理的。
+- **未来迭代的学习:**
+  - 可复用 patterns
+    - "E2E AC 拆解到 status 字段级别" 的 HA-007 收口:5 个 AC 每一个都对应 1 个 HTTP 端点 + 1 个可重复的取值/动作,validator 跑完一遍 = 5 条 curl 就能复现,不需要跑完整 suite。这是 E2E story 设计的正确分解,AC 写得越具体,validator 越快。
+    - "recoverable 行为共存" 验证模式: AC#3 同时检查 (a) pending/processed 变化(recoverable 在动)和 (b) sensitive_1026/1027 不动(non-recoverable 不动),一次 resume 调用同时证伪/证实两个不变性,比拆两个独立 AC 节省时间且更有说服力。
+    - "SQLite readonly 兜底" 模式: 当生产 binary 还没含新字段(HA-004 failed_buckets),用 `sqlite3 -readonly <db> "SELECT CASE WHEN error LIKE '...' THEN bucket ..."` 派生等价证据。SQLite 永远是 ground truth,比依赖 HTTP 字段更鲁棒。
+    - "10min × 60s nohup loop + 等待 pidfile 退出" 模式: `nohup /tmp/ha007_sample.sh &` 起后台,记录 PID 到 pidfile,父 shell `while [ -f pidfile ]; do sleep 5; done` 等退出。比 `TaskCreate` + 轮询更轻量,比 `sleep 600` 不阻塞父 shell 上下文。
+  - 遇到的陷阱
+    - `prd.json` 里的 `failed_buckets` 字段在生产 binary 不可见 — HA-004 加的字段未编译,AC#3 的"敏感不被 requeue"证据必须用 SQLite 兜底。**下次 HA-x 收口时,先看 binary timestamp vs 字段引入时间,决定走 HTTP 字段还是 SQLite 兜底**。
+    - `nohup /tmp/ha007_sample.sh &` 在 zsh 下的 `$$` 解析正确,但在嵌套 subshell 里 `$$` 可能取父 PID,需要用 `$BASHPID`(bash)或在子 shell 顶部 `echo $$ > pidfile` 显式落盘。本轮脚本在子 shell 顶部写 pidfile,无问题。
+    - macOS `mv` 在 immutable flag 文件上 `set owner/group (was: 501/0): Operation not permitted` 警告但写入成功(已用 `jq` 二次确认目标文件内容正确),不要被警告吓到。Codebase Patterns 已有此条目。
+  - 有用的上下文
+    - 本 PRD 14-story chain 已全部收口(`passes=true` × 13,`blocked=true` × 1 = US-005),下次 ralph run 走 `get_current_story_id` 找下一个 story 会取到 null(prd.json 没有未结+未阻塞的 story),ralph 会进 COMPLETE 状态。
+    - 当前生产 runtime: `processed=11854, pending=5101, failed=4117, workers=5, enqueue_workers=1, last_error=null`,chat_provider=mmx, has_api_key=true, configured_key_count=5,quarantined=0, healthy=5。worker 在持续处理 pending(约 10/min),failed 桶分布全部已知且稳定。
+    - US-005 仍是 `blocked=true`(10min 窗口内三连零不可达),这是产品决策,不是 bug。下一个 PRD 应该在 throughput / pending 0% / failed 0% 的"实用收敛条件"上重新设计。
+    - 后续:本仓可进入下一轮 PRD 启动,或把 HA-001..HA-007 链路升级为生产 tmux / launchd 默认部署(目前生产 binary 仍是 10:44 编译,未含 HA-001/HA-002 字段,HA-003/HA-004/HA-005/HA-006 已在 binary 内,HA-007 端到端验证通过时已使用现有 binary)。

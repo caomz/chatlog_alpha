@@ -16,7 +16,7 @@ func RenderMarkdown(report *Report) (string, error) {
 	}
 	var b bytes.Buffer
 	fmt.Fprintf(&b, "# 微信日报 - %s\n\n", report.Date)
-	b.WriteString("## 1. 今日总览\n\n")
+	b.WriteString("## 1. 当日总览\n\n")
 	fmt.Fprintf(&b, "- 群聊 @%s：%d 条\n", strings.TrimPrefix(report.Options.Mention, "@"), report.Overview.GroupMentionCount)
 	fmt.Fprintf(&b, "- 已回复：%d 条\n", report.Overview.RepliedCount)
 	fmt.Fprintf(&b, "- 未回复 / 待处理：%d 条\n", report.Overview.PendingCount)
@@ -83,7 +83,7 @@ func RenderMarkdown(report *Report) (string, error) {
 	}
 	b.WriteString("---\n\n")
 
-	b.WriteString("## 4. 今日个人私聊更新\n\n")
+	b.WriteString("## 4. 当日个人私聊更新\n\n")
 	if len(report.PrivateUpdates) == 0 {
 		b.WriteString("没有私聊更新，或本次未启用私聊统计。\n\n")
 	} else {
@@ -106,7 +106,7 @@ func RenderMarkdown(report *Report) (string, error) {
 	}
 	b.WriteString("---\n\n")
 
-	b.WriteString("## 5. 今日待办\n\n")
+	b.WriteString("## 5. 当日待办\n\n")
 	if len(report.Todos) == 0 {
 		b.WriteString("没有自动识别到待办。\n\n")
 	} else {

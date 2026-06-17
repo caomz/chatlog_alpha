@@ -96,3 +96,10 @@ sns.md
 
 # frontend-slides transient build output
 outputs/
+
+# Local private/generated workspace artifacts
+/reports
+/reports.backup-*/
+__pycache__/
+*.pyc
+/openai_prmpt.md

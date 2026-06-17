@@ -1,0 +1,263 @@
+{
+  "project": "chatlog_alpha",
+  "branchName": "ralph/temporal-graph-failed-reprocess-parallelism-2026-06-06",
+  "description": "Reprocess failed temporal graph sources and raise parallelism to 5 with guarded rollback",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Capture pre-reprocess status and failed buckets",
+      "description": "As an operator, I need a baseline of graph source counts and failed buckets so that retries can be measured without exposing chat contents.",
+      "acceptanceCriteria": [
+        "Record `GET /api/v1/graph/status?format=json` snapshot including running/pending/processing/processed/failed/source_count/workers/enqueue_workers/last_error before any recovery command.",
+        "Run a readonly SQLite bucket query against `graph_source_records` and output only status='failed' counts by normalized error prefix for private-safe observability.",
+        "Record `GET /api/v1/graph/config?format=json` baseline values.",
+        "Typecheck passes",
+        "Tests pass with `go test ./internal/chatlog/temporalgraph`"
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": "",
+      "retryCount": 0,
+      "blocked": false
+    },
+    {
+      "id": "US-002",
+      "title": "Requeue recoverable failed temporal graph sources with incremental rebuild",
+      "description": "As an operator, I want failed sources to be re-queued without resetting graph outputs, so the graph can continue processing remaining work.",
+      "acceptanceCriteria": [
+        "Call `POST /api/v1/graph/rebuild?format=json` with either body `{\"reset\": false}` or query `reset=false`.",
+        "Response contains `ok=true` and includes `status`.",
+        "Within 60 seconds, `GET /api/v1/graph/status?format=json` shows failed non-increasing and pending not decreasing unexpectedly.",
+        "Run the readonly failed-bucket query again and confirm recoverable classes decrease while explicit non-recoverable classes remain in failed.",
+        "Typecheck passes",
+        "Tests pass with `go test ./internal/chatlog/temporalgraph ./internal/chatlog/semantic`"
+      ],
+      "priority": 2,
+      "passes": true,
+      "notes": "",
+      "retryCount": 0,
+      "blocked": false
+    },
+    {
+      "id": "US-003",
+      "title": "Raise graph enqueue and worker concurrency to 5",
+      "description": "As an operator, I want graph processing to use 5 workers and 5 enqueue workers to increase throughput safely.",
+      "acceptanceCriteria": [
+        "Call `POST /api/v1/graph/config?format=json` with `{\"workers\":5, \"enqueue_workers\":5}` and receive `status.workers=5` and `status.enqueue_workers=5` in the response.",
+        "Call `GET /api/v1/graph/config?format=json` and verify persisted values remain `workers=5`, `enqueue_workers=5`.",
+        "Call `GET /api/v1/graph/status?format=json` and verify `workers=5`, `enqueue_workers=5`.",
+        "Capture `processing_rate_per_minute` and compare against pre-change snapshot.",
+        "Typecheck passes",
+        "Tests pass with `go test ./internal/chatlog/temporalgraph`"
+      ],
+      "priority": 3,
+      "passes": true,
+      "notes": "",
+      "retryCount": 0,
+      "blocked": false
+    },
+    {
+      "id": "US-004",
+      "title": "Protective rollback for non-recoverable failure bursts",
+      "description": "As an operator, I need a bounded fallback path when failures increase, so 5-way concurrency can be rolled back without data loss.",
+      "acceptanceCriteria": [
+        "Call `POST /api/v1/graph/pause?format=json` and verify `GET /api/v1/graph/status?format=json` shows `paused=true`.",
+        "Call `POST /api/v1/graph/config?format=json` to `workers=3` and `enqueue_workers=3`, and verify the API response persists these values.",
+        "Call `GET /api/v1/graph/config?format=json` and `GET /api/v1/graph/status?format=json` to confirm rollback before resume.",
+        "Call `POST /api/v1/graph/resume?format=json` and observe one full 5-minute window where `failed` and `last_error` do not continuously escalate.",
+        "Append the rollback action and timestamp to `progress.md` and `scripts/ralph/progress.txt`.",
+        "Typecheck passes",
+        "Tests pass with `go test ./internal/chatlog/temporalgraph`"
+      ],
+      "priority": 5,
+      "passes": true,
+      "notes": "",
+      "retryCount": 0,
+      "blocked": false
+    },
+    {
+      "id": "US-005",
+      "title": "Drive failed and pending queues toward zero in a bounded convergence window",
+      "description": "As an operator, I need objective convergence checks so failed/pending can be reduced to zero and kept stable within a defined runtime window.",
+      "acceptanceCriteria": [
+        "Capture baseline `GET /api/v1/graph/status?format=json` fields `running`, `pending`, `processed`, `failed`, `source_count`, and `last_error` before convergence checks.",
+        "Run a 10-minute loop (e.g., `for i in $(seq 1 10); do ...; sleep 60; done`) that calls `GET /api/v1/graph/status?format=json` every 60s and records snapshots.",
+        "In the loop, require `failed` to be non-increasing and `pending` to be non-increasing in each step.",
+        "The story passes only if there are 3 consecutive snapshots with `failed == 0` and `pending == 0`.",
+        "Persist snapshots to `scripts/ralph/progress.txt` with timestamps for audit.",
+        "If the 10-minute window cannot reach zero, append the residual baseline/observed values and mark the story `blocked=true` with a clear note for next iteration.",
+        "Typecheck passes",
+        "Tests pass with `go test ./internal/chatlog/temporalgraph`"
+      ],
+      "priority": 5,
+      "passes": false,
+      "notes": "Window-ended before 3 consecutive zero-failed/zero-pending snapshots. 10x60s loop completed (12:21:36 -> 12:30:36 +0800): failed stuck at 12, pending drained 15168 -> 15068 (~10/min). source_count=21008, workers=3, enqueue_workers=3. Single-zero in 10min is structurally unreachable; needs longer window (>=2-3h) or a different termination criterion (e.g. failed=0 stable, pending within X% of source_count). See scripts/ralph/progress.txt 12:21 entry for raw samples and analysis.",
+      "retryCount": 0,
+      "blocked": true
+    },
+    {
+      "id": "US-006",
+      "title": "Classify and isolate non-retryable failures",
+      "description": "As an operator, I need the 12 persistent failed sources to stop blocking convergence so retry logic focuses on recoverable work.",
+      "acceptanceCriteria": [
+        "Run a readonly SQLite query on `graph_source_records` for `status='failed'` and output counts by normalized `error` prefix; verify non-retryable classes include `sensitive_1026/1027` and `json_decode_or_format`.",
+        "Implement a non-retryable failure classifier so these classes are marked clearly and skipped from tight retry loops.",
+        "Add decoder guard so malformed model output in the temporal graph semantic path is caught and converted into a deterministic non-retryable classification.",
+        "Add/adjust unit tests in `internal/chatlog/temporalgraph` for both classes (no private content in test fixtures).",
+        "Run `go test ./internal/chatlog/temporalgraph` and confirm PASS.",
+        "Run `./init.sh` quick gate and confirm PASS."
+      ],
+      "priority": 6,
+      "passes": true,
+      "notes": "Completed as part of HA-004 (recoverable/non-recoverable bucketing + 1026/1027 isolation). The HA-004 AC set is a strict superset of US-006; merged in 2026-06-07 PRD consolidation.",
+      "retryCount": 0,
+      "blocked": false
+    },
+    {
+      "id": "US-007",
+      "title": "Use practical convergence thresholds for large backlogs",
+      "description": "As an operator, I need a convergence target that matches current throughput so progress can be measured without false blocking.",
+      "acceptanceCriteria": [
+        "Before rerun, capture `GET /api/v1/graph/status?format=json` baseline including `pending`, `processed`, `failed`, `source_count`, and `workers`.",
+        "Run a 3-hour observation loop (180 × 60s) with per-minute snapshots and log to `scripts/ralph/progress.txt`.",
+        "Pass if `failed` is non-increasing and `pending` has decreased at least 10% versus baseline.",
+        "If `failed` is still > 0 after 3 hours, include the residual class-level `failed` breakdown in notes and set `blocked=true` with a follow-up fix plan.",
+        "Typecheck passes",
+        "Tests pass with `go test ./internal/chatlog/temporalgraph`"
+      ],
+      "priority": 7,
+      "passes": true,
+      "notes": "Completed as part of HA-007 (end-to-end HA validation with 10min window + processed/failed movement). HA-007 replaces the 3h-observation criterion with an E2E validation; merged in 2026-06-07 PRD consolidation.",
+      "retryCount": 0,
+      "blocked": false
+    },
+    {
+      "id": "HA-001",
+      "title": "Runtime Chat readiness is observable and self-healable",
+      "description": "作为本地运维执行者,我想要系统明确显示 Temporal Graph 所依赖的 Chat provider、model、API key 可用性和启动配置来源,以便在配置漂移时能自动恢复到可处理状态。",
+      "acceptanceCriteria": [
+        "启动服务后,GET /api/v1/semantic/config?format=json 返回 chat_provider=mmx、目标 chat_model、has_api_key=true。",
+        "新增或扩展的 runtime status 返回 configured_key_count=5,但响应中不包含任何以 sk- 开头的真实 key。",
+        "当服务以错误配置启动并导致 chat model is not configured 时,运行 HA guard 后 60 秒内再次查询 semantic config,返回 chat_provider=mmx、has_api_key=true、configured_key_count=5。",
+        "HA guard 的 dry-run 输出只包含配置状态、key 数量、tmux/session/process 可见性和计划动作,不打印真实 API key。",
+        "bash -n scripts/chatlog-ha-guard.sh 通过。"
+      ],
+      "priority": 8,
+      "passes": true,
+      "notes": "",
+      "retryCount": 0,
+      "blocked": false,
+      "sourcePrd": "tasks/prd-temporal-graph-ha-keypool.md"
+    },
+    {
+      "id": "HA-002",
+      "title": "MiniMax 5-key pool status can be inspected safely",
+      "description": "作为系统调优者,我想要看到 MiniMax key pool 的可用 key 数、忙闲状态和错误桶,以便判断并发是否真的吃到了 5 个 key,而不是只靠环境变量猜测。",
+      "acceptanceCriteria": [
+        "GET /api/v1/semantic/mmx/status?format=json 或等价状态接口返回 configured_key_count=5、busy_key_count、idle_key_count、leased_request_count、retry_count、last_error_bucket。",
+        "状态接口对 key 只返回稳定脱敏 label,例如 key_1、key_2,不返回完整 key、key 前缀或可还原片段。",
+        "使用 5 个逗号分隔的 MINIMAX_API_KEYS 启动服务后,状态接口稳定显示 configured_key_count=5。",
+        "当其中一个 key 出现可识别的鉴权错误时,状态接口显示该 key label 进入隔离或失败状态,后续请求不会继续优先使用该 key。",
+        "go test ./internal/chatlog/semantic 覆盖 key count、脱敏输出、错误 key 隔离和敏感错误不切 key。"
+      ],
+      "priority": 9,
+      "passes": true,
+      "notes": "",
+      "retryCount": 0,
+      "blocked": false,
+      "sourcePrd": "tasks/prd-temporal-graph-ha-keypool.md"
+    },
+    {
+      "id": "HA-003",
+      "title": "Graph workers adapt to key-pool health",
+      "description": "作为 Temporal Graph 使用者,我想要系统在稳定时自动使用 5 并发,在 rate-limit、timeout 或上游延迟上升时自动降级,以便兼顾处理效率和失败率。",
+      "acceptanceCriteria": [
+        "当 configured_key_count=5 且最近观察窗口没有 rate-limit/timeout 激增时,GET /api/v1/graph/status?format=json 显示 workers=5。",
+        "当最近观察窗口内 rate_limited、network_timeout 或 before_request_timeout 数量超过阈值时,系统在下一次调度窗口内将 workers 降到小于 5,并能通过 GET /api/v1/graph/config?format=json 读回。",
+        "降级后,如果连续稳定窗口内 failed 不增加、last_error 为空或只有非重试桶,系统逐步恢复到不超过 configured_key_count 的 worker 数。",
+        "workers 永远不超过 configured_key_count 和现有 maxGraphWorkers 上限。",
+        "go test ./internal/chatlog/temporalgraph 覆盖稳定升并发、错误降并发、恢复升并发和上限保护。"
+      ],
+      "priority": 10,
+      "passes": true,
+      "notes": "",
+      "retryCount": 0,
+      "blocked": false,
+      "sourcePrd": "tasks/prd-temporal-graph-ha-keypool.md"
+    },
+    {
+      "id": "HA-004",
+      "title": "Failed sources are bucketed before any requeue",
+      "description": "作为数据安全负责人,我想要系统先按错误类型统计 failed sources,再只重试可恢复错误,以便避免把 sensitive 或无效请求失败反复打到模型 API。",
+      "acceptanceCriteria": [
+        "readonly SQLite bucket 查询或等价 HTTP 状态能统计 config_error、network_timeout、before_request_timeout、rate_limited、auth_error、json_decode_error、empty_graph、sensitive_input_1026、sensitive_output_1027、non_retryable_request。",
+        "POST /api/v1/graph/resume?format=json 只 requeue recoverable buckets:config_error、network_timeout、before_request_timeout、rate_limited。",
+        "sensitive_input_1026 和 sensitive_output_1027 在 resume 后仍保持 failed,不进入 pending。",
+        "requeue 前后状态快照包含 failed、pending、processed、processing、last_error,不包含私聊正文、source payload 或 prompt 内容。",
+        "go test ./internal/chatlog/temporalgraph 覆盖 recoverable 与 non-recoverable bucket 的 requeue 行为。"
+      ],
+      "priority": 11,
+      "passes": true,
+      "notes": "",
+      "retryCount": 0,
+      "blocked": false,
+      "sourcePrd": "tasks/prd-temporal-graph-ha-keypool.md",
+      "supersedes": "US-006"
+    },
+    {
+      "id": "HA-005",
+      "title": "Model routing keeps M2.7 as baseline and gates m2.1 by benchmark",
+      "description": "作为效果评估者,我想要用脱敏 fixture 对 m2.1 和 MiniMax-M2.7 做同 prompt 对比,以便只有在准确性达标时才把 m2.1 用作 fast path。",
+      "acceptanceCriteria": [
+        "提供一个不含真实聊天正文的 benchmark fixture,覆盖短句、省略语、时间表达、多人对话、业务实体、关系方向和空信息样本。",
+        "benchmark 输出至少包含 json_valid_rate、non_empty_graph_rate、entity_count_delta、fact_count_delta、event_count_delta、relation_count_delta、decode_retry_rate、avg_latency_ms。",
+        "如果 m2.1 的 json_valid_rate 低于 MiniMax-M2.7 超过 2 个百分点,或 non_empty_graph_rate 低于 MiniMax-M2.7 超过 5 个百分点,系统不得把 m2.1 设置为默认 fast path。",
+        "如果 m2.1 通过 benchmark,系统只将它用于低风险 bulk extraction;json_decode_error、低质量输出和关键来源仍升级到 MiniMax-M2.7 或配置的质量兜底模型。",
+        "benchmark 命令默认 dry-run 或 fixture-only,不调用真实私聊 source 内容。"
+      ],
+      "priority": 12,
+      "passes": true,
+      "notes": "",
+      "retryCount": 0,
+      "blocked": false,
+      "sourcePrd": "tasks/prd-temporal-graph-ha-keypool.md"
+    },
+    {
+      "id": "HA-006",
+      "title": "HA guard becomes a supported operator workflow",
+      "description": "作为长期运行任务维护者,我想要一个可重复执行的 guard 命令检查 health、semantic config、key count、graph status 和失败桶,以便 graph worker 可以在 tmux/launchd 场景下自动恢复。",
+      "acceptanceCriteria": [
+        "scripts/chatlog-ha-guard.sh --dry-run 返回当前 health、semantic provider/model、key count、workers、failed bucket 摘要和计划动作。",
+        "scripts/chatlog-ha-guard.sh 在服务健康、config 正确、key count 为 5、workers 正确时重复运行不会改变状态。",
+        "当 guard 发现服务未使用 serve --config-dir .cache/daily-report-config 或 process key count 不是 5 时,会执行明确恢复动作,并在输出中记录动作结果。",
+        "scripts/chatlog-ha-guard.sh --loop 60 能以 60 秒间隔运行,并在每轮输出时间戳、状态摘要和是否采取动作。",
+        "guard 的所有输出不包含真实 API key、私聊正文、source payload、prompt 内容。"
+      ],
+      "priority": 13,
+      "passes": true,
+      "notes": "",
+      "retryCount": 0,
+      "blocked": false,
+      "sourcePrd": "tasks/prd-temporal-graph-ha-keypool.md"
+    },
+    {
+      "id": "HA-007",
+      "title": "End-to-end HA validation proves throughput without hiding failures",
+      "description": "作为项目负责人,我想要一条完整验收路径证明 5-key HA 方案既能处理队列,又不会把失败和敏感错误掩盖掉。",
+      "acceptanceCriteria": [
+        "在服务运行时执行 curl -sS http://127.0.0.1:5030/health,返回 {\"status\":\"ok\"}。",
+        "执行 semantic status、MMX key-pool status、graph status 后,能看到 chat_provider=mmx、has_api_key=true、configured_key_count=5、workers<=5。",
+        "运行一次 recoverable resume 后,30 秒内 pending 或 processed 至少一个发生预期变化,sensitive_input_1026 / sensitive_output_1027 仍保持 non-requeued。",
+        "运行 10 分钟观察窗口后,processed 增加,failed 不因 config drift 大规模增长,last_error 为空或属于已知 bucket。",
+        "执行 go test ./internal/chatlog/semantic ./internal/chatlog/temporalgraph 和 ./init.sh 均通过,或在 PR/进度记录中明确列出失败命令、exit status、关键错误行和下一步修复。"
+      ],
+      "priority": 14,
+      "passes": true,
+      "notes": "",
+      "retryCount": 0,
+      "blocked": false,
+      "sourcePrd": "tasks/prd-temporal-graph-ha-keypool.md",
+      "supersedes": "US-007"
+    }
+  ]
+}
