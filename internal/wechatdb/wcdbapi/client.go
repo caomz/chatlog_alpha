@@ -424,6 +424,12 @@ func (c *Client) resolveDBPath(kind, path string) (string, error) {
 		p := strings.TrimSpace(path)
 		if !filepath.IsAbs(p) {
 			p = strings.TrimPrefix(strings.ReplaceAll(filepath.Clean(p), "\\", "/"), "db_storage/")
+			if !strings.Contains(p, "/") && !strings.Contains(p, string(filepath.Separator)) {
+				switch normalizeDBKind(kind) {
+				case "session", "contact", "message", "sns", "favorite", "media", "hardlink", "bizchat", "emoticon", "solitaire", "general", "head_image":
+					p = filepath.Join(normalizeDBKind(kind), p)
+				}
+			}
 			p = filepath.Join(c.dataDir, p)
 		}
 		return p, nil
@@ -558,6 +564,13 @@ func (c *Client) ensureDecrypted(src string) (string, error) {
 			_ = os.Remove(baseCopy)
 		}
 	}
+	if ok, err := isReadableSQLite(tmpPath); err != nil || !ok {
+		_ = os.Remove(tmpPath)
+		if err != nil {
+			return "", fmt.Errorf("decrypted database is unreadable; all_keys.json may be stale or invalid; rescan WeChat keys and clear wcdb cache after backup (src=%s): %w", src, err)
+		}
+		return "", fmt.Errorf("decrypted database is unreadable; all_keys.json may be stale or invalid; rescan WeChat keys and clear wcdb cache after backup (src=%s)", src)
+	}
 	if err := os.Rename(tmpPath, outPath); err != nil {
 		_ = os.Remove(tmpPath)
 		return "", err
@@ -567,6 +580,10 @@ func (c *Client) ensureDecrypted(src string) (string, error) {
 	c.cache[rel] = cacheEntry{srcMTime: srcMTime, walMTime: walMTime, keyHex: useKey, outPath: outPath}
 	c.mu.Unlock()
 	return outPath, nil
+}
+
+func normalizeDBKind(kind string) string {
+	return strings.ToLower(strings.TrimSpace(kind))
 }
 
 func (c *Client) resolveDataKey(src string) (string, error) {

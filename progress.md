@@ -2,6 +2,34 @@
 
 Last Updated: 2026-06-17
 
+## DB runtime core query recovery (2026-06-17)
+
+- **Current State**: active feature is now `db-runtime-core-query-recovery-2026-06-17` with `status=done`. User gave same-turn authorization for the previously blocked runtime operation. The live `127.0.0.1:5030` service is restarted from the rebuilt `bin/chatlog` in tmux session `chatlog-alpha`; core DB table-list queries for `session`, `contact`, and `message_0` are now HTTP 200. No chat rows, report bodies, model prompts, key contents, or private media were printed.
+- **What changed**:
+  - `internal/wechatdb/wcdbapi/client.go`: `resolveDBPath()` now maps bare relative filenames such as `session.db` through the requested group, so `group=session&file=session.db` resolves to `db_storage/session/session.db` instead of `db_storage/session.db`.
+  - `internal/wechatdb/wcdbapi/client.go`: `ensureDecrypted()` now validates the decrypted temp file with `isReadableSQLite()` before `os.Rename(tmpPath, outPath)`. Unreadable decrypt output is removed and returned as an actionable stale-key/cache error instead of poisoning `wcdb_cache`.
+  - `internal/wechatdb/wcdbapi/client_test.go`: added focused coverage for bare-file group resolution, explicit relative subdirs, and default-kind resolution.
+  - `.gitignore`: added `.gstack/` so local tool metadata does not dirty the repo.
+  - `feature_list.json`, `progress.md`, and `session-handoff.md`: recorded the authorized recovery, verification evidence, privacy boundary, and next restart path.
+- **Verification Evidence**:
+  - Pre-fix live truth: `/api/v1/db/tables?group=session&file=session.db`, `contact/contact.db`, and `message/message_0.db` returned HTTP 500 `stat .../db_storage/<file>: no such file or directory`; the source files existed under `db_storage/session/session.db`, `db_storage/contact/contact.db`, and `db_storage/message/message_0.db`.
+  - `go test -count=1 ./internal/wechatdb/wcdbapi` -> PASS.
+  - `./init.sh --full` -> PASS after code fix: root harness **80/80**, repo-local skill harness **29/29**, `go test ./...` PASS, `make build` PASS.
+  - Runtime restart: old listener PID `23936` stopped; new tmux listener PID `1464` started with `./bin/chatlog serve --config-dir .cache/daily-report-config`; `lsof -nP -iTCP:5030 -sTCP:LISTEN` shows `127.0.0.1:5030`; `/health` returns `{"status":"ok"}`.
+  - Core DB table-list recovery on the new binary:
+    - `session/session.db` -> HTTP 200, `table_count=7`.
+    - `contact/contact.db` -> HTTP 200, `table_count=16`.
+    - `message/message_0.db` -> HTTP 200, `table_count=406`.
+- **Not Verified (privacy/quota/runtime boundary)**:
+  - No WeChat key rescan was executed because the core query chain recovered without it. `all_keys.json` contents were never printed.
+  - No `wcdb_cache` file was deleted or moved. Existing bad cache artifacts for non-core/old attempts may remain, but the new guard prevents newly generated unreadable decrypt output from replacing cache entries.
+  - No `/api/v1/db/query`, `/api/v1/db/data`, `/api/v1/history`, `/api/v1/search`, `/api/v1/sessions`, or `/api/v1/contacts` row/body output was read.
+  - No graph write endpoint (`resume`, `rebuild`, `pause`, `config`), model call, Hermes push, or daily report generation was run.
+- **Blockers/Risks**:
+  - None for the scoped core DB recovery.
+  - If a future DB table query returns `decrypted database is unreadable; all_keys.json may be stale or invalid`, then key rescan/cache cleanup becomes the next justified step. Until that explicit error appears, do not batch-delete cache or re-scan keys by default.
+- **Recommended Next Step**: commit and push this recovery patch on `main`, then verify clean `main...origin/main`.
+
 ## Workspace tidy state repair (2026-06-17)
 
 - **Current State**: active feature is now `workspace-tidy-2026-06-17` with `status=done`. The previous active feature `db-runtime-graph-truth-harness-2026-06-12` is marked `discarded` because its recovery implementation was not preserved as the current main-line task; its diagnostic evidence and PRD history remain available for future reference. Current `main` was already clean and synchronized with `origin/main` at commit `4e101144` before this state repair.

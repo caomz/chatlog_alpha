@@ -103,3 +103,4 @@ outputs/
 __pycache__/
 *.pyc
 /openai_prmpt.md
+.gstack/

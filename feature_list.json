@@ -1,5 +1,5 @@
 {
-  "active_feature_id": "workspace-tidy-2026-06-17",
+  "active_feature_id": "db-runtime-core-query-recovery-2026-06-17",
   "features": [
     {
       "id": "graph-knowledge-digest-2026-06-10",
@@ -797,8 +797,41 @@
       "dependencies": [
         "ralph-auto-merge-branch-2026-06-12"
       ],
-      "next_step": "工作分支已删除，代码实现未保留在当前 main；DB runtime 未真正恢复。历史诊断与 PRD 证据保留在 tasks/prd-db-runtime-graph-truth-harness.md、scripts/ralph/prd.json、progress.md 和 archive/2026-06-17-db-runtime-graph-truth-harness-discarded/。如需恢复，应重新创建小步 PRD 并先取得用户授权处理 key/cache/service restart。",
+      "next_step": "工作分支已删除，该 PRD 仍作为历史证据保留；2026-06-17 用户 same-turn 授权后，核心 DB 查询链路已通过新 feature db-runtime-core-query-recovery-2026-06-17 小步恢复。历史诊断与 PRD 证据保留在 tasks/prd-db-runtime-graph-truth-harness.md、scripts/ralph/prd.json、progress.md 和 archive/2026-06-17-db-runtime-graph-truth-harness-discarded/。",
       "status": "discarded"
+    },
+    {
+      "id": "db-runtime-core-query-recovery-2026-06-17",
+      "name": "db-runtime-core-query-recovery",
+      "title": "Recover core WeChat DB table queries on the live 5030 service",
+      "description": "After same-turn user authorization, recover the live WeChat DB query chain for session/contact/message_0 by fixing bare DB filename resolution, rejecting unreadable decrypt artifacts before cache replacement, rebuilding, restarting the tmux listener, and verifying only table counts/status without printing private rows or keys.",
+      "scope": [
+        "Fix wcdbapi Client.resolveDBPath so group=file requests like group=session&file=session.db resolve to db_storage/session/session.db instead of db_storage/session.db",
+        "Validate decrypted temporary DB output with isReadableSQLite before os.Rename into wcdb_cache",
+        "Restart the live 127.0.0.1:5030 listener from the rebuilt bin/chatlog in tmux",
+        "Verify session/contact/message_0 /api/v1/db/tables by HTTP status and table count only",
+        "Record privacy boundaries and restartable state in progress.md and session-handoff.md"
+      ],
+      "done_criteria": [
+        "go test -count=1 ./internal/wechatdb/wcdbapi passes",
+        "./init.sh --full passes including go test ./... and make build",
+        "127.0.0.1:5030 /health returns status ok after restart",
+        "/api/v1/db/tables returns HTTP 200 for session/session.db, contact/contact.db, and message/message_0.db with nonzero table counts",
+        "No chat rows, key contents, report bodies, model prompts, or private media are printed"
+      ],
+      "evidence": [
+        "Pre-fix live truth after restart authorization: /api/v1/db/tables for session/session.db, contact/contact.db, and message/message_0.db returned HTTP 500 stat errors pointing at db_storage/<file> without the group subdir; source DB files existed under db_storage/session, db_storage/contact, and db_storage/message.",
+        "go test -count=1 ./internal/wechatdb/wcdbapi -> PASS after adding resolveDBPath tests.",
+        "./init.sh --full -> PASS after code fix: root harness 80/80, repo-local skill harness 29/29, go test ./..., and make build all completed.",
+        "Restarted tmux service chatlog-alpha from old PID 23936 to new PID 1464 with ./bin/chatlog serve --config-dir .cache/daily-report-config; lsof showed 127.0.0.1:5030 LISTEN and /health returned {\"status\":\"ok\"}.",
+        "/api/v1/db/tables verification on new binary: session/session.db HTTP 200 table_count=7; contact/contact.db HTTP 200 table_count=16; message/message_0.db HTTP 200 table_count=406.",
+        ".gitignore now ignores local .gstack/ metadata so tool runtime files do not dirty the repo."
+      ],
+      "dependencies": [
+        "workspace-tidy-2026-06-17"
+      ],
+      "next_step": "Commit and push this recovery patch on main. Future DB failures should first check /api/v1/db/tables status and the explicit 'decrypted database is unreadable' error before doing any key rescan or cache cleanup.",
+      "status": "done"
     },
     {
       "id": "workspace-tidy-2026-06-17",

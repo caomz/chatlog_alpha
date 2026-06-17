@@ -4,20 +4,35 @@ Last Updated: 2026-06-17
 
 ## Current Objective
 
-- Goal: **COMPLETE** — workspace tidy and state truth repair. Active feature is `workspace-tidy-2026-06-17` in `feature_list.json` with `status=done`. Current `main` was clean and synchronized with `origin/main` at commit `4e101144` before this follow-up repair; after committing this repair, verify `git status --short` is empty and ahead/behind is `0 0`.
+- Goal: **COMPLETE** — DB runtime core query recovery. Active feature is `db-runtime-core-query-recovery-2026-06-17` in `feature_list.json` with `status=done`. User gave same-turn authorization for the previously blocked runtime action; the live `127.0.0.1:5030` listener was restarted from the rebuilt `bin/chatlog` and the three core DB table-list endpoints now return HTTP 200.
 - **What changed in the current active state**:
-  - The long-lived dirty worktree was staged, committed, and pushed as `4e101144 chore: tidy chatlog alpha workspace`.
-  - `.gitignore` protects `reports`, `reports.backup-*`, Python bytecode, and `openai_prmpt.md`; private/generated artifacts remain local and ignored.
-  - `feature_list.json` now points to `workspace-tidy-2026-06-17`; `db-runtime-graph-truth-harness-2026-06-12` is historical with `status=discarded`.
+  - `internal/wechatdb/wcdbapi/client.go` resolves bare DB filenames through the requested group, fixing `db_storage/<file>` false paths for `session/contact/message`.
+  - `ensureDecrypted()` now rejects unreadable decrypted temp files before cache replacement, returning an explicit stale-key/cache error instead of writing bad `wcdb_cache` entries.
+  - `internal/wechatdb/wcdbapi/client_test.go` covers DB path resolution behavior.
+  - `.gitignore` ignores `.gstack/` local tool metadata.
+  - `feature_list.json`, `progress.md`, and this file record the recovery as a new completed feature; the old `db-runtime-graph-truth-harness-2026-06-12` PRD remains historical/discarded.
+- **Verification Evidence**:
+  - `go test -count=1 ./internal/wechatdb/wcdbapi` -> PASS.
+  - `./init.sh --full` -> PASS after the code fix (`go test ./...` + `make build` included).
+  - Runtime restart: old PID `23936` stopped; tmux `chatlog-alpha` restarted as PID `1464` with `./bin/chatlog serve --config-dir .cache/daily-report-config`; `/health` returns `{"status":"ok"}`.
+  - Core DB checks on the restarted service: `session/session.db` HTTP 200 `table_count=7`; `contact/contact.db` HTTP 200 `table_count=16`; `message/message_0.db` HTTP 200 `table_count=406`.
 - **Blockers / future work**:
-  - DB runtime recovery is not active work. It remains a future authorized runtime task if the user explicitly asks to resume it.
-  - Do not restart services, rescan WeChat keys, delete wcdb cache, requeue graph rows, or inspect private report contents unless the user gives same-turn authorization.
+  - None for scoped core DB recovery.
+  - No WeChat key rescan or cache deletion was performed because table queries recovered without it. If a future request returns `decrypted database is unreadable; all_keys.json may be stale or invalid`, then re-scan/cleanup can be considered with same-turn authorization.
+  - Do not inspect private rows, report contents, media, or key JSON. Keep verification to status/count/path/mtime/size unless the user explicitly asks otherwise.
 - **Next-session diagnostic commands(read-only)**:
   - `pwd -P` -> expect `/Volumes/WorkSSD/Dev/chatlog_alpha`
-  - `git status -sb && git status --short` -> expect clean `main...origin/main`
+  - `git status -sb && git status --short` -> expect clean `main...origin/main` after this recovery patch is committed and pushed.
   - `git rev-list --left-right --count @{u}...HEAD` -> expect `0 0`
-  - `jq '.active_feature_id as $id | {active_feature_id:$id, active:(.features[] | select(.id==$id) | {id,status})}' feature_list.json` -> expect `workspace-tidy-2026-06-17 / done`
-  - `./init.sh` -> expect quick gate PASS
+  - `jq '.active_feature_id as $id | {active_feature_id:$id, active:(.features[] | select(.id==$id) | {id,status})}' feature_list.json` -> expect `db-runtime-core-query-recovery-2026-06-17 / done`
+  - `curl -sS --max-time 5 http://127.0.0.1:5030/health` -> expect `{"status":"ok"}`
+  - `curl -sS -G 'http://127.0.0.1:5030/api/v1/db/tables' --data-urlencode 'group=session' --data-urlencode 'file=session.db' --data-urlencode 'format=json'` -> expect HTTP 200; count only, do not print rows.
+  - `./init.sh --full` -> expect full gate PASS when broad repo confidence is needed.
+
+## Previous Objective (workspace-tidy, 2026-06-17, COMPLETE)
+
+- Goal: **COMPLETE** — workspace tidy and state truth repair. Feature `workspace-tidy-2026-06-17` is `done`. The long-lived dirty worktree was staged, committed, and pushed as `4e101144 chore: tidy chatlog alpha workspace`, then state truth was repaired and pushed as `5c66f39a chore(state): record workspace tidy truth`.
+- Private/generated artifact guardrails remain in `.gitignore`: `reports`, `reports.backup-*`, `.cache`, `logs`, `outputs`, `.env*`, Python bytecode, `openai_prmpt.md`, and now `.gstack/`.
 
 ## Previous Objective (ralph/auto-merge-branch, 2026-06-12, COMPLETE)
 
