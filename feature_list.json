@@ -1,6 +1,40 @@
 {
-  "active_feature_id": "db-runtime-core-query-recovery-2026-06-17",
+  "active_feature_id": "claude-code-guard-hooks-2026-06-19",
   "features": [
+    {
+      "id": "claude-code-guard-hooks-2026-06-19",
+      "name": "Claude Code Guard Hooks",
+      "title": "Claude Code agent guard hooks (.claude/settings.json) enforcing AGENTS.md hard rules",
+      "description": "Turn the AGENTS.md text-only hard rules (private read/write, batch delete, destructive git, committing private reports, quota/privacy-sensitive commands, gofmt, DoD state update) into 8 auto-enforced .claude/settings.json hooks that apply to every AI agent working in the repo. Source PRD: tasks/prd-claude-code-guard-hooks.md; Ralph PRD: scripts/ralph/prd.json (branch ralph/claude-code-guard-hooks, 15 stories; US-015 blocked pending a real interactive Claude Code session to observe hot-reload interception).",
+      "scope": [
+        "Shared hook utility module .claude/hooks/_common.py (read_event/deny/allow/is_private/rel_to_project) with Windows backslash normalization",
+        "6 PreToolUse hooks: block-private-writes (Write|Edit|MultiEdit), block-private-reads / block-batch-delete / block-destructive-git (incl. dirty-revert) / block-report-commit / guard-quota-commands (Bash)",
+        "1 PostToolUse hook: gofmt-check (Write|Edit|MultiEdit, reminder-only via exit 2)",
+        "1 Stop hook: remind-state-update (session_id sha256 self-terminating counter, forces DoD progress.md update)",
+        "Offline standalone test harness .claude/hooks/test_hooks.sh asserting every hook before wiring",
+        ".claude/settings.json wiring all 8 hooks via python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/<name>.py\"",
+        "docs/claude-code-hooks.md distinguishing these agent hooks from product messagehook, with risk + bypass + add-hook sections",
+        "DoD state recording + zero product-code regression verification"
+      ],
+      "done_criteria": [
+        "US-001..US-014 in scripts/ralph/prd.json pass with evidence; US-015 blocked pending a real interactive Claude Code session (runtime hot-reload verification)",
+        "bash .claude/hooks/test_hooks.sh exits 0 with ALL HOOK TESTS PASSED",
+        "python3 -c \"import json; json.load(open('.claude/settings.json'))\" exits 0; git check-ignore .claude/settings.json rc=1",
+        "git status --porcelain internal/ cmd/ empty (zero product-code change); node scripts/check-root-harness.mjs and ./init.sh stay green"
+      ],
+      "evidence": [
+        "US-001..US-012 all passes=true in scripts/ralph/prd.json; per-story command-level evidence in scripts/ralph/progress.txt",
+        "bash .claude/hooks/test_hooks.sh -> assertions run: 76; final line 'ALL HOOK TESTS PASSED'; exit 0 (covers US-001..US-009 positive/negative cases standalone)",
+        "python3 -c \"import json; json.load(open('.claude/settings.json'))\" -> 'settings.json json.load OK'; .claude/settings.json wires 6 PreToolUse + 1 PostToolUse (gofmt-check) + 1 Stop (remind-state-update) hooks",
+        "git check-ignore .claude/settings.json rc=1 (not gitignored, commit-able)",
+        "docs/claude-code-hooks.md created with messagehook distinction, 8-hook table, 5 risk statements, bypass + add-hook sections (grep messagehook / Ralph|ralph.py / 热重载 all hit)"
+      ],
+      "dependencies": [
+        "db-runtime-core-query-recovery-2026-06-17"
+      ],
+      "next_step": "US-013 done (state recorded). Next executable: US-014 (regression: zero product-code change + root harness green). US-015 remains blocked — needs a real interactive Claude Code session to trigger each interception and observe hot-reload + stderr feedback; mark verified items in progress.md, never silently skip.",
+      "status": "done"
+    },
     {
       "id": "graph-knowledge-digest-2026-06-10",
       "name": "Graph Knowledge Digest",

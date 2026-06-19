@@ -1,6 +1,27 @@
 # Progress
 
-Last Updated: 2026-06-17
+Last Updated: 2026-06-20
+
+## Claude Code guard-hooks / claude-code-hooks (US-013, 2026-06-20)
+
+- **Current State**: active feature is now `claude-code-guard-hooks-2026-06-19` with `status=done`. PRD `scripts/ralph/prd.json` (branch `ralph/claude-code-guard-hooks`, 15 stories): US-001..US-012 `passes=true`; US-013 (this state record) now `passes=true`; US-014 (zero product-code regression gate) still `passes=false blocked=false`; US-015 `blocked=true` (runtime/manual — needs a real interactive Claude Code session to trigger each interception and observe hot-reload + stderr feedback; `claude --print` subprocesses cannot reliably self-verify hot-reload). 8 Claude Code agent hooks live under `.claude/hooks/` and are wired into `.claude/settings.json`.
+- **What changed**:
+  - `feature_list.json`: `active_feature_id` → `claude-code-guard-hooks-2026-06-19`; new feature entry added (name/title/description/scope/done_criteria/evidence/status=done, string-array shape matching `graph-knowledge-digest-2026-06-10`).
+  - `progress.md`: this section.
+  - `session-handoff.md`: Next Session path for the guard-hooks feature (hook inventory, test script path, key risks).
+  - No product code (`internal/`, `cmd/`) touched in this story; only state files.
+- **Verification Evidence**:
+  - `bash .claude/hooks/test_hooks.sh` → `assertions run: 76`, final line `ALL HOOK TESTS PASSED`, exit 0 (covers US-001..US-009 positive/negative cases offline; the two `Blocked: ... semantic/test` lines are the guard-quota hook's own stderr captured by US-007 assertions, expected).
+  - `python3 -c "import json; json.load(open('.claude/settings.json'))"` → `settings.json json.load OK` (exit 0).
+  - `git check-ignore .claude/settings.json` → rc=1 (not gitignored, commit-able).
+  - `python3 -c "import json; json.load(open('feature_list.json'))"` → exit 0 (feature_list.json valid after the new entry).
+- **Not Verified**:
+  - US-015 end-to-end interception in a real interactive Claude Code session (hot-reload即生效 + 模型下一轮可见 stderr) — `blocked=true`, not run by the Ralph `claude --print` subprocess. Must be verified manually by the user.
+  - US-014 regression gate (zero product-code change + `node scripts/check-root-harness.mjs` + `./init.sh`) is the next executable story; not part of US-013.
+- **Blockers/Risks**:
+  - Hot-reload has no safety gate; a malformed hook self-blocking is mitigated only by the narrow `.claude/hooks/*` + `.claude/settings.json` allowlist in block-private-writes. See docs/claude-code-hooks.md risk section.
+  - Ralph calls git via subprocess in `scripts/ralph/ralph.py`, which bypasses these PreToolUse hooks (hooks only intercept the agent's own tool calls, not child-process git). Documented intentionally.
+- **Recommended Next Step**: implement US-014 (regression verification), then hand US-015 to the user for a real interactive Claude Code session to trigger each interception path.
 
 ## DB runtime core query recovery (2026-06-17)
 

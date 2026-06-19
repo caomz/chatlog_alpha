@@ -1,8 +1,26 @@
 # Session Handoff
 
-Last Updated: 2026-06-17
+Last Updated: 2026-06-20
 
-## Current Objective
+## Current Objective (claude-code-guard-hooks, 2026-06-20)
+
+- Goal: **IN PROGRESS** — PRD `ralph/claude-code-guard-hooks` (15 stories) turns AGENTS.md text-only hard rules into 8 auto-enforced Claude Code agent hooks. Active feature `claude-code-guard-hooks-2026-06-19` in `feature_list.json` (`status=done`). US-001..US-013 `passes=true`; **US-014 is the next executable story**; US-015 `blocked=true` (manual runtime).
+- **Hook inventory** (`.claude/hooks/`, wired in `.claude/settings.json`):
+  - PreToolUse / `Write|Edit|MultiEdit`: `block-private-writes.py`
+  - PreToolUse / `Bash`: `block-private-reads.py`, `block-batch-delete.py`, `block-destructive-git.py` (incl. dirty-revert), `block-report-commit.py`, `guard-quota-commands.py`
+  - PostToolUse / `Write|Edit|MultiEdit`: `gofmt-check.py` (reminder-only, exit 2)
+  - Stop (no matcher): `remind-state-update.py` (session_id sha256 self-terminating counter)
+  - Shared util: `.claude/hooks/_common.py` (read_event/deny/allow/is_private/rel_to_project)
+- **Offline test script**: `bash .claude/hooks/test_hooks.sh` → `ALL HOOK TESTS PASSED` (76 assertions, exit 0). Run this after touching any hook, before wiring/committing.
+- **Key risks** (full text in `docs/claude-code-hooks.md`):
+  - Hot-reload has no safety gate — a broken hook applies immediately; only the `.claude/hooks/*` + `.claude/settings.json` allowlist in block-private-writes prevents self-lockout.
+  - Ralph (`scripts/ralph/ralph.py`) runs git via subprocess and bypasses these PreToolUse hooks (hooks intercept the agent's own tool calls only).
+  - PostToolUse cannot block an already-applied write (gofmt-check is reminder-only); Stop has no built-in loop guard (remind-state-update self-terminates via the session_id counter).
+- **Next Session path**:
+  1. Implement **US-014**: assert `git status --porcelain internal/ cmd/` is empty (zero product-code change), `node scripts/check-root-harness.mjs` exit 0, `node skills/chatlog-http-cli/scripts/check-harness-skill.mjs` exit 0, `./init.sh` exit 0. Set `passes=true`.
+  2. Hand **US-015** (blocked) to the user: a real interactive Claude Code session to trigger each interception (Write reports/_probe.md, `cat reports/daily.md`, `rm -rf /tmp/_test`, `git commit`, dirty-revert, `git add .`, `chatlog report daily --vision`, unformatted .go, Stop without progress.md) and observe hot-reload + stderr feedback. Mark each verified item in `progress.md`; never silently skip.
+
+## Previous Objective (db-runtime-core-query-recovery, 2026-06-17, COMPLETE)
 
 - Goal: **COMPLETE** — DB runtime core query recovery. Active feature is `db-runtime-core-query-recovery-2026-06-17` in `feature_list.json` with `status=done`. User gave same-turn authorization for the previously blocked runtime action; the live `127.0.0.1:5030` listener was restarted from the rebuilt `bin/chatlog` and the three core DB table-list endpoints now return HTTP 200.
 - **What changed in the current active state**:
