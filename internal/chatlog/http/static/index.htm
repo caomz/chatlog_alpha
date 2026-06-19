@@ -2005,7 +2005,7 @@
         let hookEventSource = null;
         let hookEventsCache = [];
         let hookStatusTimer = null;
-        let lastLongPollController = null;
+        const inflightControllers = new Set();
         let hermesWeixinEditable = false;
         let hermesQQEditable = false;
         let semanticConnectivityPassed = false;
@@ -2084,6 +2084,8 @@
 
         // Tab Switching for Main Page
         function switchTab(tabId) {
+            inflightControllers.forEach(c => { try { c.abort(); } catch (e) {} });
+            inflightControllers.clear();
             document.querySelectorAll('.tab-btn').forEach(btn => btn.classList.remove('active'));
             document.querySelectorAll('.tab-content').forEach(content => content.classList.remove('active'));
 
@@ -3374,19 +3376,14 @@
 	        }
 
 	        async function fetchWithTimeout(url, timeoutMs = 20000) {
-	            if (lastLongPollController) {
-	                try { lastLongPollController.abort(); } catch (e) { /* swallow */ }
-	            }
 	            const controller = new AbortController();
-	            lastLongPollController = controller;
+	            inflightControllers.add(controller);
 	            const timer = setTimeout(() => controller.abort(), timeoutMs);
 	            try {
 	                return await fetch(url, { signal: controller.signal });
 	            } finally {
 	                clearTimeout(timer);
-	                if (lastLongPollController === controller) {
-	                    lastLongPollController = null;
-	                }
+	                inflightControllers.delete(controller);
 	            }
 	        }
 
