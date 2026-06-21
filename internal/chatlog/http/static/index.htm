@@ -5640,8 +5640,8 @@
                 const limit = graphLimitParam();
                 const qs = `format=json&keyword=${encodeURIComponent(keyword)}&limit=${limit}${graphWindowParam()}`;
                 const [visRes, queryRes] = await Promise.all([
-                    fetch('/api/v1/graph/visualize?' + qs),
-                    fetch('/api/v1/graph/query?' + qs)
+                    fetchWithTimeout('/api/v1/graph/visualize?' + qs, 45000),
+                    fetchWithTimeout('/api/v1/graph/query?' + qs, 45000)
                 ]);
                 const vis = await visRes.json();
                 const query = await queryRes.json();
