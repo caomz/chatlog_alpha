@@ -1,0 +1,133 @@
+{
+  "project": "chatlog_alpha",
+  "branchName": "ralph/bootstrap-placeholder",
+  "description": "【记录用途，非自主执行】修复 ISSUE-005 — dashboard stats 并发请求被 ISSUE-001 的全局单 AbortController 互相 abort，导致今日总览只显示约 1 个群。方案：lastLongPollController 单变量改为 inflightControllers Set；取消时机从'发起新请求'移到 switchTab。本 prd.json 仅作结构化记录：branchName 保持 ralph/bootstrap-placeholder 不触发 ensure_work_branch 分支重建；所有 story blocked=true，防止 Ralph 自主循环误自动执行（大文件精确编辑 / 重启服务 / agent-browser 读真实 dashboard 不适合 MiniMax 弱模型自动跑）。实际单会话执行，权威文档见 .agents/plans/fix-stats-concurrent-fetch-abort.md 与 tasks/prd-fix-stats-concurrent-fetch-abort.md。修复前 HEAD 回滚锚点 c229bccb。",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "记录修复前 baseline（证明 bug）",
+      "description": "作为修复者，我需要先固定修复前的现象，以便修复后客观对比。",
+      "acceptanceCriteria": [
+        "curl -sS --max-time 6 http://127.0.0.1:5030/health 返回 {\"status\":\"ok\"}",
+        "用 agent-browser 打开 http://127.0.0.1:5030/ 默认'仪表盘 & 数据库'tab，等 overview 加载完成",
+        "读取 #dashboard-ov-groups 数字记为 baseline_overview_groups（整数）",
+        "经 /api/v1/sessions?format=json 统计 chat_type==='group' 群总数记为 actual_group_total（整数）",
+        "断言 baseline_overview_groups < actual_group_total（证明 bug：总览群数远小于实际群数）",
+        "隐私：仅记录两个整数，不读群名/消息正文，不外传全屏截图",
+        "go build ./... 通过"
+      ],
+      "priority": 1,
+      "passes": false,
+      "notes": "记录用途/单会话执行。blocked=true 防 Ralph 误自动跑（需 agent-browser 读真实 dashboard，隐私+弱模型风险）。",
+      "retryCount": 0,
+      "blocked": true
+    },
+    {
+      "id": "US-002",
+      "title": "核心修复：全局单 controller 改 Set + 取消时机移到 switchTab（3 处原子）",
+      "description": "作为前端开发者，我需要在同一次编辑改完 3 处耦合代码，使并发请求互不取消、切 tab 仍取消在途请求。",
+      "acceptanceCriteria": [
+        "index.htm:2008 将 let lastLongPollController = null; 改为 const inflightControllers = new Set();",
+        "index.htm:3376-3391 fetchWithTimeout 删除开头 if (lastLongPollController){...abort...} 块；new AbortController() 后改为 inflightControllers.add(controller)；finally 用 inflightControllers.delete(controller) 替代原 lastLongPollController 清理",
+        "index.htm:2086 switchTab 函数体首行插入 inflightControllers.forEach(c => { try { c.abort(); } catch (e) {} }); inflightControllers.clear();",
+        "三处改动在同一次编辑内完成，期间不提交（避免半改状态破坏 JS）",
+        "grep -c lastLongPollController internal/chatlog/http/static/index.htm 输出 0",
+        "grep -c inflightControllers internal/chatlog/http/static/index.htm 输出 5",
+        "缩进保真：fetchWithTimeout 为 tab+空格混合，switchTab/变量为纯空格；sed -n '3376,3387p' ... | cat -A 人工确认无缩进破损",
+        "go build ./... 通过"
+      ],
+      "priority": 2,
+      "passes": false,
+      "notes": "记录用途/单会话执行。3 处强耦合必须原子，不可拆。blocked=true 防 Ralph 误自动跑（MiniMax 在 11000 行大文件精确编辑风险高）。",
+      "retryCount": 0,
+      "blocked": true
+    },
+    {
+      "id": "US-003",
+      "title": "重新构建以打包前端改动（go:embed）",
+      "description": "作为维护者，我需要重新构建 binary，因为 index.htm 是 go:embed，不重建则改动不生效。",
+      "acceptanceCriteria": [
+        "make build 成功（exit 0）",
+        "bin/chatlog 的 mtime 更新为当前构建时间（ls -la bin/chatlog）",
+        "go build ./... 通过"
+      ],
+      "priority": 3,
+      "passes": false,
+      "notes": "记录用途/单会话执行。blocked=true 防 Ralph 误自动跑。依赖 US-002 完成。",
+      "retryCount": 0,
+      "blocked": true
+    },
+    {
+      "id": "US-004",
+      "title": "重启 5030 服务加载新 binary（runtime，需用户授权）",
+      "description": "作为维护者，我需要用新 binary 重启服务，使修复在运行态生效。",
+      "acceptanceCriteria": [
+        "执行前取得用户当轮授权（重启会短暂中断服务）",
+        "停旧进程：kill $(pgrep -f 'chatlog serve')",
+        "启新进程：nohup ./bin/chatlog serve --config-dir .cache/daily-report-config >/tmp/chatlog-5030.log 2>&1 &",
+        "sleep 2 && curl -sS --max-time 6 http://127.0.0.1:5030/health 返回 {\"status\":\"ok\"}",
+        "pgrep -f 'chatlog serve' 返回新的 pid（与重启前不同）",
+        "go build ./... 通过"
+      ],
+      "priority": 4,
+      "passes": false,
+      "notes": "记录用途/单会话执行。破坏性 runtime 操作，必须用户同轮授权。blocked=true 确保 Ralph 自主循环绝不自动重启服务。",
+      "retryCount": 0,
+      "blocked": true
+    },
+    {
+      "id": "US-005",
+      "title": "闭环验证：dashboard 显示所有群（前端→后端→UI）",
+      "description": "作为看板用户，我需要确认 overview 统计涵盖所有群，证明并发 stats 不再自相 abort。",
+      "acceptanceCriteria": [
+        "用 agent-browser 打开 http://127.0.0.1:5030/ 默认 dashboard tab，等 overview 加载完成",
+        "并发 /api/v1/stats?format=json&chat=... 请求真实到达后端返回 HTTP 200（network 面板确认多个 stats 请求均 200，非 404/被 abort 失败）",
+        "读取 #dashboard-ov-groups 数字记为 fixed_overview_groups",
+        "断言 fixed_overview_groups == actual_group_total（或显著大于 US-001 的 baseline_overview_groups）",
+        "#dashboard-comparison-grid 子卡片数量 > 1 且约等于群总数",
+        "浏览器 console 无未捕获异常",
+        "隐私：仅读数字与元素计数，不读群名/消息正文，不外传全屏截图",
+        "go build ./... 通过"
+      ],
+      "priority": 5,
+      "passes": false,
+      "notes": "记录用途/单会话执行。核心闭环验收。blocked=true 防 Ralph 误自动跑（需 agent-browser 读真实 dashboard，隐私+弱模型风险）。依赖 US-004。",
+      "retryCount": 0,
+      "blocked": true
+    },
+    {
+      "id": "US-006",
+      "title": "回归验证：切 tab 不回归 ISSUE-001",
+      "description": "作为维护者，我需要确认切 tab 仍能取消在途 long-poll，没把 ISSUE-001 的连接泄漏改回来。",
+      "acceptanceCriteria": [
+        "用 agent-browser 打开 dashboard，在 overview 加载期间或加载后点击切到'全局搜索'tab，再切回'仪表盘 & 数据库'",
+        "切 tab 过程浏览器 console 无 ERR_CONNECTION_REFUSED",
+        "切 tab 过程浏览器 console 无未捕获的 AbortError（被取消的在途请求应被 catch 吞掉）",
+        "切回后 overview 能正常重新加载并再次显示所有群",
+        "go build ./... 通过"
+      ],
+      "priority": 6,
+      "passes": false,
+      "notes": "记录用途/单会话执行。blocked=true 防 Ralph 误自动跑（需 agent-browser）。依赖 US-004。",
+      "retryCount": 0,
+      "blocked": true
+    },
+    {
+      "id": "US-007",
+      "title": "仓库回归 + ISSUE-005 收尾 + 提交",
+      "description": "作为维护者，我需要确认全仓无回归并把修复落账。",
+      "acceptanceCriteria": [
+        "go build ./... 通过（exit 0）",
+        "node scripts/check-root-harness.mjs 输出 80/80 passed",
+        "TODOS.md 中 ISSUE-005 的 Status: open 改为 Status: fixed",
+        "取得用户当轮授权后提交：git add internal/chatlog/http/static/index.htm TODOS.md，commit message 以 'fix(qa): ISSUE-005 — ' 开头，结尾含 Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>",
+        "git show --stat HEAD --name-only 仅含 index.htm 与 TODOS.md（无 bin/chatlog 等多余文件）"
+      ],
+      "priority": 7,
+      "passes": false,
+      "notes": "记录用途/单会话执行。commit 需用户同轮授权（direct-to-main）。blocked=true 防 Ralph 误自动提交。依赖 US-005/US-006 验证通过。",
+      "retryCount": 0,
+      "blocked": true
+    }
+  ]
+}

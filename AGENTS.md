@@ -24,7 +24,7 @@ Before writing code:
    - Graph digest (windowed Obsidian-friendly Markdown): `internal/chatlog/temporalgraph/digest*.go`, `internal/chatlog/http/graph.go`, `cmd/chatlog/cmd_report.go`, `docs/graph-digest.md`
    - Hermes push: `internal/chatlog/hermespush/`
    - WeChat database/key access: `internal/wechat/`, `internal/wechatdb/`
-   - Harness/Ralph automation: `.agents/`, `.claude/`, `scripts/ralph/`
+   - Harness/Ralph automation: `.agents/`, `.claude/`, `scripts/ralph/`, `scripts/chatlog-ha-guard.sh`
 5. Check privacy and quota risk before running commands that inspect real chat data, print report contents, call model providers, or touch API keys.
 
 ## Technology Stack
@@ -95,11 +95,12 @@ chatlog report daily --summary
 - `internal/model/`: chat/contact/session/media models and generated protobuf types.
 - `pkg/`: shared utility packages and version/process helpers.
 - `docs/`: task-level documentation, especially daily report (`docs/daily-report.md`) and graph digest (`docs/graph-digest.md`) behavior.
-- `skills/chatlog-http-cli/`: repo-local Codex harness skill and validation scripts.
-- `.agents/skills/`: project-local Codex skills for this repository only, including `prime`, `plan-feature`, `create-rules`, and `source-command-create-rules`.
+- `skills/chatlog-http-cli/`: repo-local Codex harness skill, validation scripts, and `references/` directory containing runtime troubleshooting truth chain docs (db-truth-chain, graph-truth-chain, feedback-audit, harness-map, session-state, verification-gates).
+- `.agents/skills/`: project-local Codex skills for this repository only, including `prime`, `plan-feature`, `create-rules`, `source-command-create-rules`, `ralph`, and `prd`.
 - `.agents/commands/`: legacy project command shortcuts kept for compatibility; do not install them globally.
 - `.claude/`, `scripts/ralph/`: Claude-compatible adapters and PRD-driven automation harness.
 - `archive/`, `tasks/`: task snapshots and local automation artifacts. Treat them as scoped work artifacts unless the active task says otherwise.
+- `scripts/chatlog-ha-guard.sh`: runtime HA guard that checks health, semantic config, graph status, tmux key environment, and can self-heal by restarting the service and resuming recoverable graph failures. Key count is reported without printing secret values.
 - `reports/`, `reports.backup-*`, `.cache/`, `logs/`, `outputs/`: generated/private/runtime outputs. Do not commit these.
 
 ## Code Patterns
@@ -114,6 +115,7 @@ chatlog report daily --summary
 - When temporal graph work fails, bucket failures first with readonly evidence; do not blindly requeue sensitive/model failures.
 - Generated standalone daily HTML/Markdown artifacts and report backups are private. Verify by path, size, timestamp, and high-level counts only.
 - Graph digest output (`reports/graph-digest-<start>_<end>.md`) is a read-only window aggregation written idempotently (same window overwrites the same file). The default path makes zero model calls; `summary=true` makes at most one role-neutral Chat call with graceful degradation. Verify by path/size/section-count only and never print digest body; `format=json` returns metadata only.
+- Frontend long-poll requests in `internal/chatlog/http/static/index.htm` are tracked via a `Set` (`inflightControllers`). Tab switches abort all controllers in the Set and clear it, so concurrent dashboard fetches do not cancel each other. When modifying frontend HTTP fetch code, keep concurrent calls in `inflightControllers` and always delete the controller in a `finally` block.
 - Do not use scripts to batch-delete files or directories. If deletion is unavoidable, delete one file at a time and explain risk/rollback first.
 
 ## Scope Rules
@@ -139,6 +141,10 @@ chatlog report daily --summary
 - `.agents/skills/plan-feature/SKILL.md`: planning-only skill for implementation plans; do not write code while using it.
 - `.agents/skills/create-rules/SKILL.md`: compatibility entry for refreshing this root rules file.
 - `.agents/skills/source-command-create-rules/SKILL.md`: original create-rules skill name; keep it alongside `create-rules`.
+- `.agents/skills/ralph/SKILL.md`: Ralph autonomous PRD→story→developer→validator loop skill.
+- `.agents/skills/prd/SKILL.md`: PRD generation skill for converting user requirements into story format.
+- `scripts/chatlog-ha-guard.sh`: runtime HA guard for the chatlog service; reports key counts and can self-heal without printing secret values.
+- `TODOS.md`: technical task tracker for deferred items (e.g., WAL/busy_timeout after queue drain); check here before starting infra-level changes.
 - `scripts/ralph/prd.json`: Ralph-executable PRD story list.
 - `scripts/ralph/progress.txt`: Ralph iteration log and reusable Codebase Patterns.
 

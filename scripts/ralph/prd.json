@@ -1,133 +1,315 @@
 {
   "project": "chatlog_alpha",
-  "branchName": "ralph/bootstrap-placeholder",
-  "description": "【记录用途，非自主执行】修复 ISSUE-005 — dashboard stats 并发请求被 ISSUE-001 的全局单 AbortController 互相 abort，导致今日总览只显示约 1 个群。方案：lastLongPollController 单变量改为 inflightControllers Set；取消时机从'发起新请求'移到 switchTab。本 prd.json 仅作结构化记录：branchName 保持 ralph/bootstrap-placeholder 不触发 ensure_work_branch 分支重建；所有 story blocked=true，防止 Ralph 自主循环误自动执行（大文件精确编辑 / 重启服务 / agent-browser 读真实 dashboard 不适合 MiniMax 弱模型自动跑）。实际单会话执行，权威文档见 .agents/plans/fix-stats-concurrent-fetch-abort.md 与 tasks/prd-fix-stats-concurrent-fetch-abort.md。修复前 HEAD 回滚锚点 c229bccb。",
+  "branchName": "ralph/claude-code-guard-hooks",
+  "description": "Claude Code 代理守卫 hooks —— 把 AGENTS.md 中只靠文字约定的硬规则（隐私读写、批量删除、破坏性 git、提交私有报告、配额敏感命令、gofmt、DoD 状态更新）转成 .claude/settings.json 自动强制执行的 hook，对所有在仓库工作的 AI 代理生效。来源 PRD: tasks/prd-claude-code-guard-hooks.md。",
   "userStories": [
     {
       "id": "US-001",
-      "title": "记录修复前 baseline（证明 bug）",
-      "description": "作为修复者，我需要先固定修复前的现象，以便修复后客观对比。",
+      "title": "创建 hooks 目录与共享工具模块 _common.py",
+      "description": "作为开发者，我需要先建立 hook 基础设施与共享工具，以便后续 hook 脚本可统一读写 stdin JSON、判断路径归属、统一拦截/放行。",
       "acceptanceCriteria": [
-        "curl -sS --max-time 6 http://127.0.0.1:5030/health 返回 {\"status\":\"ok\"}",
-        "用 agent-browser 打开 http://127.0.0.1:5030/ 默认'仪表盘 & 数据库'tab，等 overview 加载完成",
-        "读取 #dashboard-ov-groups 数字记为 baseline_overview_groups（整数）",
-        "经 /api/v1/sessions?format=json 统计 chat_type==='group' 群总数记为 actual_group_total（整数）",
-        "断言 baseline_overview_groups < actual_group_total（证明 bug：总览群数远小于实际群数）",
-        "隐私：仅记录两个整数，不读群名/消息正文，不外传全屏截图",
-        "go build ./... 通过"
+        "目录 .claude/hooks/ 存在",
+        ".claude/hooks/_common.py 提供 read_event()、deny(reason)、allow()、is_private(rel_path)、rel_to_project(path) 五个函数",
+        "is_private('reports/x.md') / is_private('reports.backup-2026-06-19/x.md') / is_private('.cache/y/z') / is_private('logs/x.log') / is_private('outputs/x') / is_private('.env') / is_private('.env.production') 全部返回 True",
+        "is_private('.env.example') / is_private('internal/chatlog/x.go') / is_private('README.md') / is_private('scripts/check-root-harness.mjs') 全部返回 False",
+        "rel_to_project 与 is_private 先对输入做 path.replace(chr(92)+chr(92), '/') 以兼容 Windows 反斜杠路径",
+        "read_event() 在 stdin 为非法 JSON 或空时调用 sys.exit(0)（放行，绝不阻断）",
+        "python3 -m py_compile .claude/hooks/_common.py exits 0"
       ],
       "priority": 1,
-      "passes": false,
-      "notes": "记录用途/单会话执行。blocked=true 防 Ralph 误自动跑（需 agent-browser 读真实 dashboard，隐私+弱模型风险）。",
-      "retryCount": 0,
-      "blocked": true
+      "blocked": false,
+      "notes": "",
+      "passes": true,
+      "retryCount": 0
     },
     {
       "id": "US-002",
-      "title": "核心修复：全局单 controller 改 Set + 取消时机移到 switchTab（3 处原子）",
-      "description": "作为前端开发者，我需要在同一次编辑改完 3 处耦合代码，使并发请求互不取消、切 tab 仍取消在途请求。",
+      "title": "实现 block-private-writes hook（PreToolUse / Write|Edit|MultiEdit）",
+      "description": "作为代理工作流安全护栏，我需要在 Write/Edit/MultiEdit 写入私有目录时阻断，以保护微信聊天数据与生成产物不被覆盖。",
       "acceptanceCriteria": [
-        "index.htm:2008 将 let lastLongPollController = null; 改为 const inflightControllers = new Set();",
-        "index.htm:3376-3391 fetchWithTimeout 删除开头 if (lastLongPollController){...abort...} 块；new AbortController() 后改为 inflightControllers.add(controller)；finally 用 inflightControllers.delete(controller) 替代原 lastLongPollController 清理",
-        "index.htm:2086 switchTab 函数体首行插入 inflightControllers.forEach(c => { try { c.abort(); } catch (e) {} }); inflightControllers.clear();",
-        "三处改动在同一次编辑内完成，期间不提交（避免半改状态破坏 JS）",
-        "grep -c lastLongPollController internal/chatlog/http/static/index.htm 输出 0",
-        "grep -c inflightControllers internal/chatlog/http/static/index.htm 输出 5",
-        "缩进保真：fetchWithTimeout 为 tab+空格混合，switchTab/变量为纯空格；sed -n '3376,3387p' ... | cat -A 人工确认无缩进破损",
-        "go build ./... 通过"
+        "创建 .claude/hooks/block-private-writes.py，从 stdin 取 tool_input.file_path",
+        "echo '{\"tool_name\":\"Write\",\"tool_input\":{\"file_path\":\"reports/a.md\"}}' | python3 .claude/hooks/block-private-writes.py 退出码为 2，stderr 含 'Blocked'",
+        "写入 internal/chatlog/x.go 的事件 → 退出码 0",
+        "写入 .env.example 的事件 → 退出码 0",
+        "写入 .claude/hooks/block-private-writes.py 的事件 → 退出码 0（自修改放行，防热重载自死锁）",
+        "写入 .claude/settings.json 的事件 → 退出码 0（自配置放行）",
+        "tool_input 缺 file_path 的事件 → 退出码 0",
+        "python3 -m py_compile .claude/hooks/block-private-writes.py exits 0"
       ],
       "priority": 2,
-      "passes": false,
-      "notes": "记录用途/单会话执行。3 处强耦合必须原子，不可拆。blocked=true 防 Ralph 误自动跑（MiniMax 在 11000 行大文件精确编辑风险高）。",
-      "retryCount": 0,
-      "blocked": true
+      "blocked": false,
+      "notes": "",
+      "passes": true,
+      "retryCount": 0
     },
     {
       "id": "US-003",
-      "title": "重新构建以打包前端改动（go:embed）",
-      "description": "作为维护者，我需要重新构建 binary，因为 index.htm 是 go:embed，不重建则改动不生效。",
+      "title": "实现 block-private-reads hook（PreToolUse / Bash）",
+      "description": "作为代理工作流安全护栏，我需要在代理用 cat/head/tail/grep/jq/sqlite3 读私有目录时阻断，以防止聊天内容被直接打印泄漏。",
       "acceptanceCriteria": [
-        "make build 成功（exit 0）",
-        "bin/chatlog 的 mtime 更新为当前构建时间（ls -la bin/chatlog）",
-        "go build ./... 通过"
+        "创建 .claude/hooks/block-private-reads.py，从 stdin 取 tool_input.command 检测 读取命令+私有路径 组合",
+        "命令 'cat reports/daily.md' → 退出码 2",
+        "命令 'head -n 5 .env' → 退出码 2",
+        "命令 'tail -f logs/x.log' → 退出码 2",
+        "命令 'grep error logs/x.log' → 退出码 2（保守：grep 一律拦）",
+        "命令 'jq .x reports/y.json' → 退出码 2",
+        "命令 'ls -la reports/' → 退出码 0（仅元数据）",
+        "命令 'wc -l reports/x.md' → 退出码 0",
+        "命令 'stat .env' → 退出码 0",
+        "命令 'cat internal/chatlog/x.go' → 退出码 0（项目代码路径放行）",
+        "python3 -m py_compile .claude/hooks/block-private-reads.py exits 0"
       ],
       "priority": 3,
-      "passes": false,
-      "notes": "记录用途/单会话执行。blocked=true 防 Ralph 误自动跑。依赖 US-002 完成。",
-      "retryCount": 0,
-      "blocked": true
+      "blocked": false,
+      "notes": "",
+      "passes": true,
+      "retryCount": 0
     },
     {
       "id": "US-004",
-      "title": "重启 5030 服务加载新 binary（runtime，需用户授权）",
-      "description": "作为维护者，我需要用新 binary 重启服务，使修复在运行态生效。",
+      "title": "实现 block-batch-delete hook（PreToolUse / Bash）",
+      "description": "作为代理工作流安全护栏，我需要在代理执行批量删除命令时阻断，以强制单文件删除+显式确认流程。",
       "acceptanceCriteria": [
-        "执行前取得用户当轮授权（重启会短暂中断服务）",
-        "停旧进程：kill $(pgrep -f 'chatlog serve')",
-        "启新进程：nohup ./bin/chatlog serve --config-dir .cache/daily-report-config >/tmp/chatlog-5030.log 2>&1 &",
-        "sleep 2 && curl -sS --max-time 6 http://127.0.0.1:5030/health 返回 {\"status\":\"ok\"}",
-        "pgrep -f 'chatlog serve' 返回新的 pid（与重启前不同）",
-        "go build ./... 通过"
+        "创建 .claude/hooks/block-batch-delete.py，从 stdin 取 tool_input.command 正则匹配批量删除模式",
+        "命令 'rm -rf build/' → 退出码 2",
+        "命令 'rm -fr /tmp/foo' → 退出码 2",
+        "命令 'find . -name \"*.tmp\" -delete' → 退出码 2",
+        "命令 'find . -name \"*.log\" -exec rm {} ;' → 退出码 2",
+        "命令 'git clean -fd' → 退出码 2",
+        "命令 'rm logs/*.log'（含通配符）→ 退出码 2",
+        "命令 'rm -f one.txt'（单文件）→ 退出码 0",
+        "命令 'rm one.txt'（单文件）→ 退出码 0",
+        "命令 'ls -la' → 退出码 0",
+        "python3 -m py_compile .claude/hooks/block-batch-delete.py exits 0"
       ],
       "priority": 4,
-      "passes": false,
-      "notes": "记录用途/单会话执行。破坏性 runtime 操作，必须用户同轮授权。blocked=true 确保 Ralph 自主循环绝不自动重启服务。",
-      "retryCount": 0,
-      "blocked": true
+      "blocked": false,
+      "notes": "",
+      "passes": true,
+      "retryCount": 0
     },
     {
       "id": "US-005",
-      "title": "闭环验证：dashboard 显示所有群（前端→后端→UI）",
-      "description": "作为看板用户，我需要确认 overview 统计涵盖所有群，证明并发 stats 不再自相 abort。",
+      "title": "实现 block-destructive-git hook（PreToolUse / Bash，含 dirty-revert 检测）",
+      "description": "作为代理工作流安全护栏，我需要在代理直接执行破坏性 git 操作时阻断，并在 git checkout/restore/reset 对当前 dirty 集中路径时阻断，以保护现有 dirty 文件与提交历史。",
       "acceptanceCriteria": [
-        "用 agent-browser 打开 http://127.0.0.1:5030/ 默认 dashboard tab，等 overview 加载完成",
-        "并发 /api/v1/stats?format=json&chat=... 请求真实到达后端返回 HTTP 200（network 面板确认多个 stats 请求均 200，非 404/被 abort 失败）",
-        "读取 #dashboard-ov-groups 数字记为 fixed_overview_groups",
-        "断言 fixed_overview_groups == actual_group_total（或显著大于 US-001 的 baseline_overview_groups）",
-        "#dashboard-comparison-grid 子卡片数量 > 1 且约等于群总数",
-        "浏览器 console 无未捕获异常",
-        "隐私：仅读数字与元素计数，不读群名/消息正文，不外传全屏截图",
-        "go build ./... 通过"
+        "创建 .claude/hooks/block-destructive-git.py，从 stdin 取 tool_input.command 正则匹配破坏性 git 子命令",
+        "命令 'git commit -m x' → 退出码 2",
+        "命令 'git push origin main' → 退出码 2",
+        "命令 'git reset --hard HEAD~1' → 退出码 2",
+        "命令 'git rebase -i HEAD~3' → 退出码 2",
+        "命令 'git merge --no-ff feature' → 退出码 2",
+        "命令 'git merge --abort' → 退出码 0（恢复路径放行）",
+        "命令 'git checkout -b foo' → 退出码 2（创建/切换分支）",
+        "命令 'git status' → 退出码 0",
+        "命令 'git rev-parse --abbrev-ref HEAD' → 退出码 0（ralph.py 用，必须放行）",
+        "命令 'git log --oneline -5' → 退出码 0",
+        "命令 'git diff' → 退出码 0",
+        "hook 先调 git status --porcelain 取 dirty 集；在仓库根运行 'git restore CLAUDE.md'（CLAUDE.md 当前 dirty）→ 退出码 2（dirty-revert 命中）",
+        "在非 git 目录或 git status 失败时回退到 不检测 dirty 集，其它命令名规则仍生效，不 crash",
+        "python3 -m py_compile .claude/hooks/block-destructive-git.py exits 0"
       ],
       "priority": 5,
-      "passes": false,
-      "notes": "记录用途/单会话执行。核心闭环验收。blocked=true 防 Ralph 误自动跑（需 agent-browser 读真实 dashboard，隐私+弱模型风险）。依赖 US-004。",
-      "retryCount": 0,
-      "blocked": true
+      "blocked": false,
+      "notes": "",
+      "passes": true,
+      "retryCount": 0
     },
     {
       "id": "US-006",
-      "title": "回归验证：切 tab 不回归 ISSUE-001",
-      "description": "作为维护者，我需要确认切 tab 仍能取消在途 long-poll，没把 ISSUE-001 的连接泄漏改回来。",
+      "title": "实现 block-report-commit hook（PreToolUse / Bash）",
+      "description": "作为代理工作流安全护栏，我需要在代理用 git add . 等全量暂存命令时阻断，以防止 reports/ 等私有目录被一起暂存。",
       "acceptanceCriteria": [
-        "用 agent-browser 打开 dashboard，在 overview 加载期间或加载后点击切到'全局搜索'tab，再切回'仪表盘 & 数据库'",
-        "切 tab 过程浏览器 console 无 ERR_CONNECTION_REFUSED",
-        "切 tab 过程浏览器 console 无未捕获的 AbortError（被取消的在途请求应被 catch 吞掉）",
-        "切回后 overview 能正常重新加载并再次显示所有群",
-        "go build ./... 通过"
+        "创建 .claude/hooks/block-report-commit.py，从 stdin 取 tool_input.command",
+        "命令 'git add .' → 退出码 2",
+        "命令 'git add -A' → 退出码 2",
+        "命令 'git add --all' → 退出码 2",
+        "命令 'git add reports/x.md' → 退出码 2（显式私有路径）",
+        "命令 'git add internal/chatlog/x.go' → 退出码 0",
+        "命令 'git status' → 退出码 0（只读放行）",
+        "命令 'git diff --cached' → 退出码 0",
+        "python3 -m py_compile .claude/hooks/block-report-commit.py exits 0"
       ],
       "priority": 6,
-      "passes": false,
-      "notes": "记录用途/单会话执行。blocked=true 防 Ralph 误自动跑（需 agent-browser）。依赖 US-004。",
-      "retryCount": 0,
-      "blocked": true
+      "blocked": false,
+      "notes": "",
+      "passes": true,
+      "retryCount": 0
     },
     {
       "id": "US-007",
-      "title": "仓库回归 + ISSUE-005 收尾 + 提交",
-      "description": "作为维护者，我需要确认全仓无回归并把修复落账。",
+      "title": "实现 guard-quota-commands hook（PreToolUse / Bash）",
+      "description": "作为代理工作流安全护栏，我需要在代理默认调用配额/隐私敏感命令时阻断，以避免无意识消耗模型配额与暴露 prompt。",
       "acceptanceCriteria": [
-        "go build ./... 通过（exit 0）",
-        "node scripts/check-root-harness.mjs 输出 80/80 passed",
-        "TODOS.md 中 ISSUE-005 的 Status: open 改为 Status: fixed",
-        "取得用户当轮授权后提交：git add internal/chatlog/http/static/index.htm TODOS.md，commit message 以 'fix(qa): ISSUE-005 — ' 开头，结尾含 Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>",
-        "git show --stat HEAD --name-only 仅含 index.htm 与 TODOS.md（无 bin/chatlog 等多余文件）"
+        "创建 .claude/hooks/guard-quota-commands.py，从 stdin 取 tool_input.command",
+        "命令 'chatlog report daily --vision' → 退出码 2",
+        "命令 'chatlog report daily --summary' → 退出码 2",
+        "命令含 '/api/v1/semantic/test' 的 curl → 退出码 2",
+        "命令 'chatlog semantic test' → 退出码 2",
+        "命令 'go run . report daily --help' → 退出码 0（--help 放行）",
+        "命令 'chatlog report daily'（无 vision/summary）→ 退出码 0",
+        "命令 'chatlog http list' → 退出码 0",
+        "python3 -m py_compile .claude/hooks/guard-quota-commands.py exits 0"
       ],
       "priority": 7,
+      "blocked": false,
+      "notes": "",
+      "passes": true,
+      "retryCount": 0
+    },
+    {
+      "id": "US-008",
+      "title": "实现 gofmt-check hook（PostToolUse / Write|Edit|MultiEdit，仅提醒不阻断）",
+      "description": "作为代理工作流安全护栏，我需要在代理写完 .go 文件后提醒其补 gofmt，以避免未格式化代码落地但代理不知。",
+      "acceptanceCriteria": [
+        "创建 .claude/hooks/gofmt-check.py，当 file_path 以 .go 结尾时调 gofmt -l <file>",
+        "对未格式化的 .go 文件（如 /tmp/_unfmt.go 内容 'package x\\nfunc F( ){\\n}\\n'）→ 退出码 2，stderr 含 'Reminder' 与 'gofmt -w'",
+        "对已 gofmt 的 .go 文件 → 退出码 0 且无输出",
+        "对非 .go 文件（如 README.md）→ 退出码 0（不触发 gofmt）",
+        "gofmt 不在 PATH（FileNotFoundError）时 → 退出码 0（不 crash、放行）",
+        "测试断言验证 stderr 包含 reminder 文案（不只看退出码）",
+        "python3 -m py_compile .claude/hooks/gofmt-check.py exits 0"
+      ],
+      "priority": 8,
+      "blocked": false,
+      "notes": "",
+      "passes": true,
+      "retryCount": 0
+    },
+    {
+      "id": "US-009",
+      "title": "实现 remind-state-update Stop hook（含 session_id 哈希自终止计数器）",
+      "description": "作为代理工作流安全护栏，我需要在代理改完 .go 但未更新 progress.md 时阻止会话停止，以强制补 DoD 状态文件，且必须自终止避免死循环。",
+      "acceptanceCriteria": [
+        "创建 .claude/hooks/remind-state-update.py，处理 hook_event_name=Stop 事件，取 session_id 做 sha256 前 12 字符",
+        "计数文件路径为 $CLAUDE_PROJECT_DIR/.claude/hooks/.stop_block_count.<hash>（不写 /tmp）",
+        "首次（计数=1）且 git dirty 集含 *.go 但无 progress.md → stdout 输出含 '\"decision\": \"block\"' 的 JSON，退出码 0",
+        "第二次及以后（计数>=2）同一 session_id → stdout 输出含 '\"continue\": false' 与 stopReason 的 JSON，退出码 0（强制停止）",
+        "dirty 集无 *.go 或含 progress.md → stdout 输出 {} ，退出码 0（放行）",
+        "自终止验证：连续 3 次喂同一 session_id，第 2 次与第 3 次 stdout 都含 'continue' 且值为 false",
+        "测试开头与结尾执行 rm -f .claude/hooks/.stop_block_count.* 清理，不污染仓库",
+        "python3 -m py_compile .claude/hooks/remind-state-update.py exits 0"
+      ],
+      "priority": 9,
+      "blocked": false,
+      "notes": "",
+      "passes": true,
+      "retryCount": 0
+    },
+    {
+      "id": "US-010",
+      "title": "创建离线单测脚本 test_hooks.sh（先验证全部 hook standalone）",
+      "description": "作为开发者，我需要一个汇总单测脚本，让 8 个 hook 都能离线跑断言，无需启动 Claude Code 真实会话，以在接线前先确认 hook 行为正确。",
+      "acceptanceCriteria": [
+        "创建 .claude/hooks/test_hooks.sh，开头 cd 到仓库根并 set -u",
+        "脚本汇总 US-001..US-009 全部正/负样例，断言总数 >= 35",
+        "每条用 actual=$?; [ \"$actual\" = \"期望值\" ] || { echo FAIL...; fail=1; } 形式断言退出码",
+        "临时 .go 文件用 /tmp 并在结尾 rm -f 清理",
+        "开头与结尾执行 rm -f .claude/hooks/.stop_block_count.* 清理侧计数文件",
+        "block-destructive-git 的 dirty-revert 断言在仓库根目录执行（需 .git）",
+        "bash .claude/hooks/test_hooks.sh 全部通过，末尾打印 'ALL HOOK TESTS PASSED'，退出码 0",
+        "任一断言失败时脚本退出码为 1 并打印失败项"
+      ],
+      "priority": 10,
+      "blocked": false,
+      "notes": "",
+      "passes": true,
+      "retryCount": 0
+    },
+    {
+      "id": "US-011",
+      "title": "在 .claude/settings.json 挂载所有 8 个 hook",
+      "description": "作为开发者，我需要把 8 个 hook 接进 .claude/settings.json，使其对所有在仓库工作的 Claude Code 代理生效。",
+      "acceptanceCriteria": [
+        "创建 .claude/settings.json（当前确认不存在；若已存在则先 Read 再 merge hooks 键，绝不覆盖既有键）",
+        "PreToolUse 含 6 个 hook：block-private-writes（matcher 'Write|Edit|MultiEdit'）、block-private-reads / block-batch-delete / block-destructive-git / block-report-commit / guard-quota-commands（matcher 'Bash'）",
+        "PostToolUse 含 1 个 hook：gofmt-check（matcher 'Write|Edit|MultiEdit'）",
+        "Stop 含 1 个 hook：remind-state-update（无 matcher 键，Stop 不支持 matcher）",
+        "所有 command 字符串使用 python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/<name>.py\" 形式",
+        "python3 -c \"import json; json.load(open('.claude/settings.json'))\" exits 0",
+        "git check-ignore .claude/settings.json 退出码为 1（即不被 gitignore，可正常 commit）"
+      ],
+      "priority": 11,
+      "blocked": false,
+      "notes": "",
+      "passes": true,
+      "retryCount": 0
+    },
+    {
+      "id": "US-012",
+      "title": "编写文档 docs/claude-code-hooks.md",
+      "description": "作为维护者，我需要一份说明文档，让后续开发者理解本 hooks 与产品 messagehook 的区别、新增/调整 hook 的流程、以及关键风险。",
+      "acceptanceCriteria": [
+        "创建 docs/claude-code-hooks.md",
+        "文档开头显式声明：本文件描述 Claude Code 代理 hooks（.claude/settings.json），不是产品 internal/chatlog/messagehook，也不是 /api/v1/hook/* HTTP 端点",
+        "列出全部 8 个 hook 的触发事件、matcher、拦截规则、deny 文案样例",
+        "列出 5 条关键风险声明：热重载无安全门、subprocess 不可见、Ralph 通过 subprocess 调 git 绕过 hook、PostToolUse 不能 block、Stop 无内置循环防护",
+        "含 临时绕过 章节（注释 settings.json 对应行或临时改 settings.local.json）与 新增 hook 流程章节",
+        "grep -q 'messagehook' docs/claude-code-hooks.md exits 0",
+        "grep -qE 'Ralph|ralph.py' docs/claude-code-hooks.md exits 0",
+        "grep -qE '热重载|hot reload|hot-reload' docs/claude-code-hooks.md exits 0"
+      ],
+      "priority": 12,
+      "blocked": false,
+      "notes": "",
+      "passes": true,
+      "retryCount": 0
+    },
+    {
+      "id": "US-013",
+      "title": "按 DoD 更新状态文件 feature_list.json / progress.md / session-handoff.md",
+      "description": "作为维护者，我需要把本特性记录到状态文件，让下一个 agent 能复盘与重启。",
+      "acceptanceCriteria": [
+        "在 feature_list.json 添加 feature 条目 id='claude-code-guard-hooks-2026-06-19'，含 name/title/description/scope/done_criteria/evidence/status='done'，字段结构与已有条目（如 graph-knowledge-digest-2026-06-10）一致",
+        "evidence 包含 bash .claude/hooks/test_hooks.sh 末尾 'ALL HOOK TESTS PASSED' 行与 settings.json json.load 通过证据",
+        "progress.md 追加 What changed / Verification Evidence / Not Verified（端到端手动验证未做则标 未验证）/ Risks / Next",
+        "session-handoff.md 写 Next Session 路径：hook 清单、test 脚本路径、关键风险",
+        "python3 -c \"import json; json.load(open('feature_list.json'))\" exits 0",
+        "grep -qE 'guard-hooks|claude-code-hooks' progress.md exits 0"
+      ],
+      "priority": 13,
+      "blocked": false,
+      "notes": "",
+      "passes": true,
+      "retryCount": 0
+    },
+    {
+      "id": "US-014",
+      "title": "回归验证：零产品代码改动 + 根 harness 不回归",
+      "description": "作为维护者，我需要确认本特性不打破仓库既有的 harness 检查，且未触碰 Go 产品代码。",
+      "acceptanceCriteria": [
+        "git status --porcelain internal/ cmd/ 输出为空（零产品代码改动）",
+        "node scripts/check-root-harness.mjs 退出码 0",
+        "node skills/chatlog-http-cli/scripts/check-harness-skill.mjs 退出码 0",
+        "./init.sh（不带 --full/--runtime）退出码 0"
+      ],
+      "priority": 14,
+      "blocked": false,
+      "notes": "",
+      "passes": true,
+      "retryCount": 0
+    },
+    {
+      "id": "US-015",
+      "title": "闭环集成验证：在真实 Claude Code 会话中触发每种拦截（runtime，需用户授权）",
+      "description": "作为维护者，我需要在真实 Claude Code 会话里触发每种 hook，确认端到端拦截行为符合预期（热重载即生效、stderr 反馈可见）。",
+      "acceptanceCriteria": [
+        "在真实 Claude Code 会话中 Write reports/_probe.md → 被 block-private-writes 阻断，模型下一轮可见 stderr 原因",
+        "Bash 'cat reports/daily.md' → 被 block-private-reads 阻断",
+        "Bash 'rm -rf /tmp/_test' → 被 block-batch-delete 阻断",
+        "Bash 'git commit -m x' → 被 block-destructive-git 阻断",
+        "Bash 'git checkout -- CLAUDE.md'（CLAUDE.md dirty）→ 被 block-destructive-git dirty-revert 规则阻断",
+        "Bash 'git add .' → 被 block-report-commit 阻断",
+        "Bash 'chatlog report daily --vision' → 被 guard-quota-commands 阻断",
+        "编辑一个故意未格式化的 .go 文件 → gofmt-check 在下一轮反馈 reminder",
+        "改一个 .go 但不更新 progress.md → remind-state-update 在 Stop 时阻断并要求补 DoD，第二次 Stop 用 continue:false 自终止",
+        "上述任一项未验证 → 在 progress.md 显式标 未验证（不静默跳过）"
+      ],
+      "priority": 15,
+      "blocked": true,
+      "notes": "runtime/manual story：需真实交互式 Claude Code 会话触发拦截并观察热重载即生效行为。Ralph 的 developer/validator 是 claude --print 子进程，难以可靠自验证 hook 拦截与 hot-reload；标 blocked 待用户在真实会话中验证。",
       "passes": false,
-      "notes": "记录用途/单会话执行。commit 需用户同轮授权（direct-to-main）。blocked=true 防 Ralph 误自动提交。依赖 US-005/US-006 验证通过。",
-      "retryCount": 0,
-      "blocked": true
+      "retryCount": 0
     }
   ]
 }

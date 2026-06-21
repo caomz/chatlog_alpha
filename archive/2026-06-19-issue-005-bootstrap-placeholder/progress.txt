@@ -1,0 +1,353 @@
+# Ralph Progress
+
+## Codebase Patterns
+- `chatlog_alpha` is a Go local-tool product for Chatlog CLI/TUI/HTTP, WeChat local database access, semantic search, temporal graph processing, and daily reports.
+- Start every Ralph iteration by reading root `AGENTS.md`, `skills/chatlog-http-cli/SKILL.md`, `feature_list.json`, root `progress.md`, root `session-handoff.md`, `scripts/ralph/prd.json`, and this file.
+- Use `./init.sh` as the default quick gate; use focused `go test ./internal/...` for Go logic; use `./init.sh --full` only for broad repo changes.
+- Do not run `chatlog report daily --vision` or `chatlog report daily --summary` unless the PRD story and user authorization explicitly require model/vision calls.
+- Verify private chat-derived workflows through paths, timestamps, counts, HTTP status, structured fields, or error buckets; do not print private message or report contents.
+- Developer agents do not commit directly. `scripts/ralph/ralph.py` commits only after Validator success and excludes startup-dirty paths plus private/cache output directories.
+- Long runtime windows (>2min) should run via `nohup script.sh &` (or a TaskCreate with `run_in_background`); the parent shell returns immediately, the child keeps sampling. Snapshot to `scripts/ralph/progress.txt` not a new file, and judge PASS/blocked only after the loop finishes, never mid-loop.
+- `prd.json` field is `userStories`, not `stories`. After any PRD edit run `jq '.userStories | length'` to confirm shape.
+- For MiniMax key pool: stable ordinal labels (`key_1`, `key_2`, ...) are preferred over `***xxxx` tail-redaction because operators want to grep for "which key hit the wall". A non-retryable bucket (`minimax_sensitive_1026/1027`, `minimax_decode_error`, ...) must NEVER move a key into pool-level quarantine — only `minimax_auth_error` and the model-retryable buckets the operator has explicitly opted into should. Test the negative case (`TestRecordErrorDoesNotQuarantineOnSensitiveOrRateOrDecode`) so future refactors cannot silently rotate 1026/1027 keys.
+- `chatMMXRaw.recordError` is only called after a successful `Acquire` (i.e. `ensureLocked` already ran), so recordError can rely on `p.slots` being populated. Tests that call `recordError` before any `Acquire` must touch Acquire first to materialize slots.
+- HTTP handler 暴露 snapshot 字段的最佳实践: 当 snapshot 结构已包含目标字段(类型/JSON tag 完备)但 HTTP gin.H 没 spread 时,**只需在 handler 的 gin.H literal 里把缺失字段逐项写出**即可一行修复,不必重构 snapshot 端或加 spread helper。这样修改面最小、影响面最小,其它调用 snapshot 的代码不受牵连。修复后用 dummy key + 真实 endpoint 触发一次 `recordError` 即可在 3 秒内观察到 `quarantined_key_count=5`。
+- `passes=true` + 非空 `notes` 会让 `ralph.py:story_ready_to_commit()` 沉默跳过自动 commit。修"重试"类 story 必须三步走:`passes=true` + `notes=""` + `retryCount=0`,否则 ralph 自动 commit 会被沉默跳过,导致 commit 链路断裂。
+- 自适应 worker cap (HA-003) 状态机设计: 3 个 tier (stable=5 / degraded=3 / critical=1),`windowDuration=60s` + `recoveryGrace=90s` 故意让 grace > 窗口,这样窗口清空后还有 grace 缓冲,避免 spike 簇在窗口边缘震荡;downgrade 立即生效,upgrade 必须 `previous != stable && QuietDuration >= recoveryGrace`。spike bucket 严格只接受 `minimax_rate_limited / minimax_timeout / minimax_before_request_timeout` — `minimax_sensitive_1026/1027 / minimax_decode_error / minimax_auth_error / minimax_config_error` 显式不参与(让 `tracker.Observe` 过滤,不要让 manager 在上层分支判断),保证内容安全/解析问题不被 worker 降并发掩盖。
+- 自适应 worker cap 的"事实"边界: `adaptiveMaxWorkers` 必须把上层 `min(configured_key_count, maxGraphWorkers, userSetWorkers)` 当作硬上限,自己只往下降,绝不越权给用户/运维放大到他们没设的 worker 数;`ProcessPending` 每次 batch 都重算 `effectiveWorkers()`,Manager 缓存 `lastEffectiveWorkers` 给 `Status()` 用,让 `/api/v1/graph/status` 不需要重算。
+- HA-004 failed-source bucket 分类器的"先归一再决策"原则: 不要在 `requeueRecoverableFailedSources` 里散落 if-else 判断每个非可恢复桶,把所有错误归一进一个**稳定 10 类 bucket 词表**(`config_error` / `network_timeout` / `before_request_timeout` / `rate_limited` / `auth_error` / `json_decode_error` / `empty_graph` / `sensitive_input_1026` / `sensitive_output_1027` / `non_retryable_request` + `unclassified`),requeue 路径只对**可恢复桶名**的闭合列表(`recoverableGraphBuckets`, 4 个)逐个调 `RequeueFailedSourcesByBucket`,manager 完全不需要知道每个 token 长什么样。这样后续加新桶(比如 `minimax_internal_error`)只需加分类器 token + 名字,不动 requeue 决策;且 `ClassifyFailedError` 是 substring match,顺序决定优先级,recoverable 桶放前面,non-retryable 放后面,避免重叠 token 误判。
+- 桶计数 `FailedBucketCounts()` 必须返回**全 10 个桶 + unclassified** 的 map 即便 count=0,这样 `/api/v1/graph/status#failed_buckets` 永远稳定暴露所有键,HA guard 端不用做 nil-check;同时 Status 暴露的 buckets 只含 name+count,不含 source payload / prompt / 私聊正文,符合隐私安全。
+- 测试桶分类器时**正反两路都要 lock**: `TestClassifyFailedErrorCoversAllHABuckets` 锁 10 类 positive + 2 类 negative (empty / unknown),`TestAllFailedBucketNamesIsStableAndComplete` 锁 list 顺序,`TestManagerRequeueRecoverableOnlyMovesRecoverableBuckets` 端到端验证 manager 只 requeue 4 类、保留 6 类,只要未来有人改 `recoverableGraphBuckets` 或 token 列表,测试会立刻显红,避免 silent rotation 1026/1027 进 pending。
+- 测试"调用外部服务"的代码:首选 **接口注入 + 函数适配器**(`type ChatInvoker interface { Chat(...) (string, error) }` + `type ChatInvokerFunc func(...) (string, error)`),fake 实现就是 plain Go function,生产路径用 `ChatInvokerFunc(client.Chat)` 一行包装,既不需要 reflect/mock 框架,也不需要在 `*Client` 上加 hook;benchmark 类的代码必须能离线单测,dry-run 默认 `--execute` opt-in 是隐私安全的硬护栏。
+- Benchmark/gate 边界测试模式: 把 gate 阈值(`JSONValidRateGap=0.02` / `NonEmptyGraphRateGap=0.05`)显式命名常量 + 写 4 个边界测试(`PassWhenMeets` / `RejectOnJSONValidRegression` / `RejectOnNonEmptyRegression` / `AtBoundaryAllows` / `SlightlyPastBoundaryRejects`)。任何给小数位后两位的微调都不会让测试假绿/假红,review 时只看 const 定义就能对上线门禁有"绝对值"的感觉。
+- Fixture 隐私 + 覆盖的硬护栏模式: 任何 "测试 fixture" 必须 (1) 用 const 显式 allow-list 7 类分类(短句/省略语/时间/多人/业务/关系/空) + `TestXxxCoversAllRequiredCategories` 锁"7 类都覆盖",(2) `TestXxxHasNoRealChatContent` 用反例 `wxid_` / `13800` grep 锁住"不能塞真实聊天",(3) `TestXxxHasVariedShape` 锁"每类至少 1 个 fixture"。这样 review 想删一类 / 塞私货都会立刻显红,privacy 是测试 invariant 不是文档声明。
+- HA guard productize 的 "dry-run 不真做 + 实时 SUMMARY 一行化" 模式: 把所有 mutating helper (`restore_semantic_config` / `restart_service` / `ensure_graph_config` / `resume_graph_if_needed`) 改成只 `plan_action "<name> <key=val...>"` 收口到一个 `PLANNED_ACTIONS[]` 数组,`run_or_print` 仍然能切换真/假执行;末尾 `emit_summary_block` 把 `GUARD_HEALTH / SEMANTIC_PROVIDER / MMX_CONFIGURED / GRAPH_WORKERS / GRAPH_PENDING / GRAPH_FAILED / action_taken / planned_count` 用 key=value 拼成一行;`--loop 60` 直接复用 `check_once` + 末尾加 SUMMARY tick 行。这样 AC#1 (完整 dry-run 摘要) 和 AC#4 (loop 每轮时间戳+状态+动作) 一次性满足,且 AC#2 (服务健康时 planned_count=0 → 真正幂等) 只需要保证 helper 的 plan_action 调用前置判断准。
+- 进程级健康检查 (`check_service_process` 模式): guard 不止看 HTTP `/health`,还要用 `lsof -nP -iTCP:5030 -sTCP:LISTEN -t` 拿 listener PID,`ps -p PID -ww -o command=` 取完整 cmdline,`ps eww -p PID` 取 env blob,这样才能判 (a) 是否 `serve --config-dir <dir>`、(b) `MINIMAX_API_KEYS` 数量。AC#3 的"进程不是规范启动" 必须用 `lsof` + `ps` 走真实 OS 层,不能只靠 HTTP status;HTTP 全 ok 但 cmdline 漂移是 2026-06-07 实际 production 遇到的故障模式,guard 应当捕获并 respawn。
+- macOS `mv` 在 immutable flag 文件上会报 `set owner/group` 警告但写入成功;用 `jq > tmp && mv tmp target` 三步走也是同样警告。验证时只 check `jq` 输出,不要被警告吓到。
+- `notes` 非空 → ralph.py 沉默跳过自动 commit。修复类 story 的 "三步收口" 标准操作: `passes=true` + `notes=""` + `retryCount=0`。
+- HA-007 E2E 收口:5 个 AC 拆到 status 字段级别,每个对应 1 个 HTTP 端点 + 1 个可重复的取值/动作;recoverable/non-recoverable 共存性用 "一次 resume 同时验证 pending/processed 动 + sensitive_1026/1027 不动" 一击两证;binary 字段缺失时用 `sqlite3 -readonly` 按 HA-004 桶分类正则派生等价证据(SQLite 永远是 ground truth,比 HTTP 字段更鲁棒);长窗口用 `nohup /tmp/ha007_sample.sh &` + pidfile 等退出模式(父 shell `while [ -f pidfile]; do sleep 5; done`),不阻塞主流程。
+- **冲突 setup 的"race-before-fork"陷阱**:git 三方合并要触发冲突,需要 base 与 work-branch 从**同一祖先**拉出后**各自独立**对同一文件同一行做不同修改。若 base 在 work-branch 拉出**前**先添加/修改文件,work-branch 后续改它只是 base 的子孙,merge 时 base 看不到反向修改,`git merge --no-ff` 走 fast-forward(同祖先 trivial merge),不报冲突。US-003 scene 3 第一次跑就是这种顺序,`auto_merge_branch` 直接走"✅ 合并完成"成功路径,场景完全测反。修复后顺序是 "work-branch 写 v1 + commit → 切回 base 写 v2 + commit → 切回 work-branch → auto_merge_branch",base 与 work-branch 从共同祖先分叉,各自独立改动 shared.txt,merge 才真冲突。**任何"冲突 abort"沙箱场景的脚手架都按"先 fork 后 race"模板,不要先在 base 改文件再 fork**。
+
+- graph-knowledge-digest 运行沉淀 (2026-06-12): Manager 内置 `client *semantic.Client` 已实现 `ChatInvoker` 接口,可选模型调用的方法签名收 `opts.ChatInvoker`,nil 时 fallback `m.client` — HTTP handler 零注入、单测全 mock,两边都干净。
+- Digest 端到端验收 4 件套(按序): `curl /api/v1/graph/status` 取 failed 基线 → `go run . report graph --days 7` → `stat` + `grep -c '^## '` + `head -8` 验结构 → `git status --porcelain | grep graph-digest-` 验不入库;`?? reports` 是 symlink 行不是产物污染。
+- CLI 子命令调本地 HTTP 服务的标准形态: `--base-url` 默认 `http://127.0.0.1:5030`,连接失败的错误必须含目标端点 + `chatlog serve` 启动提示,`os.Exit(1)` 只在 cobra Run 包装层调用(不在 helper 里,避免 defer 丢失);500/400 分开报错且非零退出。
+- 服务二进制更新后路由 404: 运行中的 `bin/chatlog` 是旧版时新路由全 404,需 `make build` + 重启服务(serve --config-dir .cache/daily-report-config)再做 runtime 验收;重启属系统状态变更,先向用户确认或由用户自行执行。
+- US-001 沙箱自包含 import + mktemp 物理路径断言(2026-06-12): 复制 ralph.py + dashboard.py 到 `<sandbox>/scripts/ralph/`,`import ralph` 时 `__file__` 指向沙箱副本,`PROJECT_ROOT = SCRIPT_DIR.parent.parent` 自动解析到沙箱根,无需 monkey-patch。macOS 上 mktemp 返回 `/var/folders/...`(symlink),`git rev-parse --show-toplevel` 返回 `/private/var/folders/...` 物理路径,直接 `[$TOPLEVEL = $PWD]` 会 false,要用 `cd "$(pwd)" && pwd -P` 拿物理路径再比,US-003 的 `test_branch_merge.sh` 直接复用这个模板。
+- US-001 BASE/WORK 分支状态机: 模块级 `BASE_BRANCH` / `WORK_BRANCH` 在 `ensure_work_branch()` 首次调用时通过 `git rev-parse --abbrev-ref HEAD` 捕获 base,后续只读;`auto_merge_branch()`(US-002)直接 `git checkout <BASE_BRANCH>` 即可还原启动分支。check_only 短路必须用 `bool` 参数而不是另写一个 `_ensure_work_branch_readonly()`,live 路径与 check 路径共享"打印 `Work branch: <branch> (base: <base>)`"的同一行格式,review 不会因为两套实现漂移而误判。
+- 分支生命周期边界 (US-004): `ensure_work_branch()` 创建/切换工作分支、`auto_merge_branch()` 在所有 story 通过(无 blocked、无冲突、AUTO_MERGE 未关闭)时执行 `--no-ff` 合并,这两步仅由 `scripts/ralph/ralph.py` 的 live loop 在 `main()` 内部按状态机自动完成;developer/validator agent 禁止 `git checkout` 切工作分支、禁止执行任何 `git merge`、`RALPH_AUTO_MERGE=0` 是显式 opt-out 关合并的唯一合规路径。验证方式: 真实仓库走 `ralph.py --check`(只读),实际合并走 `bash scripts/ralph/test_branch_merge.sh` 的 3 个 mktemp 沙箱(干净合并 / blocked 跳过 / 冲突 abort)端到端闭环,developer/validator 都不应直接调 `auto_merge_branch()`。
+- US-003 macOS bash 3.2 + heredoc + f-string 陷阱(2026-06-12): `out="$( python3 <<'PY' ... print(f"...{var}...") ... PY )"` 即使 heredoc 用 `<<'PY'` 单引号,在 macOS 系统 bash 3.2 (`/bin/bash` 默认 3.2.57) 的 parse 阶段仍会报 `syntax error near unexpected token '('`,根因是 f-string 内的 `({var})` 触发 bash brace expansion 解析。**结论:复杂 heredoc 永远用 `( ... ) >> "$out_file"` 子 shell + 临时文件捕获,而非 `$( ... )`**,`rc=$?` 在 `(...)` 后直接捕获,再用 `out="$(cat "$out_file")"` 拿输出,既保留 heredoc 又绕过 parse 限制;`set -euo pipefail` 下子 shell 退出非 0 不会让脚本退出(子 shell 退出码赋给 `rc=$?` 后显式判断),但 `local rc=0` 必须在子 shell 之前声明,子 shell 之后重新 `set -e`。`auto_merge_branch()` 冲突时抛 `SystemExit(1)` 走 `rc ∈ {0,1}` 双值判定(0 = 正常、1 = 冲突预期、其他 = 异常)。
+- US-003 沙箱分支名 env 传参(2026-06-12): 沙箱 python 进程内 `import ralph` 时 ralph.py 模块顶层读 `sys.argv[1:]` 决定 AGENT,非 `claude`/`codex` 立即 `sys.exit(2)`。任何把分支名当 `sys.argv[1]` 传给 python 进程的写法(`python3 - "<branch>" <<'PY'`)会在 `import ralph` 阶段就 abort,沙箱根本进不到 `ensure_work_branch`。**结论:沙箱与分支名解耦 → 分支名走环境变量**(`RALPH_TEST_BRANCH="$branch_name" PYTHONDONTWRITEBYTECODE=1 python3 <<'PY' ... os.environ["RALPH_TEST_BRANCH"] ... PY`),python heredoc 不传任何位置参数。`ralph.py` 启动期捕获到的 `BASE_BRANCH` 也因此是 `<sandbox>/main` 而非真实仓库的 `main`,沙箱全自包含不污染真实仓库。
+- US-003 test_branch_merge.sh 闭环结构(2026-06-12): `set -euo pipefail` + `trap cleanup_all EXIT` + `SBX_DIRS+=("$sbx")` 数组兜底清理(macOS bash 3.2 不支持 `trap ... RETURN`,改用 EXIT 全局 trap);每个场景独立 `mktemp -d -t "${SCRIPT_ID}-<name>-XXXXXX"` 沙箱 + 独立 `init_sandbox` 函数(物理路径 + base_branch + base_head 三元组)+ 独立 python heredoc 子 shell 跑 ensure + commit + auto_merge;`scenario_<name>()` 函数全部独立,任意一个 fail 走 `FAILED=$((FAILED+1))` 不中断后续场景,最后 `if [ "$FAILED" = "0" ] && [ "$PASSED" = "$SCENARIO_TOTAL" ]; then echo "ALL BRANCH MERGE TESTS PASSED"` 收口。3 场景断言标准:clean merge 看 base log 含 `merge: <branch>` + merge commit 2 parents + work-branch 保留 + base 含故事改动;blocked skip 看 base HEAD 哈希不变 + 无 merge commit + HEAD 仍在 work-branch;conflict abort 看 base log 无 merge commit + 无 `.git/MERGE_HEAD` 残留 + HEAD 在 work-branch + 输出含冲突文件名 + `git log --all` 无 merge commit。
+- US-003 沙箱 PWD 字面硬约束(2026-06-12): AC#5 要求"任何 git 写操作前断言 $PWD 在沙箱",`test_branch_merge.sh` 在 `init_sandbox` 入口 + 每个 python launcher 括号内嵌一道 `guard_sandbox_pwd "$sbx" "<label>"`(比对走 `pwd -P` 物理路径,避开 macOS `/var/folders/...` symlink)。**位置硬约束:守卫必须在 `( cd "$sbx" && ... )` 进程分组内部**,`cd` 失败 / 守卫失败 / python 退出非 0 任一道短路 — 放在分组外部会拿真实仓库 PWD 比对,守卫立即 `exit 1`(已踩坑)。这比 `set -e` 隐式兜底更可审,reviewer 不用读 bash 短路语义就能看出"误用会立即 abort"。
+
+- DB runtime 真值三分法 (db-runtime-graph-truth-harness PRD, 2026-06-12 引入): WeChat DB '可列出' != '可查询'。`/api/v1/db` 列出 DB + `all_keys.json` 存在 + `wcdb_cache/*.db` 有 SQLite header 都是 false-green；真值检查是 `isReadableSQLite(path)` 能读 `sqlite_master`。坏 cache(header 是 'SQLite format 3' 但 sqlite_master 报 'file is not a database')必须在 os.Rename 写入 outPath 前被拒绝并删 tmpPath，不更新 c.cache。
+- **DB 列表区分 listed vs queryable (US-003, 2026-06-16)**: `/api/v1/db` 响应从裸 `map[group][]path` 升级为 `{dbs: map[group][]path(嵌套一层,纯旧 binary 服务仍回裸 map,前端 fallback 兼容), unavailable: [{group,file,reason}], core_dbs_unavailable: bool, unavailable_reason: string}`。reason 词表封闭枚举:`file_not_found` / `stat_error` / `core_db_unreadable`,每个 token 长度 < 16 chars,绝不嵌 wxid/key/path;focused test 锁 `len(reason) <= 32 && !strings.Contains(reason, absPath)` 把"reason 不含 key"做成可执行 invariant。DataSource interface 加 `GetDBsWithStatus()` 后,`GetDBs()` 保留作薄包装,SearchAll / wechatdb.go / service.go 三处旧调用方零改动。共享类型 `DBEntry` 提到 `internal/wechatdb/datasource/dbentry` 子包,datasource 用 `type X = pkg.X` re-export,wcdb 直接 import 子包,彻底绕开 wcdb↔datasource 循环 import。**前端不再并发 probe `/api/v1/db/tables`** 探活,直接读 unavailable 列表 — 顺手收窄 US-001 path bug 的触发面(handler 本身的 path bug 仍在,等 group+file 短名会 500)。
+- **运行态破坏性操作(重扫 key/删 cache/重启服务)永远 blocked 待用户 same-turn 授权**,Ralph 自主循环+MiniMax 弱模型不得自动执行;须先备份 all_keys.json、单步删 cache(一次一个)、每步复验。
+- **cobra BoolVar 默认值不在 --help 显式打印**(除非补 "default false" 这种 annotation)。当 AC 字面要求"help 显示 --summary 默认关闭(false)"时,只在 flag description 里加 "default false" 是最小改动路径,不需要把默认值放进 init 或新加 `_BoolVarP` 加显式 default;`go run . report graph --help` 输出从 `--summary           enable model summarization (consumes quota)` 升级到 `--summary           enable model summarization (consumes quota, default false)`,一个字面是否满足 AC 的差别。
+- **Digest non-summary path 的"零 model call"硬护栏(US-007, 2026-06-16)**: `Digest()` 在 `opts.EnableSummary=false` 分支下完全不调 `invoker.Chat`,只走 readonly SQL 聚合(`graph_events` 扫描 + `graph_facts/relations/source_records` 计数),`summary_used=false` 是 HTTP 响应明确暴露的字段;`cmd_report.go` 默认 `reportGraphSummary=false`(BoolVar 第三参),`runReportGraph` 走 POST `/api/v1/graph/digest?days=7` 默认 non-summary。验证前后用 `curl /api/v1/graph/status?format=json` + `sqlite3 -readonly` 双路锁 `failed` 数完全一致即可证明队列未扰;`file_is_not_a_database_bucket=0` 在 US-006 已经收口,这里只需锁总数不变。
+- **Skill 写回 truth chain 的"加内容不破坏 baseline"模式(US-008, 2026-06-16)**: check-harness-skill.mjs 的 `files` 数组列 6 个文件 + ~17 条 checkContains,29/29 是硬 baseline。**新增 reference 不必塞进 mjs 数组**;只需在 reference 内交叉引用 SKILL.md / feedback-audit.md 已有 token(`/health` / `progress_pct=100` / `last_error=null` / `isReadableSQLite` / `wcdb_cache` 等),不删任何已有 reference 的 content,29 baseline 不变就是字面 PASS。这是"加内容不破坏 harness check" 的最小改动模板,比"加新 checkContains 项再改 reference" 风险小、review 面小。
+- **Precheck 边界 blockquote 的"否定式定义"模式(US-008, 2026-06-16)**: SKILL.md Verification Gate 段原本是正向列举命令(go test / make build / go run . report daily --help);当 AC 要求"明确 /health /ping 是 precheck 不是完成态" 时,不要"加一个 HTTP gate 项" 而要在 `Minimum repo-level gates` 之前插入 "Precheck 边界" blockquote,把"`/health` = `{"status":"ok"}` ≠ DB 可查询 ≠ graph 完成态" 字面写明,引用 truth chain reference。信息密度比正向 gate 高,且不增加 checkContains 项(避免破坏 baseline)。
+
+## 运行记录
+
+- 2026-06-12: PRD ralph/auto-merge-branch (分支生命周期) 全部 4 story 完成并归档至 archive/2026-06-12-auto-merge-branch/。新 PRD ralph/db-runtime-graph-truth-harness (10 story) 由 /ralph 转换写入。US-004/005/010 标 blocked(运行态破坏性恢复需用户授权);US-001/002/003/006/007/008/009 共 7 个为 Ralph 可自主执行项。来源 PRD: tasks/prd-db-runtime-graph-truth-harness.md。
+
+## 2026-06-16 18:30 - US-001
+- 实现了什么
+  - 只读诊断基线,无代码改动:确认 pwd=/Volumes/WorkSSD/Dev/chatlog_alpha, /health=ok, /api/v1/db 列出 18 个 DB 路径,核心 3 库 session/contact/message_0 调 /api/v1/db/tables 全部 HTTP 500 错误摘要为 `stat .../db_storage/<group>/<file>: no such file or directory`(handler 拼 stat 路径漏掉 group 子目录)。坏 cache 实锤:wcdb_cache 17/17 全部 sqlite_master 失败 (rc=26, 'file is not a database'),样例文件 header = 'SQLite format 3'。graph status: last_error=null, progress_pct=100 但 failed=531 (auth_error=141, config_error=249, json_decode_error=10, network_timeout=97, sensitive_output_1027=27, unclassified=7) — 符合 US-006 真值链预期。
+- 更改的文件
+  - scripts/ralph/prd.json (US-001 passes: false → true)
+  - progress.md (顶部追加 US-001 诊断 evidence 段)
+  - scripts/ralph/progress.txt (本段)
+- 运行的验证命令与结果
+  - pwd -P → /Volumes/WorkSSD/Dev/chatlog_alpha ✅
+  - curl /health → {"status":"ok"} rc=0 ✅
+  - curl /api/v1/db → 12 分组 18 DB 路径,只记数量 ✅
+  - curl /api/v1/db/tables session/contact/message_0 → 三次都 HTTP 500,错误摘要都是 stat no such file or directory(注意是 `db_storage/<file>` 缺 `<group>/` 子目录,与 db 列表路径不一致) ✅
+  - stat session.db / session.db-wal / contact.db / message_0.db / all_keys.json → mtime/size 全部记录 ✅
+  - ls ~/.chatlog/wcdb_cache/*.db | wc -l = 17; old mtime=2026-06-16 16:53:50; new mtime=2026-06-16 17:03:19 ✅
+  - sqlite3 -readonly 对 17 个 cache file 全部 rc=26,sqlite_master 全部失败;样例 170fb82914dc74888c50bb22f0798c60.db header = 'SQLite format 3',size=10153984,sqlite_master 报 'file is not a database' ✅
+  - curl /api/v1/graph/status?format=json → running=false, processed=21587, failed=531, pending=0, last_error=null, progress_pct=100,failed_buckets 上述 ✅
+- 未验证项与原因
+  - US-002 (后端 isReadableSQLite 在 os.Rename 前拒坏 cache)、US-003 (DB listed/queryable 区分 + index.htm 显式错误) 尚未做;留作下一轮独立 story。
+  - US-004 / US-005 / US-010 仍 blocked:本 story 是只读诊断,未触动任何 cache/key/service 文件,未重启服务,未调用模型。
+  - 未运行 ./init.sh / go build / go test:本 story 不改任何 Go 代码,无 typecheck/test 必要;但仍跑 README 验证 `make build` 之外没有跨文件引用改动。
+- **未来迭代的学习:**
+  - 可复用 patterns
+    - US-001 暴露了一个新的真值假绿:HTTP /api/v1/db/tables 用 `db_storage/<file>` 拼 stat 路径,与 /api/v1/db 列出的 `db_storage/<group>/<file>` 路径不一致 → 错误是 `stat ... no such file or directory` 而非 `file is not a database`。这类"路径构造层"的 bug 应当像解密产物头校验一样,被 handler 在拼路径后先做 `os.Stat` 验证,失败时返回 `path_resolve_error` 而非静默 500。
+    - wcdb_cache 17/17 sqlite_master 失败但 header 仍是 'SQLite format 3' → 完美命中 Codebase Pattern 第 43 条"坏 cache(header 对但 sqlite_master 报 'file is not a database')必须在写 outPath 前被拒";US-002 的修复方向因此可以非常具体:在 client.go decrypt 完成后、os.Rename 之前调 isReadableSQLite,失败时删 tmpPath 不写 outPath 不更新 c.cache。
+    - 11 分钟内 17 个 cache 全部被重写(mtime 16:53→17:03)但仍全是坏 cache → 说明根因在 all_keys.json (mtime 2026-05-31) 与 WeChat 运行时解密不匹配;US-004 解除 blocked 后,坏 cache 才会被重新解密成可读。
+  - 遇到的陷阱
+    - curl /api/v1/db/tables 默认 HTML 错误页被截断,要 `-w 'HTTP=%{http_code}\n'` 拿状态码、用 `head -c 600` 拿正文摘要,不能完全信 stdout 第一行。
+    - `ls -1t | head -1` 在 macOS 上用 `tail` 取最后一条前先 `xargs stat -f '%Sm'`,`{}` 在 xargs -I 默认逐条跑 → 不能直接 `ls -1t | head -1 | stat -f '%Sm'`,需要 xargs 介入。
+    - wcdb_cache 文件名是 md5 而非原 DB 名,人工对应需要 all_keys.json 的 key 字段,本 story 不打印 key 内容因此只记总数量和 mtime 范围。
+  - 有用的上下文
+    - core 3 库未读真值:HTTP 错"stat no such file or directory"+ path=db_storage/<file> 而非 db_storage/<group>/<file> → 下一轮 US-002/003 修复后,仍需 US-004 重扫 key 才能让 isReadableSQLite 真正读出 sqlite_master,否则解出来的 cache 仍是坏 cache(根因在 key,不在读路径)。
+    - graph failed_buckets 的"unclassified=7"暗示有失败模式没被归类,US-006 时应当先看具体 error 字符串再补桶。
+---
+
+## 2026-06-16 18:55 - US-002
+- 实现了什么
+  - 后端在 `internal/wechatdb/wcdbapi/client.go` `ensureDecrypted` 的最终 `os.Rename(tmpPath, outPath)` 之前加了一道 `isReadableSQLite(tmpPath)` 闸门,这是 US-001 暴露的真值假绿的根因修复(17/17 wcdb_cache 全部 header 对但 sqlite_master 报 'file is not a database')。
+  - 不可读时:`_ = os.Remove(tmpPath)` + 返回 error 包含 actionable hint `"decrypted database is unreadable; all_keys.json may be stale or invalid; rescan WeChat keys and clear wcdb cache after backup (src=...)"`,并以 src 路径定位(不含 key)。同时 c.cache 不被更新,后续同源查询重新走完整 decrypt 流程。
+  - cache 命中但产物不可读路径(US-001 实际命中场景):原代码 `_ = os.Remove(entry.outPath)` 之后 `c.cache[rel]` 仍残留在 map 中且指向已删文件,后续查询会 `os.Stat` 失败 → 走 decrypt 路径,行为正确但中间状态不一致;改为删除 outPath **同时** `delete(c.cache, rel)`,后续查询不依赖已删 entry。
+  - 新增 `internal/wechatdb/wcdbapi/client_test.go` 三个 focused test:
+    - `TestIsReadableSQLiteRejectsBadCache`: 锁定 `isReadableSQLite` 收到 header-对-sqlite_master-坏 的产物时返回 (false, error),error 必须含 "file is not a database"(锁底层 invariant)。
+    - `TestEnsureDecryptedRejectsUnreadableCacheAndClearsCacheEntry`: 端到端 cache 命中但产物不可读,断言 (a) 错误含 `all_keys.json` / `rescan WeChat keys`,(b) 错误**不**含 dummy key(隐私),(c) outPath 已删,(d) c.cache[rel] 已清空。
+    - `TestIsReadableSQLiteAcceptsValidSQLite`: 反向锁,合法 SQLite 必须 ok=true nil error,防止未来 regression 把可读误判不可读。
+- 更改的文件
+  - `internal/wechatdb/wcdbapi/client.go` (`ensureDecrypted` 增加最终 isReadableSQLite 闸门 + cache entry 删除)
+  - `internal/wechatdb/wcdbapi/client_test.go` (新文件,3 个 focused test)
+  - `scripts/ralph/prd.json` (US-002 passes: false → true, notes 清空, retryCount=0)
+  - `scripts/ralph/progress.txt` (本段)
+- 运行的验证命令与结果
+  - `go build ./internal/wechatdb/wcdbapi/` 单独 build → rc=0,无输出 ✅
+  - `go test -v -count=1 ./internal/wechatdb/wcdbapi/` → `PASS: TestIsReadableSQLiteRejectsBadCache / TestEnsureDecryptedRejectsUnreadableCacheAndClearsCacheEntry / TestIsReadableSQLiteAcceptsValidSQLite`,`ok ... 1.665s` ✅
+  - `go build ./...` 全仓 typecheck → rc=0,无输出 ✅
+  - `./init.sh` quick gate → "Verification Complete",root harness + skill harness + HTTP 端点列表全部通过 ✅
+- 未验证项与原因
+  - US-004 (运行态重扫 key + 清 cache + 重启服务) 仍 blocked,需用户 same-turn 授权;US-002 只确保"key 错时不会再写出坏 cache",实际恢复仍要 US-004。
+  - 真实 4.x wcdb 解密产物的端到端可读性测试没跑:测试用 `makeHeaderOnlySQLite` 合成 header-对-sqlite_master-坏 的 fixture 替代真实坏 cache;真实路径验证需 US-004 解除 blocked 后, US-001 那 17 个坏 cache 之一被新代码重新处理时观察 outPath 是否被留、cache map 是否被清。
+  - `./init.sh --full` / `./init.sh --runtime` 未跑:US-002 是小范围 backend hardening,quick gate + focused go test 已足够;runtime 验收(坏 cache 实际被拒)需 US-004 解除 blocked 后再补。
+- **未来迭代的学习:**
+  - 可复用 patterns
+    - **decrypt 产物的 final 闸门**: `os.Rename(tmpPath, outPath)` 之前 `isReadableSQLite(tmpPath)` 是任何解密/cache 链路的硬护栏。原代码在 `walMTime > 0` 分支已经有这道闸门(WAL 应用后),但**只有 walMTime=0 的普通 DB 完全跳过**这道检查 → 17/17 坏 cache 全部走完 decrypt+rename 路径。统一到 rename 之前的最终闸门是无 wal/有 wal 路径共用的"最后机会",应该与 file header 校验、size 校验同列。
+    - **错误信息含 actionable hint + 绝不打印 key**: 错误模板是 `fmt.Errorf("%s; %s; %s (src=%s)", reason, hint1, hint2, src)`,`reason` 可以包 sqlite 错误(不含 key 字节),`src` 是绝对文件路径(不含 key),绝不把 useKey 或 relPath 拼到 message 里。
+    - **cache map 一致性**: 旧代码 `_ = os.Remove(entry.outPath)` 之后 `c.cache[rel]` 残留在 map 中,虽然不引发正确性 bug(`os.Stat` 失败后 `entry.srcMTime==...` 判断不会命中,会走 decrypt 路径),但 map 状态与磁盘状态偏离。**修复模式**: 删除文件时同步 `delete(c.cache, rel)`,保持 cache map 永远反映"磁盘上实际存在且 readable 的 entry"。
+  - 遇到的陷阱
+    - macOS bash 3.2 + heredoc 内 `()` brace expansion 仍触发 `syntax error near unexpected token '('` —— 改用子 shell + 临时文件捕获,这是 US-003 旧坑的复现,本轮没踩到是因为没用 heredoc 跑 python。
+    - 写新 test 包 `package wcdbapi` 而不是 `_test` 外部包,可以引用 unexported helper(`isReadableSQLite` / `c.cache` / `c.mu`),不需要再造一个对外 façade。这是 chatlog 现有测试惯例(`dailyreport`、`temporalgraph` 都是同包 internal test)。
+    - 测试 fixture 不能用真实 4.x wcdb 解密产物(需 dylib/cgo + 真 key),改用 "SQLite format 3\0 + garbage" 合成字节,触发 sqlite 打开阶段真实失败("file is not a database"),而不是用空文件(空文件会 short-circuit 成 `io.EOF` 不是 "file is not a database",断言会假红)。
+  - 有用的上下文
+    - 真正能让 US-001 那 17 个坏 cache 重新变可读的不是 US-002,而是 US-004 重扫 all_keys.json + 清 cache;US-002 之后任何 cache 写入都会被这个新闸门拦下,即便 key 是错的,新 cache 也不会被写入磁盘,系统行为可被外部观察("cache count 不再增长"是 US-004 解除 blocked 后的硬指标)。
+    - `progress_pct=100` 的真值链(US-006)与本 story 平行:本 story 解决 "DB 可读性" 真值,US-006 解决 "graph 健康" 真值,两者合起来覆盖 db-runtime-graph-truth-harness PRD 的核心真值三分法。
+
+## 2026-06-16 17:45 - US-003
+- 实现了什么
+  - **后端**: 新增独立 `internal/wechatdb/datasource/dbentry/dbentry.go` 包,定义 `DBEntry{Path,Group,Queryable,Reason}` 结构(避免 wcdb↔datasource 循环 import);`DataSource` interface 新增 `GetDBsWithStatus() (map[string][]DBEntry, error)`,老 `GetDBs()` 保留(三个旧调用方不破:wechatdb.go、service.go、wcdb SearchAll);wcdb `classifyDB()` 用 `os.Stat` 优先 + `ds.client.IsReadableSQLite`(新增 public wrapper,封装已有的 unexported `isReadableSQLite`)+ `CanQueryDB` 三层检查,不可读时填 `file_not_found` / `stat_error` / `core_db_unreadable` 三种 token,token 字符串绝不嵌入 key/wxid/path。HTTP `handleGetDBs` 改写为返回 `{dbs: map[group][]path(兼容旧), unavailable: [{group,file,reason}], core_dbs_unavailable: bool, unavailable_reason: string}`,核心组定义 `coreDBGroups={session,contact,message}`,任一核心库不可读时 `core_dbs_unavailable=true`。reason 字段是固定枚举字符串,不含 key。
+  - **前端**: `internal/chatlog/http/static/index.htm` `loadDBList()` 解析新 shape(优先 `data.dbs` + `data.unavailable` + `data.core_dbs_unavailable`,回退旧 map 形式),不再并发 probe `/api/v1/db/tables`(这正是 US-001 path bug 的旧路径)。`core_dbs_unavailable=true` 时插入明确 `.alert-danger` 条幅,文案"数据库当前不可用 / <reason 中文> / 请重扫 key 或检查 wcdb cache",替换原"加载失败: ${e.message}"。每个 DB 行 badge 仍按"是否在 unavailable 列表"区分可查询/不可查询,不可查询 badge `title` 带 reason 便于悬停诊断。
+  - **测试**: 新增 `internal/wechatdb/datasource/wcdb/datasource_test.go` 两个 focused test:`TestClassifyDBMissingFile` 锁 file_not_found reason + 不含 path + token 长度 < 32(防 key 泄漏);`TestClassifyDBStatError` 锁非 IsNotExist stat 错误时 reason=stat_error。两者都用 nil-client 避开 cgo 依赖,跑 0.86s。
+- 更改的文件
+  - `internal/wechatdb/datasource/dbentry/dbentry.go` (新增,DBEntry 类型)
+  - `internal/wechatdb/datasource/datasource.go` (interface 加 GetDBsWithStatus,re-export DBEntry)
+  - `internal/wechatdb/datasource/wcdb/datasource.go` (新增 classifyDB + GetDBsWithStatus,GetDBs 改写为薄包装,导入 dbentry,加 os 包)
+  - `internal/wechatdb/datasource/wcdb/datasource_test.go` (新增 2 focused test)
+  - `internal/wechatdb/wcdbapi/client.go` (新增 public Client.IsReadableSQLite 包装)
+  - `internal/wechatdb/wechatdb.go` (DB 加 GetDBsWithStatus 透传)
+  - `internal/chatlog/database/service.go` (Service 加 GetDBsWithStatus 透传 + 导入 datasource)
+  - `internal/chatlog/http/route.go` (handleGetDBs 改写为新 shape + coreDBGroups 常量)
+  - `internal/chatlog/http/static/index.htm` (loadDBList 解析新 shape + 显式错误条幅)
+  - `scripts/ralph/prd.json` (US-003 passes: false → true, notes 清空, retryCount=0)
+  - `scripts/ralph/progress.txt` (本段)
+- 运行的验证命令与结果
+  - `go build ./...` → exit 0,无输出 ✅
+  - `go test -v -count=1 ./internal/wechatdb/datasource/wcdb/` → `PASS: TestClassifyDBMissingFile / TestClassifyDBStatError`,ok 0.866s ✅
+  - `go test -count=1 ./internal/wechatdb/...` → 全部 ok(wcdb + wcdbapi 包含 US-002 的 3 个测试) ✅
+  - `node -e 'new Function(loadDBListString)'` → 解析 OK,length=5291 ✅(前端新 JS 无语法错误)
+  - `curl -sS http://127.0.0.1:5030/api/v1/db`(旧 binary,backward compat 验证)→ 返回 `map[group][]file` 12 groups,旧客户端仍能解析 ✅
+  - `./init.sh` → "Verification Complete",quick gate 通过 ✅
+  - `make build` → 新 binary `bin/chatlog` (34.7MB) 包含 US-003 代码 ✅
+- 未验证项与原因
+  - **新 binary 浏览器面板未跑**: `chatlog serve` 子命令无 `--addr` flag,新 binary 与旧 5030 binary 不能并存,启新 binary 必须先 kill 旧服务 — Codebase Pattern 35 明确"重启属系统状态变更,先向用户确认"。已做静态 JS 解析验证 + 新 binary build 验证 + 旧 binary backward compat 验证,真实 agent-browser 验证留待用户启新 binary 后跑(本轮不主动重启 5030)。
+  - **真实 wcdb cache 路径下 unavailable 列表填充**: 当前 5030 跑的是旧 binary,unavailable 列表需新 binary + 真实 4.x wcdb cache 才会暴露;新 binary 启服务后,unavailable 应含 session/contact/message_0 三条 entry,reason=`core_db_unreadable`(与 US-001 证据一致)。这是 US-004 解除 blocked 后的运行时真值。
+  - 未跑 `./init.sh --full` / `--runtime`:本轮仅 backend hardening + 前端 + 测试,quick gate + focused go test 已足够覆盖改动面;runtime 验收(浏览器面板 banner 可见)需用户授权启新 binary,见上。
+- **未来迭代的学习:**
+  - 可复用 patterns
+    - **跨包共享类型 + 防循环 import**: 当 parent package interface 需要引用 child package 类型,而 child 又被 parent 引用时,最干净方案是把共享类型提到独立小子包(`dbentry`)。parent 用 `type X = pkg.X` 做 re-export,既保留旧 import path 又彻底解耦。US-002 已有 `wcdbapi.Client.IsReadableSQLite` 暴露 unexported helper 的先例 — 当 unexported 工具需被 sibling package 调用,public wrapper 优于跨包访问。
+    - **HTTP 响应加新字段保 backward compat**: 老 shape 是裸 `map[group][]path`,新 shape 加 `dbs` 嵌套一层 + `unavailable`/`core_dbs_unavailable`/`unavailable_reason` 三个新键;前端用"新 shape 优先 + 旧 map fallback"双解析,旧 client 不破,新 client 拿到新字段。`dbs` 嵌套一层而不是把新键直接放顶层,语义上把"DB 路径"和"诊断元数据"分组,review 时一眼能看出"这俩是不同概念"。
+    - **reason token 封闭枚举 + 防泄漏测试**: reason 是 3 个固定短字符串(`file_not_found` / `stat_error` / `core_db_unreadable`),每个 token 长度都 < 16 chars,无 path/wxid/hex 片段;focused test `TestClassifyDBMissingFile` 显式断言 `len(reason) <= 32` + `!strings.Contains(reason, absPath)`,把"reason 不含 key"做成可执行 invariant 而不是文档承诺。
+    - **不再并发 probe 子端点**: 旧前端对每个 DB 都并发 fetch `/api/v1/db/tables?group=...&file=...` 探活,18 个 DB × 1 HTTP = 18 个额外请求,而且这正是 US-001 path bug 的入口。新前端直接从 `/api/v1/db` 的 unavailable 字段读 reason,零额外子请求,顺便把 path bug 的影响面收窄到只剩点开 viewer 那一刻。
+  - 遇到的陷阱
+    - `datasource.DataSource` interface 加方法后,所有实现都得满足。`wcdb.DataSource` 是该 interface 的实现,但 Go 编译期才发现少了 `GetDBsWithStatus` — 这正是 interface 加方法的好处(强制全实现更新),代价是改动跨两个文件但编译期一次过。
+    - `classifyDB` 早期想直接调 wcdb 包内 unexported `isReadableSQLite`,但它是 wcdbapi 包函数,wcdb 包不可见。**结论: 跨包调用 unexported helper 一律 public wrapper 化**(US-002 经验复现),且 wrapper 一行就够(`func (c *Client) IsReadableSQLite(p string) bool { ok, _ := isReadableSQLite(p); return ok }`)。
+  - 有用的上下文
+    - 真实 5030 旧 binary 仍跑,US-004 重启服务时新 binary 上线,unavailable 列表会暴露 session/contact/message_0 三条 `core_db_unreadable`,前端 banner "数据库当前不可用" 自动出现。US-004 解除 blocked 后,这条 banner 是否消失 / 转为可查询,就是端到端"DB 链路恢复"的最直白信号。
+    - 新 binary 上线后,前端再无并发 probe `/api/v1/db/tables` 调用 → US-001 path bug 不再被前端触发,但 handler 本身的 path bug 仍在(等 group+file 短名会 500)。这是 US-004+US-010 端到端验收的一部分。
+    - reason token 词汇表是设计选择(不在 AC 字面),但落进了 `classifyDB` 内部字符串;未来要新增 reason(比如 `permission_denied` / `key_stale`),加 token + 加 test + 加前端 reasonMap 三处,缺一不可。
+
+## 2026-06-16 18:55 - US-006
+- 实现了什么
+  - Temporal graph 健康状态真值链验证,只读诊断,无代码改动:把 `/api/v1/graph/status` HTTP 响应 vs `graph_source_records` readonly SQLite 真值 + 自写 Go-side `ClassifyFailedError` 镜像三路对齐,验证 `failed_buckets` 字段在 HTTP 端与 SQLite 真值完全一致,`file is not a database` / `db_not_database` bucket 严格为 0,`last_error=null`,`progress_pct=100` 的真实含义(只代表 pending=0)写进 progress.md。
+  - HTTP 真值:`enabled=true paused=false running=false workers=3 effective_workers=1 adaptive_level=stable`,`source_count=22118 entity=26895 relation=28141 event=18247 fact=27154 pending=0 processing=0 processed=21587 failed=531 progress_pct=100 last_updated_at=2026-06-14T09:01:35+08:00`,`last_error=null`,failed_buckets 5 类非空: `config_error=249 auth_error=141 network_timeout=97 json_decode_error=10 sensitive_output_1027=27 unclassified=7`。
+  - SQLite 真值: `SELECT error FROM graph_source_records WHERE status='failed'` 拉到 531 行,Go 镜像 `ClassifyFailedError`(同 `failedBucketTokens` + 同 `orderedFailedBuckets` 顺序)重新分类,**结果与 HTTP 完全一致**:`config_error=249 network_timeout=97 before_request_timeout=0 rate_limited=0 auth_error=141 json_decode_error=10 empty_graph=0 sensitive_input_1026=0 sensitive_output_1027=27 non_retryable_request=0 unclassified=7`。
+  - `file is not a database` / `db_not_database` 真值:SQLite `LOWER(error) LIKE '%file is not a database%' OR '%db_not_database%' OR '%not a database%'` 在 531 行 failed rows 命中 **0** 行 → 桶严格为 0,符合"图谱真值不应受 US-001~US-003 暴露的 DB 解密链路污染"的设计目标。
+  - `progress_pct=100` 边界写进 progress.md 顶部: 只代表 `pending=0`,不代表 `failed=0`(当前 531)也不代表图谱完全健康;`config_error=249` 占 failed 47% 且属 recoverableGraphBuckets(4 个回收桶: config_error / network_timeout / before_request_timeout / rate_limited)共 346 条 = 65%,requeue 一次可清理大部分,但本 story 是只读诊断不触发 requeue。
+- 更改的文件
+  - `scripts/ralph/prd.json` (US-006 passes: false → true, notes 清空, retryCount=0)
+  - `progress.md` (顶部追加 US-006 truth-chain 段 + progress_pct=100 caveat)
+  - `scripts/ralph/progress.txt` (本段)
+- 运行的验证命令与结果
+  - `curl -sS --max-time 12 'http://127.0.0.1:5030/api/v1/graph/status?format=json'` → 200,failed_buckets 与 last_error=null 全部可读 ✅
+  - `sqlite3 -readonly ... "SELECT status, COUNT(*) FROM graph_source_records GROUP BY status"` → `done|21587 failed|531` ✅
+  - `go run /tmp/us006_check/main.go <graph.db>` → 14 行输出,total_failed=531,10 个桶 + unclassified + file_is_not_a_database_bucket=0,数值与 HTTP 100% 一致 ✅
+  - `go build ./...` → rc=0 无输出 ✅
+- 未验证项与原因
+  - US-007 (digest 不扰队列):留作下一轮独立 story。
+  - US-008 (skill 写回 truth chain 文档):留作下一轮独立 story。
+  - US-009 (state 记录):留作下一轮独立 story。
+  - US-004 / US-005 / US-010 仍 blocked:本 story 是 graph 只读诊断,未触动任何 cache/key/service 文件,未触发 requeue/rebuild/resume/pause/config 任何写操作。
+  - 未跑 `./init.sh` / `go test ./internal/chatlog/temporalgraph`:本 story 不改任何 Go 代码,无 typecheck/test 必要,且 AC#7 只要求 `go build ./...` 通过已确认。
+- **未来迭代的学习:**
+  - 可复用 patterns
+    - **Graph 健康真值 = HTTP status + SQLite failed bucket + SQLite file_is_not_a_database 桶三层**。HTTP 字段由 `manager.store.FailedBucketCounts()` 计算,内部走 `ClassifyFailedError`;SQLite 真值是 ground truth,任何 future refactor 改 token 顺序或新增 bucket,只要 HTTP/SQLite 数字开始不一致,就是 silent regression。"再写一个 Go 镜像 classify 跑一次" 是 0-cost 验证手段,10 行 main.go + `_query_only=1` readonly flag 即可。
+    - **`progress_pct=100` 反向标注**: 任何完成态字段(`progress_pct` / `processed == source_count` / `pending == 0` / `last_error == null`)都只代表"没在 pending",不代表"全部成功"。graph 状态机的真值在 `failed_buckets` 桶分布,human-readable summary 必须显式写 `failed=N != 0` 这类 caveat,review 时看到"100%"瞬间警觉。
+    - **可恢复桶 = 4 类,占总 failed 65%**: `config_error=249` (47%) + `network_timeout=97` (18%) + `before_request_timeout=0` + `rate_limited=0` = 346 条,requeue 一次可清理 65% 的 failed queue;non-recoverable 桶(`auth_error=141` `sensitive_output_1027=27` `json_decode_error=10` `unclassified=7`)共 185 条 = 35%,requeue 不会被这些桶动。HA-004 bucket 分类器的设计在此被真实验证: subset requeue 不会把敏感/解析/超时/auth 内容安全问题搅浑。
+    - **HTTP 字段与 SQLite 真值的等价证据模式**: AC#4 "确认 file is not a database bucket 为 0" 在 HTTP 端是无字段(HTTP 没有 `file_is_not_a_database` 这个 bucket key),必须用 SQLite LOWER LIKE 派生证据;HTTP 端只暴露 10 个 HA 桶 + unclassified。这是"binary 字段缺失时用 SQLite ground truth 派生"的具体落地,US-010 端到端验收可以复用同样模式。
+  - 遇到的陷阱
+    - 第一次写 SQLite 分类器时漏了"ordered buckets 的优先级": "minimax chat failed before request: context deadline exceeded" 同时含 "before request" 和 "context deadline exceeded",但 orderedBuckets 里 `network_timeout` 在 `before_request_timeout` 前面 → 命中 `network_timeout` 而不是 `before_request_timeout`。HTTP 端 `before_request_timeout=0` 也证实了这点。**结论: 镜像 ClassifyFailedError 必须严格按 orderedBuckets 顺序,不能直接 `UNION ALL` 多个 LOWER LIKE**,那样会算重且排序失效。
+    - 同样, "model http 422 ... output new_sensitive (1027)" 同时含 "http 422"(non_retryable_request)和 "output new_sensitive"(sensitive_output_1027),按 orderedBuckets 顺序 `sensitive_output_1027` 排在前面 → 27 条敏感 422 全部进 `sensitive_output_1027`,`non_retryable_request` 是 0。这种"subset 排序避免内容安全桶被 generic 422 桶吃掉"的设计在真值链里被验证。
+    - Go 镜像写到 `/tmp/us006_check/main.go` 而非入仓,本 story 是只读诊断不入仓,符合"diagnostic helper 不污染源码树"的边界;若以后真要把 classifier 也开放成 CLI tool(用于 offline / non-HTTP 环境查 SQLite failed buckets),可考虑入 `cmd/chatlog/` 加 `cmd_graph_buckets.go`,但本 PRD 不要求。
+  - 有用的上下文
+    - US-001 + US-002 + US-003 修的是 DB 链路真值;US-006 修的是 graph 健康真值;US-007 会用 graph digest 进一步加固"non-summary path 不扰队列";US-008 把这些真值链写回 skill。三者合起来 = db-runtime-graph-truth-harness PRD 的核心真值三分法落进文档 + 项目状态。
+    - 当前 `last_error=null` 表示 manager 自身没 panic 但不代表图谱健康;`last_updated_at=2026-06-14 09:01:35` 比 US-001 抓取的 mtime(2026-06-14 09:01)完全吻合,说明 service config 还在跑(graph manager 仍在处理 batch,只是 pending=0 没有任何新源排队)。
+    - 真正的 graph queue drain 验证不在 US-006 scope,留 US-010 端到端跑 (queue 不变 + file is not a database bucket = 0 + progress_pct=100 but failed=531 caveat 全链路)。
+
+## 2026-06-16 18:08 - US-007
+- 实现了什么
+  - Graph digest non-summary path 端到端验证,无破坏性操作,只改了一行 help 文本让 `--summary` flag 描述字面显式标 "(consumes quota, default false)" — AC#1 字面要求 help 显示默认 false,`cobra.BoolVar` 默认不在 `--help` 打印 default,只能通过 flag description annotation 满足。
+  - 验证逻辑保持原状: `cmd_report.go` 默认 `reportGraphSummary=false` → POST `/api/v1/graph/digest?days=7&format=json`(无 summary=true)→ HTTP handler `handleGraphDigest` 把 `EnableSummary` 透传给 `Digest()`,`Digest()` 在 `opts.EnableSummary=false` 分支下完全不调 `invoker.Chat`,只走 readonly SQL 聚合 (`graph_events` 扫描 + `graph_facts/relations/source_records` COUNT)。HTTP 响应明确暴露 `summary_used: false`,不返回 `summary_content` 字段。
+- 更改的文件
+  - `cmd/chatlog/cmd_report.go` (1 行: `--summary` flag description 末尾追加 ", default false")
+  - `scripts/ralph/prd.json` (US-007 passes: false → true, notes 清空, retryCount=0)
+  - `scripts/ralph/progress.txt` (顶部 ## Codebase Patterns 新增 2 条 digest non-summary pattern; 末尾追加本段)
+- 运行的验证命令与结果
+  - `go run . report graph --help` → flag description 从 `enable model summarization (consumes quota)` 升级到 `enable model summarization (consumes quota, default false)`,字面满足 AC#1 ✅
+  - Baseline 抓取: `curl /api/v1/graph/status?format=json` → `failed=531, pending=0, processing=0, source_count=22118, last_error=null, failed_buckets={auth_error=141, before_request_timeout=0, config_error=249, empty_graph=0, json_decode_error=10, network_timeout=97, non_retryable_request=0, rate_limited=0, sensitive_input_1026=0, sensitive_output_1027=27, unclassified=7}` ✅
+  - SQLite baseline: `sqlite3 -readonly ... "SELECT status, COUNT(*) FROM graph_source_records GROUP BY status"` → `done|21587 failed|531` ✅
+  - `go run . report graph --days 7` → rc=0, stdout 含 `path=/Volumes/WorkSSD/Dev/chatlog_alpha/reports/graph-digest-2026-06-09_2026-06-16.md`, `window_start=2026-06-09T18:08:42+08:00`, `window_end=2026-06-16T18:08:42+08:00`, `entity_count=20`, `event_count=50`, `fact_count=264`, `relation_count=297`, **`summary_used=false`** ✅
+  - `stat -f 'mtime=%Sm size=%z bytes path=%N' reports/graph-digest-2026-06-09_2026-06-16.md` → `mtime=Jun 16 18:08:42 2026 size=3709 bytes`,mtime 与 run 时间完全吻合 ✅
+  - `grep -c '^## ' reports/graph-digest-2026-06-09_2026-06-16.md` → `7`;`grep '^## '` 列出 7 个固定 H2:`一句话结论 / 核心主题 / 关键实体 / 事件时间线 / 新增事实与关系 / 可复用沉淀 / 后续跟进` ✅
+  - `git status --porcelain | grep -E 'graph-digest-.*\.md'` → 无输出,digest 文件未入库 ✅
+  - 运行后 HTTP 抓取: `failed=531, pending=0, processing=0, source_count=22118, last_error=null, failed_buckets` 与 baseline 100% 一致 ✅
+  - 运行后 SQLite: `done|21587 failed|531`,与 baseline 完全相同 ✅
+  - `go build ./...` → rc=0 无输出 ✅
+- 未验证项与原因
+  - US-004/005/010 仍 blocked,本 story 是 non-summary path 闭环,不需要重扫 key/清 cache/重启服务。
+  - `./init.sh --full` / `--runtime` 未跑: 本轮只改 1 行 help 文本,无 Go 逻辑改动,`go build ./...` + endpoint 端到端验证已覆盖。
+  - `summary=true` path 未跑(quota 边界,且 AC#2 默认 false 已锁): 任何后续需要跑 `summary=true` 的场景都需要用户 same-turn 授权,因为会触发 1 次 Chat provider 调用消耗 quota。
+- **未来迭代的学习:**
+  - 可复用 patterns
+    - **cobra BoolVar 默认值不在 --help 显式打印**: 当 AC 字面要求 "help 显示 default false" 时,只能在 flag description 里加 "default false" annotation,不需要把默认值放进 init 或新加 `_BoolVarP` 显式 default。`go run . report graph --help` 输出从 `--summary           enable model summarization (consumes quota)` 升级到 `--summary           enable model summarization (consumes quota, default false)`,一个字面是否满足 AC 的差别。本仓库同款 pattern 适用于任何 BoolVar "默认行为可见性"需求。
+    - **Digest non-summary path 的"零 model call"硬护栏**: `Digest()` 在 `opts.EnableSummary=false` 分支下完全不调 `invoker.Chat`,只走 readonly SQL 聚合(`graph_events` 扫描 + `graph_facts/relations/source_records` COUNT),`summary_used=false` 是 HTTP 响应明确暴露的字段。验证流程: baseline 抓 HTTP+SQLite failed → 跑 `go run . report graph --days 7` → after 抓 HTTP+SQLite failed → 三组数值完全一致 + `summary_used=false` + 7 H2 section + 文件 mtime 是当前 run → 队列未扰。`file_is_not_a_database_bucket=0` 在 US-006 已经收口,这里只需锁总数不变。
+    - **Idempotent overwrite 是 digest 的固有性质**: `handleGraphDigest` 用 `startStr_endStr` 作 filename,相同窗口再次 POST 会覆盖同一文件,mtime 更新但 size 不一定完全相同(因为渲染每次 event_time 都是 `time.Unix(event.Time, 0)` 同一时刻)。任何"重跑 digest 会让 digest 文件计数涨"都是误判,验证时用 `git status --porcelain | grep graph-digest-` 锁"无 digest 文件入 git",而不是 `ls | wc -l`。
+  - 遇到的陷阱
+    - macOS `mktemp` 不在 story 里使用,但 digest 验证时 `stat -f '%Sm'` 输出的月份是英文缩写(如 `Jun` 而非 `06`),与 Linux `stat -c '%y'` 格式不一致,跨平台分析日志时需要先 normalize。
+    - `go run . report graph --days 7` stdout 是 `path=` / `entity_count=` 等 key=value 行,**没有 `failed` / `pending` 字段**,因为 digest endpoint 设计上不返回队列状态。验证队列未扰必须靠"前后两次 status 抓取 + diff",不能从 digest 输出本身反推。
+  - 有用的上下文
+    - 当前 digest 命中窗口 `2026-06-09 ~ 2026-06-16` 跨 7 天,`entity_count=20` 顶到 MaxEntities 上限(20),`event_count=50` 顶到 MaxEvents 上限(50),`fact_count=264 / relation_count=297` 在窗口内有大量内容。这说明 digest limit 选择合理,既能避免扫太多数据,又能让用户看到有意义的窗口;若以后发现 event_count 总是 50 而 timeline 全是同一周的旧事件,可考虑把 MaxEventsScan 从 2000 提到 5000。
+    - `summary_used=false` 不仅是 CLI 输出,HTTPServer handler `handleGraphDigest` 在 `c.Query("format") == "json"` 路径也返回这个字段(`/api/v1/graph/digest?days=7&format=json`),任何监控/HA 脚本都可以用它做"digest 是否触发 quota 消耗"的真值判断。
+    - 下一轮 US-008(skill 写回 truth chain)会引用本 story 的"non-summary path 不扰队列"作为 digest 三层真值之一的证据。
+
+## 2026-06-16 18:32 - US-008
+- 实现了什么
+  - skills/chatlog-http-cli 三个新/改 reference 把 US-001~US-007 的真值三分法落进 agent 排障路径,后续 agent 看到 /health=ok / progress_pct=100 / last_error=null 不会再误判为完成态。
+  - `references/db-truth-chain.md`(新增):WeChat DB / Key / Cache 三分法(AppleDouble / Stale key / Bad cache)+ 5 步真值命令 + 修复路径(含"重扫 key/删 cache/重启服务 = 破坏性运行态操作,需用户 same-turn 授权"的硬护栏);`isReadableSQLite` 读 sqlite_master 是唯一真值;reason 字段封闭枚举(`file_not_found` / `stat_error` / `core_db_unreadable`),不含 wxid/key/path。
+  - `references/graph-truth-chain.md`(新增):Temporal graph 三层真值(1. HTTP /api/v1/graph/status 字段, 2. SQLite readonly failed bucket + `file is not a database` 桶严格=0, 3. Digest non-summary path 不扰队列);`progress_pct=100` 反向标注:只反映 pending=0,failed 维度被忽略,典型 65% recoverable + 35% non-retryable 仍堆积;adaptive workers 与 quota 边界(只有 non-summary path 不消耗 quota,summary=true 需要用户授权)。
+  - `references/feedback-audit.md`(更新):新增 "Known False Greens" 段,8 条假绿表(health ok / all_keys.json exists / wcdb_cache exists / progress_pct=100 / last_error=null / processing=N / /api/v1/db 18 paths / report graph 退出 0),每条配真值命令交叉引用,不再把"看起来绿"和"真值绿"混为一谈;末尾加 "关联 Reference" 段链向 db-truth-chain / graph-truth-chain。
+  - `SKILL.md` Verification Gate 段(改):在 `Minimum repo-level gates` 之前插入 "Precheck 边界" blockquote,明确 /health 和 /api/v1/ping 只是 availability precheck 不是 DB/graph 完成态真值;引用三个 reference 让任何"完成态"必须由 truth chain 闭环验证,不能由单一 health / 计数器 / progress_pct 字段判定。
+- 更改的文件
+  - `skills/chatlog-http-cli/references/db-truth-chain.md`(新增,~85 行,含 5 步验证命令 + 三分法 + 修复路径 + 隐私/quota 边界)
+  - `skills/chatlog-http-cli/references/graph-truth-chain.md`(新增,~95 行,含三层真值 + `progress_pct=100` 反向标注 + adaptive workers + 隐私/quota 边界)
+  - `skills/chatlog-http-cli/references/feedback-audit.md`(更新,加 Known False Greens 8 行表 + 关联 Reference 段)
+  - `skills/chatlog-http-cli/SKILL.md`(更新,Verification Gate 段加 Precheck 边界 blockquote)
+  - `scripts/ralph/prd.json`(US-008 passes: false → true, notes 清空, retryCount=0)
+  - `scripts/ralph/progress.txt`(顶部 ## Codebase Patterns 新增 2 条 pattern;末尾追加本段)
+- 运行的验证命令与结果
+  - `node skills/chatlog-http-cli/scripts/check-harness-skill.mjs` → **29/29 PASS** ✅(与 baseline 29/29 完全一致,新增/改的 reference 没破坏现有 checkContains 项,AC#5 字面要求 "通过" 已满足)
+  - `node scripts/check-root-harness.mjs` → **80/80 PASS** ✅(skill 改动未影响 root harness)
+  - `./init.sh` quick gate → "Verification Complete",root harness 80/80 + skill harness 29/29 + HTTP endpoint list 全过 ✅
+  - `grep -rn -E 'wxid_[a-z0-9]{8,}|sk-[a-zA-Z0-9]{16,}' skills/chatlog-http-cli/` → 0 命中,无 wxid/真实 API key 泄漏 ✅
+  - `grep -rn -E '[a-f0-9]{32,}' skills/chatlog-http-cli/references/db-truth-chain.md skills/chatlog-http-cli/references/graph-truth-chain.md skills/chatlog-http-cli/SKILL.md` → 0 命中,无 32+ 字符 hex data key 泄漏 ✅
+  - `diff /tmp/prd.json.us008.bak scripts/ralph/prd.json` → 仅 US-008 字段变化(`passes: false → true`),无其他 drift ✅
+  - `jq '.userStories[] | select(.id=="US-008") | {id, passes, notes, blocked, retryCount}' scripts/ralph/prd.json` → `{passes: true, notes: "", blocked: false, retryCount: 0}` 三步收口,符合 "修复类 story 必须 `passes=true` + `notes=""` + `retryCount=0`" pattern(Codebase Pattern 27)✅
+- 未验证项与原因
+  - US-009 (Root state 记录 + 完成态) 留作下一轮独立 story,本轮不主动更新 root progress.md / session-handoff.md 的 "active feature 状态" 段(避免越界)。
+  - US-004 / US-005 / US-010 仍 blocked 待用户授权,本 story 不涉及破坏性运行态操作。
+  - check-harness-skill.mjs 的 `files` 数组没把 `db-truth-chain.md` / `graph-truth-chain.md` 列入(known limitation),AC#5 字面要求 "通过" 满足(29/29);若未来要 "强制 check 必须包含 truth chain 文件" 可在 mjs 数组加这两条 + 加 checkContains(如 `db-truth-chain.md` 文本含 `isReadableSQLite`),本轮不强行改动 mjs 避免破坏现有 29 baseline 的最小变更原则。
+  - `./init.sh --full` 未跑:US-008 是文档/story hardening,无 Go 代码改动,quick gate + skill harness check + root harness check 已覆盖改动面。
+- **未来迭代的学习:**
+  - 可复用 patterns
+    - **Truth chain reference 落 agent 排障路径的最小变更面**: 现有 check-harness-skill.mjs 的 `files` 数组列 6 个文件(SKILL.md + 4 references + 1 script),AC#5 字面要求"通过" 只需 29/29 不变,新增 reference 不必塞进 mjs 数组;只在"强制 check 必须包含 truth chain"才需要扩展 mjs。**任何"新加 reference 不破坏 baseline"的标准操作**: 1) 在 reference 内交叉引用 SKILL.md / feedback-audit.md 已有 token(`/health` / `progress_pct=100` / `last_error=null` 等),2) 不删任何已有 reference 的现有 content,3) 跑 check-harness-skill.mjs 确认 29 baseline 不变。这是"加内容不破坏 harness check"的最小改动模板。
+    - **三层真值的代码-文档双锁 pattern**: graph-truth-chain.md 的三层真值(HTTP / SQLite / Digest)与代码路径一一对应 —— `manager.store.FailedBucketCounts()` → HTTP `failed_buckets`;`sqlite_master` 读 `error` 文本 → SQLite ground truth;`Digest()` non-summary path → `summary_used=false`。任何"完成态"由代码层 + 文档层共同锁,review 时一眼能看出"这一行是 code 哪一段"。US-007 已 lock Digest non-summary path 0 model call,US-008 把这条 lock 写进 reference,US-010 端到端可复用同样模式。
+    - **Precheck 边界 blockquote 的"否定式定义"模式**: SKILL.md Verification Gate 段原本是正向列举命令(go test / make build / go run . report daily --help),AC#1 要求"明确说明 /health 和 /ping 只是 precheck" 是反向限定。在 `Minimum repo-level gates` 之前插入 "Precheck 边界" blockquote,把"`/health` = `{"status":"ok"}` ≠ DB 可查询 ≠ graph 完成态" 字面写明,比"加一个 HTTP gate 项" 更有信息密度,且不增加 checkContains 项。这是"用否定式定义边界" 替代"加正向 gate" 的最小变更方法。
+    - **macOS `mv` immutable flag 警告的"内容已写入"判定**: `jq > tmp && mv tmp scripts/ralph/prd.json` 在 macOS 上会报 `mv: scripts/ralph/prd.json: set owner/group (was: 501/0): Operation not permitted`,但写入内容已经成功。验证方式: `jq '.userStories[] | select(.id=="US-008")' scripts/ralph/prd.json` 直接读出 `passes=true`,**不要被 mv 警告吓到**。Codebase Pattern 26 已有记录;本轮复现再次确认。
+  - 遇到的陷阱
+    - Read 显示 `---` frontmatter 时行号会偏移,Edit 用 `## Verification Gate` 段做 old_string 时第一次失败,原因可能是 sed -n '57,62p' | cat -et 看到 "未验证" 在 cat 输出里变成乱码但实际是 UTF-8 字节。**结论**: Edit 失败时直接重试一次(本轮第二次尝试就成功),不必深究字节级差异,这是 cat 终端 UTF-8 显示问题不是文件内容问题。
+    - check-harness-skill.mjs 第 31 行 `allText = [...contents.values()].join('\n\n').toLowerCase()` 只扫 `files` 数组内的 6 个文件,新增的 `db-truth-chain.md` / `graph-truth-chain.md` 不在数组内;但 29 baseline 不变是字面 PASS 的硬要求,所以本轮不强行扩展 mjs,留给未来 "强制 include truth chain" 的迭代。本轮不引入新 checkContains 项是"加内容不破坏 baseline" 的核心。
+  - 有用的上下文
+    - US-008 的"truth chain 落文档" 与 US-009 的"root state 收口" 是 db-runtime-graph-truth-harness PRD 的最后两个非-blocked story:US-008 把 truth chain 写进 skill,US-009 把 PRD 状态写进 root state files(feature_list.json / progress.md / session-handoff.md)。两者顺序:US-008 先做(本轮),US-009 下一轮。US-009 必须把 US-008 写入的 reference 路径在 root state 中显式记录,以便下一会话能 "3 分钟恢复" 时直接跳到这两个 reference。
+    - 5030 旧 binary 仍跑;新 binary 含 US-003 代码但未重启(Codebase Pattern 35 适用)。US-008 完全是文档/story hardening,不动 binary,不需要重启服务。
+    - US-004 (重扫 key + 清 cache + 重启) 仍 blocked,本 PRD 7 个可自主 story 已完成 6 个 (US-001/002/003/006/007/008),US-009 是最后一个,US-010 是端到端验收,依赖 US-004。Ralph 自主循环在 US-009 通过后会等待用户授权 US-004,或由用户手动接管。
+---
+
+## 2026-06-16 18:55 - US-009
+- 实现了什么
+  - Root state 与完成态记录收口,只动 3 个 state file (feature_list.json + progress.md + session-handoff.md) + 1 个 prd 状态字段,无任何 Go 代码改动,无任何 git 写操作。
+  - `feature_list.json` 中 active feature `db-runtime-graph-truth-harness-2026-06-12` 的 `evidence` 数组从 `[]` 升级为 7 条命令级 evidence (US-001~US-003 + US-006~US-009,每条含 `command` + `result` 字段),`status` 从 `planned` → `in_progress`(因 3 blocked story 还要等用户授权),`next_step` 精确描述 7/10 done + 3 blocked + Ralph 等待状态。
+  - `progress.md` 顶部新增 "US-009 Root state 与完成态记录" 段,严格按 AC#2 字面要求 6 子段齐全: Current State / What changed / Verification Evidence / Not Verified / Blockers-Risks / Next;US-004/005/010 blocked 原因在 Not Verified 与 Blockers-Risks 两段同时明示。
+  - `session-handoff.md` "Current Objective" 段从 "3/10 完成 + 4 pending 自主剩余" 刷新为 "7/10 完成 + 3 blocked + 0 自主剩余",补 US-009 完成的代码改动列表 + 5 条 next-session read-only 诊断命令(含 `pwd -P` 物理路径断言、`/health` 是 precheck 不是完成态、`progress_pct=100` caveat 真值在 failed_buckets)。
+  - `scripts/ralph/prd.json` US-009 `passes: false → true`, `notes=""`, `retryCount=0` 三步收口(Codebase Pattern 15/27 修复类 story 必须)。
+- 更改的文件
+  - `feature_list.json` (evidence 数组填入 7 条 + status → in_progress + next_step 替换)
+  - `progress.md` (顶部 US-009 段,6 子段齐全)
+  - `session-handoff.md` (Current Objective 段刷新 + next-session 5 诊断命令)
+  - `scripts/ralph/prd.json` (US-009 passes/notes/retryCount 三步收口)
+  - `scripts/ralph/progress.txt` (本段)
+- 运行的验证命令与结果
+  - `jq empty feature_list.json` → PASS, JSON 合法 ✅
+  - `jq '.userStories[] | select(.id=="US-009") | {id, passes, notes, blocked, retryCount}' scripts/ralph/prd.json` → `{passes: true, notes: "", blocked: false, retryCount: 0}` 三步收口 ✅
+  - `jq '.userStories | length' scripts/ralph/prd.json` → 10 (US-001..US-010 完整无丢失) ✅
+  - `jq '.features[] | select(.id=="db-runtime-graph-truth-harness-2026-06-12") | {status, evidence_count: (.evidence|length)}' feature_list.json` → `status=in_progress evidence_count=7` ✅
+  - `node scripts/check-root-harness.mjs` → **80/80 PASS** (与 US-008 提交时 baseline 完全一致,US-009 未引入新 harness 项破坏 baseline) ✅
+  - `grep -c -E '^## (US-009|Current State|What changed|Verification Evidence|Not Verified|Blockers-Risks|Next)' progress.md` → 5 段(US-009 + Current State/What changed/Verification Evidence/Not Verified/Blockers-Risks/Next 在同一段内做 bold 列表,而非各自 ## 段;符合 Codebase Pattern "progress.md 6 子段齐全" 的字面 AC 解读)
+  - `grep -E 'US-004.*blocked|US-005.*blocked|US-010.*blocked' progress.md` → 4 行命中,明确标 blocked=true ✅
+  - `grep -rE 'wxid_[a-z0-9]{8,}|sk-[a-zA-Z0-9]{16,}|[a-f0-9]{32,}' feature_list.json progress.md session-handoff.md` → 0 命中,evidence 不含真实聊天 ID/真实 API key/真实 data key ✅
+  - `git status --porcelain | grep -E '^(M|\\?\\?).*(reports|\\.cache|logs|outputs|\\.env)'` → `?? reports`(symlink,预存在 dirty,US-007 已记录)+ `?? reports.backup-20260606_124656/`(预存在 dirty),无新增 ✅
+  - `git log --oneline -1` → `d9ff56b7 feat: US-008 - skills/chatlog-http-cli runtime truth 方法论写回` ✅ HEAD 未动,US-009 不执行 git commit
+- 未验证项与原因
+  - **未跑 git commit / push / merge**: AC#6 字面要求 "本 story 不执行 git commit/push/reset/rebase/merge",Ralph 自动 commit 留给 `scripts/ralph/ralph.py` 在 Validator 成功后执行;若要入仓由用户手动或 ralph.py 自动接管。
+  - **未跑 `./init.sh --full` / `./init.sh --runtime`**: US-009 是 state files 收口,无 Go 代码改动,quick gate (root harness 80/80) 已足够覆盖;full/runtime 与本 story 范围无关。
+  - **US-004/005/010 验证未跑**: 仍 `blocked=true` 待用户 same-turn 授权;evidence / progress.md / session-handoff.md / prd.json 中均明确标 blocked 并写明原因(破坏性运行态操作 + 依赖 US-004)。`feature_list.json.status` 因此是 `in_progress` 而非 `done`。
+  - **`?? reports` symlink 未入 .gitignore**: 仓库惯例保留,US-007 已记录"`?? reports` 是 symlink 行不是产物污染";US-009 不改变此边界。
+- **未来迭代的学习:**
+  - 可复用 patterns
+    - **Active feature 的 `evidence` 数组 = 命令级真值证据,且与 prd.json 的 story.passes 一一对应**: 每个 passed story 一条 evidence(`command` + `result`),evidence 文本只描述 path/mtime/size/count/status/bucket,**绝不嵌 wxid/key/path**;这种"双向索引"(story passes=true ↔ evidence[i] 描述该 story)让下一会话 grep 一个 story id 就能定位到所有 evidence 命令。
+    - **`status` 字段语义分级**: `planned`(未开始)/ `in_progress`(有 story 通过但仍有 blocked)/ `done`(所有 story 全部 passes=true 且无 blocked)。本 PRD 在 US-009 通过后 status 落在 `in_progress`,因为 3 个 story blocked;`done` 的判定门槛是"全部 story passes=true 且 0 blocked",这条规则让 feature 状态机可被 grep 推断(`done` ↔ 无 blocked)。
+    - **session-handoff.md 的 `Current Objective` 段做 "story 通过计数 + blocked 计数 + 0 自主剩余" 三元组**: 这是会话重启信号,任何 agent 读到这一行就知道 (a) 当前 PRD 已完成多少,(b) 还有多少等用户授权,(c) 还有多少 Ralph 可自主执行;不需要读完整 prd.json 也能快速 resume。
+    - **`next_step` 优先写"解锁条件"而非"建议动作"**: 写 "US-004/005/010 remain blocked=true pending user same-turn authorization for destructive runtime recovery (force WeChat key rescan + bad wcdb_cache cleanup + service restart)" 比写 "continue with US-004" 更利于下一会话立刻看出下一步需要用户介入而非自动执行。
+  - 遇到的陷阱
+    - **`progress.md` 6 段(AC#2)用同一 `## US-009` 段下的 bold 列表 vs 各起 `##` 段**: 第一次想写成 6 个独立 `## Current State`/`## What changed` 等,但 README/已有 progress.md 习惯是把它们合并在 `## <story title>` 段下的 `**Current State**:` / `**What changed**:` 列表项里。Codebase Pattern 看 root progress.md 历史(2026-06-12 / 2026-06-07 / 2026-06-08)全部用 bold 列表形式,保持与既有惯例一致是 review 友好的最小改动。
+    - **feature_list.json 的 `evidence` 数组 vs `status` 字段的同步**: 改 evidence 必须同时改 status;反向同理。本次先改 evidence(7 条)后改 status(planned → in_progress),review 时一眼能看出"改 evidence 时同时收紧 status",不存在 evidence 已填但 status 还是 planned 的不一致窗口。
+    - **`grep -c -E '^## (US-009|...)' progress.md` 给出 5 而非 6**: 因为 AC#2 的 6 段全在 `## US-009 Root state 与完成态记录` 同一 `##` 段下用 bold 列表呈现;这是惯例取舍而非验收失败,grep count 不必凑成 6。AC 字面要求"记录 6 段",记录了就行,不必每段单独 `##`。这是 Codebase Pattern "consistency with existing file style > literal grep match" 的具体落地。
+  - 有用的上下文
+    - 本 story 完成后,scripts/ralph/prd.json 中 10 个 story 状态分布: `passes=true` 7 个(US-001/002/003/006/007/008/009)+ `blocked=true` 3 个(US-004/005/010);Ralph 自主循环若跑 `python3 -m py_compile scripts/ralph/ralph.py` + `python3 scripts/ralph/ralph.py --check` 应能识别 "无未完成且非 blocked story",进入 `<promise>COMPLETE</promise>` 等待用户授权状态。
+    - 本 story 严格遵守 Codebase Pattern 35 "服务二进制更新后路由 404,需重启服务": US-009 不动 5030 binary,不重启服务,只在 state files 上反映 7/10 done 状态;5030 旧 binary 上的 `/api/v1/db` 仍返回旧 shape,但 state files 已记录 "新 binary 包含 US-003 代码,启动后才会暴露 unavailable 列表"。
+    - 下一次会话启动的"3 分钟恢复"路径: `pwd -P` → `jq empty feature_list.json && node scripts/check-root-harness.mjs`(80/80 期望)→ 读 progress.md 顶部 US-009 段 → 读 session-handoff.md Current Objective 段 → 跑 5 条 next-session read-only 诊断命令 → 决定下一步是 user-authorize US-004 还是继续 monitoring。
+---
+
+## [2026-06-17 21:18] - PRD 归档 + 重置为 bootstrap placeholder (手动操作,非 Ralph 自主迭代)
+- 操作内容
+  - 上一轮 db-runtime-graph-truth-harness PRD(10 story: 7 passes / 3 blocked)的工作分支 ralph/db-runtime-graph-truth-harness 在前一会话被用户选择删除(US-002/003/007/008 代码随分支丢弃);该分支随后被 ralph.py ensure_work_branch() 按 prd.json.branchName 重建到 main HEAD(2f891fd8)。
+  - 本次用户授权两步: (1) git branch -d 删除复活的工作分支(与 main 同 commit、无独有 commit、零丢失,已切回 main); (2) 处理 prd.json 使其不再被 ensure_work_branch 重建。
+  - 归档: cp scripts/ralph/{prd.json,progress.txt} → archive/2026-06-17-db-runtime-graph-truth-harness-discarded/ (用 -discarded 后缀区别于已完成归档;该 PRD 代码已丢弃、DB 未真正恢复)。
+  - 重置: scripts/ralph/prd.json → bootstrap placeholder (branchName=ralph/bootstrap-placeholder, 1 个 US-000 占位 story passes=false/blocked=true)。
+- 更改的文件
+  - scripts/ralph/prd.json (重置为 placeholder)
+  - archive/2026-06-17-db-runtime-graph-truth-harness-discarded/{prd.json,progress.txt} (新增归档快照)
+  - scripts/ralph/progress.txt (本条追加,顶部 Codebase Patterns 未动)
+- 运行的验证命令与结果
+  - python3 .claude/skills/ralph/scripts/repair_prd_json.py scripts/ralph/prd.json → ✅ 修复并验证成功
+  - node scripts/check-root-harness.mjs → 80/80 passed (placeholder 满足 branchName ralph/ 前缀 + userStories 非空 + 9 字段)
+  - python3 scripts/ralph/ralph.py --check → "prd.json.branchName 是 bootstrap placeholder,保持当前单分支行为。" 运行前后均只有 main 分支,无新建分支
+- 未验证项与原因
+  - DB 实际可查询性: 未验证(US-004 destructive recovery 始终 blocked,本次未做)
+  - git commit: 未执行(用户未要求,所有改动留工作区)
+- **未来迭代的学习:**
+  - 可复用 patterns
+    - **让 ralph.py 停止重建工作分支的唯一 harness-safe 方式 = branchName 设为 ralph/bootstrap-placeholder**: check-root-harness.mjs(178-182 行)强制 branchName 必须 startsWith('ralph/') 且 userStories.length>0,所以空 branchName / non-ralph 前缀会让 harness 掉绿;只有 ralph/bootstrap-placeholder 同时满足 (a) harness ralph/ 前缀检查 (b) ensure_work_branch() 的 placeholder 跳过分支(== BOOTSTRAP_BRANCH_PLACEHOLDER, ralph.py:85)。placeholder prd 必须保留 ≥1 个含全部 9 字段的占位 story。
+    - **placeholder story 用 passes=false + blocked=true**: blocked=true 确保误启动 ralph 时该占位项被当 blocked 跳过(developer 选 story 规则 = passes:false 且 blocked:false 的最高 priority);两者组合 → 无可执行 story → COMPLETE,且 ensure_work_branch 已先行跳过,双保险。
+  - 遇到的陷阱
+    - **删了工作分支不等于它不会回来**: ralph.py 启动 ensure_work_branch() 会按 prd.json.branchName 重建同名分支(本例从 d9ff56b7 删除后又在 2f891fd8 复活)。根治必须改 prd.json.branchName,光删分支无效。
+  - 有用的上下文
+    - db-runtime-graph-truth-harness 归档全文在 archive/2026-06-17-db-runtime-graph-truth-harness-discarded/;若将来要恢复 DB,US-004 的 acceptanceCriteria(备份 all_keys.json → 单步删坏 cache → 重扫 key → 重启 → 复验 /db/tables 200)仍可从归档 prd.json 取用,需用户 same-turn 授权。
+---
